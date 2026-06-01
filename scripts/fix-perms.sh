@@ -16,6 +16,15 @@ chmod 0700 "${AUTH_DATA_ROOT}/wrappers/ssh.py";
 
 chmod 0700 "${AUTH_DATA_ROOT}/configs"
 
+# Logs are written by interactive users in the auth group. Keep the rest of
+# /opt/auth strict, but preserve group-write and setgid for session logs.
+chown auth:auth "${AUTH_DATA_ROOT}/logs"
+chmod 2770 "${AUTH_DATA_ROOT}/logs"
+find "${AUTH_DATA_ROOT}/logs" -mindepth 1 -type d -print0 | xargs -r -n60 -P 5 -0 chgrp auth
+find "${AUTH_DATA_ROOT}/logs" -mindepth 1 -type d -print0 | xargs -r -n60 -P 5 -0 chmod 2770
+find "${AUTH_DATA_ROOT}/logs" -type f -print0 | xargs -r -n60 -P 5 -0 chgrp auth
+find "${AUTH_DATA_ROOT}/logs" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0660
+
 find "${AUTH_DATA_ROOT}/shared" -type d -print0 | xargs -n60 -P 5 -0 chmod 0750
 find "${AUTH_DATA_ROOT}/shared" -type f -print0 | xargs -n60 -P 5 -0 chmod 0640
 chmod 0750 "${AUTH_DATA_ROOT}/shared/helper.py";

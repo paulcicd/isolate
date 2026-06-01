@@ -3,6 +3,7 @@ import os
 import sys
 import socket
 import errno
+import grp
 import re
 import json
 import time
@@ -10,6 +11,17 @@ import argparse
 import logging
 import uuid
 import subprocess
+import select
+import signal
+
+try:
+    import pty
+    import termios
+    import tty
+except ImportError:  # pragma: no cover - wrapper runs on Linux bastions
+    pty = None
+    termios = None
+    tty = None
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared')))
 from isolate_config import load_config
@@ -60,6 +72,20 @@ def mkdir(path):
             pass
         else:
             raise
+
+
+def prepare_user_log_dir(path):
+    mkdir(path)
+    try:
+        os.chown(path, -1, grp.getgrnam('auth').gr_gid)
+    except PermissionError:
+        pass
+    except KeyError:
+        pass
+    try:
+        os.chmod(path, 0o2770)
+    except PermissionError:
+        pass
 
 
 def is_valid_ipv4_address(address):
@@ -185,7 +211,7 @@ def init_log_file(host):
     host['server_ip'] = args.hostname[0]
 
     current_user_log_dir = '{0}/{1}'.format(logs_base_path, local_sudo_user)
-    mkdir(current_user_log_dir)
+    prepare_user_log_dir(current_user_log_dir)
 
     # example: /tmp/root/root_127.0.0.1_22_common_1485110002_<uuid>.log
     current_log_path = '{0}/{1}_{2}_{3}_{4}_{5}.log'.format(current_user_log_dir,
@@ -202,10 +228,106 @@ def init_log_file(host):
     log_meta = '{0}'.format(json.dumps(host, indent=4))
     with open(current_log_path + '.meta', 'w') as log_f:
         log_f.write(log_meta)
+    try:
+        os.chmod(current_log_path + '.meta', 0o660)
+    except PermissionError:
+        pass
 
     LOGGER.debug(log_meta)
 
     return current_log_path
+
+
+def _write_raw_log(raw_log, data):
+    text = data.decode('utf-8', errors='replace')
+    raw_log.write('{0:.6f}\n{1}'.format(time.time(), text))
+    raw_log.flush()
+
+
+def _run_pipe_command(argv, raw_log):
+    proc = subprocess.Popen(
+        argv,
+        stdin=None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+    )
+    while True:
+        chunk = proc.stdout.readline()
+        if not chunk:
+            break
+        os.write(sys.stdout.fileno(), chunk)
+        _write_raw_log(raw_log, chunk)
+    return proc.wait()
+
+
+def _run_pty_command(argv, raw_log):
+    master_fd, slave_fd = pty.openpty()
+    old_tty = None
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+
+    proc = subprocess.Popen(
+        argv,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+        preexec_fn=os.setsid,
+    )
+    os.close(slave_fd)
+
+    if sys.stdin.isatty() and termios is not None and tty is not None:
+        old_tty = termios.tcgetattr(stdin_fd)
+        tty.setraw(stdin_fd)
+
+    try:
+        while True:
+            if proc.poll() is not None:
+                # Drain pending PTY output after process exit.
+                while True:
+                    ready, _, _ = select.select([master_fd], [], [], 0)
+                    if master_fd not in ready:
+                        break
+                    try:
+                        data = os.read(master_fd, 4096)
+                    except OSError:
+                        break
+                    if not data:
+                        break
+                    os.write(stdout_fd, data)
+                    _write_raw_log(raw_log, data)
+                break
+
+            read_fds = [master_fd]
+            if sys.stdin.isatty():
+                read_fds.append(stdin_fd)
+            ready, _, _ = select.select(read_fds, [], [], 1)
+
+            if master_fd in ready:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                os.write(stdout_fd, data)
+                _write_raw_log(raw_log, data)
+
+            if stdin_fd in ready:
+                data = os.read(stdin_fd, 4096)
+                if not data:
+                    break
+                os.write(master_fd, data)
+    finally:
+        if old_tty is not None:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
+        try:
+            os.close(master_fd)
+        except OSError:
+            pass
+
+    return proc.wait()
 
 
 def run_command(argv, raw_log_path, audit, metadata):
@@ -215,23 +337,14 @@ def run_command(argv, raw_log_path, audit, metadata):
     started = time.time()
 
     with open(raw_log_path, 'a', encoding='utf-8', errors='replace') as raw_log:
-        proc = subprocess.Popen(
-            argv,
-            stdin=None,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            bufsize=0,
-        )
-        while True:
-            chunk = proc.stdout.readline()
-            if not chunk:
-                break
-            text = chunk.decode('utf-8', errors='replace')
-            sys.stdout.write(text)
-            sys.stdout.flush()
-            raw_log.write('{0:.6f}\n{1}'.format(time.time(), text))
-            raw_log.flush()
-        exit_code = proc.wait()
+        try:
+            os.chmod(raw_log_path, 0o660)
+        except PermissionError:
+            pass
+        if pty is not None and sys.stdin.isatty() and sys.stdout.isatty():
+            exit_code = _run_pty_command(argv, raw_log)
+        else:
+            exit_code = _run_pipe_command(argv, raw_log)
 
     if exit_code != 0:
         msg = 'Exit code: {1}{0}{2}'.format(exit_code, term_colors['red'], term_colors['reset'])

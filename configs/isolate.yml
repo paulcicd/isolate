@@ -33,6 +33,7 @@ ssh:
   default_remote_user: null
   default_sudo_mode: sudo-i
   require_known_hosts: true
+  allocate_tty: true
 
 logging:
   base_path: /opt/auth/logs

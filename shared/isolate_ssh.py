@@ -74,6 +74,8 @@ def filter_extra_args(extra_args, allowed):
 def build_ssh_argv(config, host, extra_args=None, proxy=None, remote_command=None):
     ssh = config.get("binary", "/usr/bin/ssh")
     argv = [ssh, "-e", "none", "-F", config.get("config_path", "/opt/auth/configs/defaults.conf")]
+    if config.get("allocate_tty", True):
+        argv.append("-tt")
     argv.extend(filter_extra_args(extra_args, config.get("allowed_extra_args")))
 
     proxy = proxy or {}

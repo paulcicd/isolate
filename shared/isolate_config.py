@@ -44,6 +44,7 @@ DEFAULT_CONFIG = {
         "default_remote_user": None,
         "default_sudo_mode": "sudo-i",
         "require_known_hosts": True,
+        "allocate_tty": True,
     },
     "logging": {
         "base_path": "/opt/auth/logs",

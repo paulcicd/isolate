@@ -1,11 +1,14 @@
 import os
+import shutil
 import sys
+import uuid
 import unittest
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 
 from isolate_identity import normalize_claims
+from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, resolve_policy
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 
@@ -47,6 +50,7 @@ class SSHBuilderTest(unittest.TestCase):
         )
         self.assertIn("-l", argv)
         self.assertIn("support", argv)
+        self.assertIn("-tt", argv)
         self.assertEqual(argv[-2:], ["host.example.com", "sudo -i"])
 
     def test_rejects_unknown_ssh_arg(self):
@@ -73,6 +77,24 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(identity["username"], "alice")
         self.assertEqual(identity["groups"], ["/ops", "/prod"])
         self.assertEqual(identity["roles"], ["bastion"])
+
+
+class SessionLoggerTest(unittest.TestCase):
+    def test_creates_user_and_session_log_paths(self):
+        tmpdir = os.path.join(ROOT, ".tmp-session-logger-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        try:
+            logger = SessionLogger(
+                tmpdir,
+                {"username": "alice", "groups": ["auth"], "session_id": "session-1"},
+            )
+            logger.event("helper_start", project="prod")
+
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "alice")))
+            self.assertTrue(os.path.isdir(os.path.join(tmpdir, "alice", "session-1")))
+            self.assertTrue(os.path.isfile(os.path.join(tmpdir, "alice", "session-1", "session.jsonl")))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 if __name__ == "__main__":

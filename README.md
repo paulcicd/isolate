@@ -157,6 +157,7 @@ keycloak:
 ssh:
   binary: /usr/bin/ssh
   config_path: /opt/auth/configs/defaults.conf
+  allocate_tty: true
   allowed_extra_args:
     - -4
     - -6
@@ -503,6 +504,17 @@ Enable helper debug:
 g prod test-ubuntu --debug
 ```
 
+If interactive keys such as Backspace, Delete, arrows, or command history do not
+work after `g`, make sure the v2 SSH config has remote TTY allocation enabled:
+
+```yaml
+ssh:
+  allocate_tty: true
+```
+
+The wrapper must pass `-tt` to OpenSSH when it starts the remote `sudo -i`
+session; otherwise the remote shell behaves like a non-interactive stdin script.
+
 Open Redis with current password:
 
 ```bash
@@ -513,6 +525,29 @@ Check generated logs:
 
 ```bash
 find /opt/auth/logs -type f -name 'session.jsonl' -o -name '*.meta' -o -name '*.log'
+```
+
+If a user gets `PermissionError` under `/opt/auth/logs`, verify group membership
+and each directory on the path:
+
+```bash
+id <user>
+ls -ld /opt/auth /opt/auth/logs /opt/auth/logs/<user>
+namei -l /opt/auth/logs/<user>/<failed-file>
+```
+
+Expected log permissions:
+
+```text
+/opt/auth/logs         auth:auth 2770
+/opt/auth/logs/<user>  <user>:auth or auth:auth, mode 2770
+log files              group auth, mode 0660
+```
+
+Re-apply permissions after deploy:
+
+```bash
+bash /opt/auth/scripts/fix-perms.sh
 ```
 
 Check SSH key and known hosts:
