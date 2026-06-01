@@ -1,8 +1,8 @@
 ---
-- include: users.yml
+- import_tasks: users.yml
   tags: users
 
-- include: cron.yml
+- import_tasks: cron.yml
   tags: cron
 
 - name: Installing GAWK...

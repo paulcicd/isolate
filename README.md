@@ -1,443 +1,537 @@
-# ISOLATE - AUTHENTICATION SERVER 
+# Isolate Bastion Platform
 
+Isolate is an SSH bastion platform for managing access to large fleets of Linux servers. Users connect to the bastion first, search or select a target with the `s` and `g` helpers, and Isolate opens the SSH session while writing session metadata and logs.
 
-[![Slack Url](https://img.shields.io/badge/Slack-channel-red?logo=slack)](https://join.slack.com/t/devopsprodigygroup/shared_invite/zt-anhohkyu-gA4MGwVX9pxme6drVkH7RQ)
-[![Telegram Url](https://img.shields.io/badge/Telegram-chat-blue?logo=telegram)](https://t.me/isolate_bastion)
-[![Project Site](https://img.shields.io/badge/Project-site-red)](https://devopsprodigy.com/products/isolate)
-[![License](https://img.shields.io/badge/License-AGPL--3.0-blue)](https://github.com/devopsprodigy/isolate/blob/master/LICENSE)
+This fork contains the v2 compatibility layer for modern bastion hosts:
 
-![Image](logo.jpg)
+- Ubuntu 24.04 LTS and Debian 12+ support
+- Python 3 runtime
+- Redis-backed host and policy storage
+- Keycloak OIDC Device Authorization Grant helper
+- Policy-based remote user selection
+- JSONL session audit logs plus legacy raw SSH transcripts
+- safer SSH command construction through `subprocess` argv
 
-
-
-The idea behind Isolate is that we should somehow manage how do people get access to our servers.
-How can we make this process more secure?
-How could we prevent a system from being compromised when someone lost the laptop with ssh key.
-What would we do in case someone quits the company - is there an alternative to just changing all passwords, keys, etc? 
-
-1. Isolate adds OTP 2FA to SSH login. It could be hardware YubiKey or Google Authenticator app. If someone lost the password - OTP key is here and the intruder can't get access to the bastion host.
-
-2. Users don't get direct access to endpoint servers - they go there through Isolate server,  the system tracks their actions.
-
-3. You can easily manage access to the bastion server - add/remove users, etc.
-
-Technically you should generate and place the bastion host key on endpoint servers, and users will get regular access to Isolate server with the sudoer access to ssh command.
-
-Once they want to connect to the endpoint server, the system executes ssh command and ssh client running with privileged user permissions gets server key and using it the system gets access to the server we need to get access to.
-
-## Supports
-
-* [OTP](https://en.wikipedia.org/wiki/One-time_password) (counter and time based) 2FA algorithms
-* SSH sessions logging
+Legacy OTP/PAM-OATH setup is still documented below for compatibility, but new deployments should prefer the v2 identity and policy model.
 
 ## Requirements
 
-* CentOS 7 / Ubuntu 16.04 / Debian 9 setup
-* [Ansible](http://docs.ansible.com/ansible/intro_installation.html) 2.3+ for
-install or update
+### Bastion host
 
-## INSTALL
+- Ubuntu 24.04 LTS is the primary target
+- Debian 12+ should work with the same package set
+- Python 3.12-era packages
+- Redis
+- OpenSSH server/client
+- Ansible for remote deployment
 
-for ubuntu only:
+Install local deployment dependencies:
+
+```bash
+apt update
+apt install -y ansible git python3 python3-dev python3-pip python3-venv redis-tools
 ```
-# apt update; apt install python python-pip python-dev -y
+
+### Python dependencies
+
+Runtime dependencies are listed in `requirements.txt`:
+
+```bash
+python3 -m pip install --break-system-packages -r requirements.txt
 ```
 
-edit
+For development and tests on Windows, use:
 
-`ansible/hosts.ini`
-
-and run:
+```powershell
+py -3 -m unittest discover -s tests
 ```
+
+## Quick Deploy
+
+### 1. Prepare inventory
+
+Edit `ansible/hosts.ini`:
+
+```ini
+[main]
+auth1.example.org ansible_ssh_host=203.0.113.10 ansible_ssh_port=22 ansible_ssh_user=root
+```
+
+### 2. Run Ansible
+
+```bash
 cd ansible
-ansible-playbook main.yml -e redis_pass=REDIS_PASSWORD
+ansible-playbook main.yml -e redis_pass='CHANGE_ME_STRONG_PASSWORD'
 ```
 
-and restart server
-```
-# reboot
-```
+The playbook creates the `auth` service user, installs Redis and system packages, deploys the repository to `/opt/auth`, installs Python dependencies with `pip3`, and applies file permissions.
 
-append to
+### 3. Load shell helpers
 
-`/etc/bashrc` (`/etc/bash.bashrc` on debian/ubuntu):
-```
+Add this to `/etc/bash.bashrc` on Ubuntu/Debian:
+
+```bash
 if [ -f /opt/auth/shared/bash.sh ]; then
-    source /opt/auth/shared/bash.sh;
+    source /opt/auth/shared/bash.sh
 fi
 ```
 
-append to
+Reload the shell:
 
-`/etc/sudoers` (or use `visudo`)
+```bash
+source /etc/bash.bashrc
 ```
+
+### 4. Configure sudo wrapper
+
+Use `visudo` and add:
+
+```sudoers
 %auth ALL=(auth) NOPASSWD: /opt/auth/wrappers/ssh.py
 ```
 
-### SSH
-edit
+### 5. Configure SSH daemon
 
-`/etc/ssh/sshd_config`:
-```
-# AuthorizedKeysFile /etc/keys/%u_authorized_keys
-PermitRootLogin without-password
+Recommended baseline in `/etc/ssh/sshd_config`:
+
+```sshconfig
 PasswordAuthentication yes
 GSSAPIAuthentication no
 AllowAgentForwarding no
 AllowTcpForwarding no
 X11Forwarding no
 UseDNS no
-MaxStartups 48:20:300
 TCPKeepAlive yes
 ClientAliveInterval 36
 ClientAliveCountMax 2400
 UsePAM yes
 ```
 
-```
-systemctl restart sshd
-systemctl status sshd
-```
+Restart SSH:
 
-### OTP
-
-add to
-
-`/etc/pam.d/sshd` (`/etc/pam.d/common-auth` on debian/ubuntu):
-```
-auth       required     pam_oath.so usersfile=/etc/oath/users.oath window=20 digits=6
+```bash
+systemctl restart ssh
+systemctl status ssh
 ```
 
-Example:
-```
-#%PAM-1.0
-auth	   required     pam_sepermit.so
-auth	   substack     password-auth
-auth       required     pam_oath.so usersfile=/etc/oath/users.oath window=20 digits=6
-auth	   include	    postlogin
-...>
-```
+## Configuration
 
-```
-sed -i -e 's/ChallengeResponseAuthentication no/ChallengeResponseAuthentication yes/g' /etc/ssh/sshd_config
-```
+The v2 runtime reads configuration from:
 
-add to
+1. `/etc/isolate/isolate.yml`
+2. `/opt/auth/configs/isolate.yml`
 
-`/etc/ssh/sshd_config`
+Environment variables override file settings:
 
-```
-Match Group auth
-    AuthenticationMethods keyboard-interactive
-```
-```
-systemctl restart sshd
-systemctl status sshd
-```
+- `ISOLATE_CONFIG`
+- `ISOLATE_DATA_ROOT`
+- `ISOLATE_REDIS_HOST`
+- `ISOLATE_REDIS_PORT`
+- `ISOLATE_REDIS_DB`
+- `ISOLATE_REDIS_PASS`
+- `ISOLATE_KEYCLOAK_ISSUER`
+- `ISOLATE_KEYCLOAK_CLIENT_ID`
+- `ISOLATE_KEYCLOAK_CLIENT_SECRET`
 
-## Management
+Minimal v2 config:
 
-#### load auth environment
-```
-# source /etc/bashrc
+```yaml
+schema_version: 2
+data_root: /opt/auth
 
-## OR debian/ubuntu:
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  password: CHANGE_ME_STRONG_PASSWORD
 
-# source /etc/bash.bashrc
-```
+keycloak:
+  issuer: https://keycloak.example.org/realms/infra
+  client_id: isolate-bastion
+  client_secret: null
+  scopes:
+    - openid
+    - profile
+    - email
 
-#### add user
-```
-# auth-add-user username
-```
+ssh:
+  binary: /usr/bin/ssh
+  config_path: /opt/auth/configs/defaults.conf
+  allowed_extra_args:
+    - -4
+    - -6
+    - -A
+    - -a
+    - -C
+    - -v
+    - -vv
+    - -vvv
+  default_sudo_mode: sudo-i
 
-#### generate otp
-```
-# Time-Based (Mobile and Desktop apps)
-gen-oath-safe username totp
+logging:
+  base_path: /opt/auth/logs
+  sink: local
 
-# Counter-Based (Yubikey and Mobile apps)
-gen-oath-safe username hotp
-
-# and append user secret to /etc/oath/users.oath
-# Example: HOTP username - d7dc876e503ec498e532c331f3906153318ec565
-```
-
-```
-mkdir -p /etc/oath
-touch /etc/oath/users.oath
-chmod 0600 /etc/oath/users.oath
-echo '<user oath record above>' >> /etc/oath/users.oath
-```
-
-#### local user ssh config template
-
-append to
-
-top of
-
- `~/.ssh/config`
-```
-Host auth
-    HostName 1.2.3.4
-    Port 22
-    User <username>
-    ForwardAgent no
-    ControlPath ~/.ssh/%r@%h:%p
-    ControlMaster auto
-    ControlPersist 3h
+policy:
+  default_allowed_actions:
+    - ssh
+  fallback_remote_user: null
 ```
 
-Persistent connection - for easy connection reopen without OTP and password prompt. (3h hours inactive timeout)
+SSH client defaults live in `/opt/auth/configs/defaults.conf`:
 
-### Data sources
-
-append to
-
-`/etc/bashrc` (`/etc/bash.bashrc` for debian/ubuntu):
-```
-ISOLATE_BACKEND=redis; 
-export ISOLATE_BACKEND;
-```
-
-#### Redis
-
-```
-ISOLATE_REDIS_HOST="127.0.0.1";
-ISOLATE_REDIS_PORT="6379";
-ISOLATE_REDIS_DB=0;
-ISOLATE_REDIS_PASS=<REDIS_PASSWORD>; # ansible/roles/redis/vars/main.yml
-export ISOLATE_REDIS_HOST;
-export ISOLATE_REDIS_PORT;
-export ISOLATE_REDIS_PASS;
-export ISOLATE_REDIS_DB;
-```
-
-
-
-Load changes
-```
-source /etc/bashrc
-```
-
-#### add server
-
-Login as new auth user before.
-
-```
-$ auth-add-host --project starwars --server-name sel-msk-prod --ip 1.1.1.1
-Database updated
-```
-
-add `support` user on server via auto-generated helper:
-```
-$ add-support-user-helper
-
-SUPPORT_USER="support"
-KEY="<content of /home/auth/.ssh/id_rsa.pub>"
-
-useradd -m ${SUPPORT_USER}
-mkdir /home/${SUPPORT_USER}/.ssh
-echo ${KEY} >> /home/${SUPPORT_USER}/.ssh/authorized_keys
-chmod 600 /home/${SUPPORT_USER}/.ssh/authorized_keys
-chmod 700 /home/${SUPPORT_USER}/.ssh/
-chown -R ${SUPPORT_USER}:${SUPPORT_USER} /home/${SUPPORT_USER}/.ssh/
-echo "${SUPPORT_USER} ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
-```
-
-
-#### del server
-```
-$ auth-del-host <server_id>
-```
-
-#### test data
-```
-auth-add-host --project starwars --server-name sel-msk-prod --ip 1.1.1.1
-auth-add-host --project starwars --server-name sel-spb-reserve --ip 1.1.1.2
-auth-add-host --project starwars --server-name sel-spb-dev --ip 1.1.1.3
-
-auth-add-host --project tinyfinger --server-name do-ams3-prod --ip 2.1.1.1
-auth-add-host --project tinyfinger --server-name do-nyc-dev --ip 2.1.1.3
-
-auth-add-host --project powerrangers --server-name aws-eu-prod --ip 3.1.1.1
-auth-add-host --project powerrangers --server-name aws-eu-reserve --ip 3.1.1.2
-
-# custom host/port/user options
-auth-add-host --project lotr --server-name aws-eu-prod --ip 4.1.1.1 --port 25 --user dealer --nosudo
-```
-
-
-### Host behind ssh proxy (client side bastion)
-
-`nc`/`netcat` need to be installed to bastion host.
-Or you can try use `-W host:port` options for ssh,
-but on old Centos/Ubuntu this not work properly (old sshd versions).
-
-You can use insecure proxy host for connections to other servers safely
-(not need private keys on client side bastion-host),
-Over `ProxyCommand` established sub ssh session with all authentication steps.
-
-```
-## add proxy
-auth-add-host --project bigcorp --server-name au-prod-bastion --ip 45.45.45.45 --port 2232
-Database updated: 10001
-
-# and use this id (10001) as proxy to other hosts
-
-## add hosts in network
-auth-add-host --project bigcorp --proxy-id 10001 --server-name au-prod-web1 --ip 192.168.1.1
-auth-add-host --project bigcorp --proxy-id 10001 --server-name au-prod-web2 --ip 192.168.1.2
-auth-add-host --project bigcorp --proxy-id 10001 --server-name au-prod-web3 --ip 192.168.1.3
-```
-
-This ability useful for `Amazon VPC`
-or other `VPC` provider with limited global internet ips and internal networking setup.
-
-Also you can setup separate VPN host and use it as next hop, to ablie login to hosts over VPN.
-
-### Project/Group default settings
-
-```
-$ auth-add-project-config projectname --proxy-id 10001 --port 2222
-```
-
-Host config override per project setting.
-
-### S - aka search
-
-![Image](img2.png)
-
-
-### G - aka go
-
-![Image](img1.png)
-
-
-simple usage (just go to any server by ip with default user/port/key):
-```
-$ g 1.2.3.4
-```
-
-if connection not established as expected use `--debug`:
-```
-$ g 1.2.3.4 --port 3232 --user cheburajhka --debug
-```
-
-it puts `-v` option for `ssh` and show all helper/wrapper debug logs.
-
-`--nosudo` - by default, ssh session opened with `sudo -i` (become root).
-But on old FreeBSD or systems without `sudo` it not working as expected.
-```
-$ g 1.2.3.4 --nosudo
-```
-
-
-#### G with two arguments
-
-example:
-```
-$ g bigcorp au-prod-web2
-# g bigcorp 192.168.1.1
-```
-
-more complex example:
-```
-s bigcorp
-
-bigcorp
-------
-100012  | 192.168.1.2      | au-prod-web2
-100013  | 192.168.1.3      | au-prod-web3
-100010  | 45.45.45.45      | au-prod-bastion
-100011  | 192.168.1.1      | au-prod-web1
-
-------
-Total: 4
-```
-
-Use exist proxy by server_id (proxy_id == server_id):
-```
-# this line override all project and global defaults
-$ g bigcorp 192.168.1.2 --user root --nosudo --port 4322 --proxy-id 100010
-```
-
-Set any accessable host as proxy:
-```
-g bigcorp 192.168.1.2 --proxy-host 33.22.44.88 --proxy-port 8022 --proxy-user pfwd
-```
-
-## Logs
-
-```
-/opt/auth/logs/${USER}/${USER}_${SSH_HOST}_${SSH_PORT}_${SSH_CONFIG}_1485110002_<uuid>.log
-```
-
-also with all logs, `ssh.py` creates `*.meta` files with JSON object.
-
-## SSH Client configuration
-
-`/opt/auth/configs/defaults.conf`
-```
+```sshconfig
 Host *
-    StrictHostKeyChecking no
-    UserKnownHostsFile /dev/null
+    StrictHostKeyChecking accept-new
+    UserKnownHostsFile /opt/auth/known_hosts
     TCPKeepAlive yes
     ServerAliveInterval 40
     ServerAliveCountMax 3
     ConnectTimeout 180
     ForwardAgent no
-    UseRoaming no
     User support
     Port 22
     IdentityFile /home/auth/.ssh/id_rsa
 ```
 
+## Quick Functional Test
 
-### Autocomplete
+These commands verify the main legacy flow and new v2 features on a freshly deployed bastion.
 
-Bash have a completition support.
+### 1. Load environment
 
-Cron task under user `auth` update autocomplete data in `redis` every `*/1` minute.
-
-Simple search (project) completition:
-```
-$ g tiny<tab><tab>
-...
-$ g tinyfinger
-```
-If you try `g project_name` without `host` argument:
-
- `a)` in project >1 servers. Action: show hosts list for this project.
-
- `b)` in project == 1 server. (only one server at project/group)
-
-In `b` variant, helper lookups hosts list, and if only
-one host in project/group -> just login to it.
-
-You can disable blind mode by setting in you global/local `bashrc`:
-
-```
-export ISOLATE_BLINDE=false;
+```bash
+source /etc/bash.bashrc
+export ISOLATE_BACKEND=redis
+export ISOLATE_REDIS_HOST=127.0.0.1
+export ISOLATE_REDIS_PORT=6379
+export ISOLATE_REDIS_DB=0
+export ISOLATE_REDIS_PASS='CHANGE_ME_STRONG_PASSWORD'
 ```
 
-## User settings
+### 2. Add a bastion user
 
-This options can be added to local user `~/.bashrc`
-
-```
-ISOLATE_COLORS='true'
-export ISOLATE_COLORS
-
-# Search & Print fields for servers list
-ISOLATE_SPF='server_id server_ip server_name'
-export ISOLATE_SPF
-
-# if only one server in project/group
-ISOLATE_BLIND='false'
-export ISOLATE_BLIND
+```bash
+auth-add-user alice
 ```
 
-## Debug options
-`redis-dev` - open redis-cli with current `$ISOLATE_REDIS_PASS`
-`--debug` - argument in all helpers
+Log in as `alice` before testing user-facing commands.
+
+### 3. Add a test target
+
+Use a real SSH-reachable host:
+
+```bash
+auth-add-host --project prod --server-name test-ubuntu --ip 192.0.2.20 --port 22 --user support
+```
+
+Check it exists:
+
+```bash
+s prod
+auth-dump-host 10001
+```
+
+### 4. Install the bastion key on the target
+
+Print the helper:
+
+```bash
+add-support-user-helper
+```
+
+Run the printed commands on the target host as root. This creates the remote `support` user and installs `/home/auth/.ssh/id_rsa.pub`.
+
+### 5. Test old workflow
+
+Search:
+
+```bash
+s test-ubuntu
+s prod
+```
+
+Connect:
+
+```bash
+g prod test-ubuntu --debug
+```
+
+Connect without remote `sudo -i`:
+
+```bash
+g prod test-ubuntu --nosudo
+```
+
+### 6. Test v2 policy resolver
+
+Add a group policy:
+
+```bash
+isolate policy add --subject group --name /ops --project prod --remote-user support
+```
+
+Add a more specific user/host policy:
+
+```bash
+isolate policy add --subject user --name alice --project prod --host 10001 --remote-user alice
+```
+
+Test policy resolution:
+
+```bash
+isolate policy test --user alice --group /ops --project prod --host 10001
+```
+
+Expected result: `remote_user` is `alice`, because user+host policy has higher priority than group+project policy.
+
+### 7. Test Keycloak device-flow login
+
+Configure Keycloak:
+
+```bash
+export ISOLATE_KEYCLOAK_ISSUER='https://keycloak.example.org/realms/infra'
+export ISOLATE_KEYCLOAK_CLIENT_ID='isolate-bastion'
+```
+
+Run:
+
+```bash
+isolate login
+```
+
+Open the printed verification URL, enter the user code if required, and approve the login. The command prints normalized identity fields: `session_id`, `keycloak_sub`, `username`, `email`, `groups`, and `roles`.
+
+Current status: this is the v2 CLI/PAM-helper foundation. Full PAM wiring can be added on top of the same device-flow client.
+
+### 8. Test session audit logs
+
+After running `g`, search JSONL audit events:
+
+```bash
+isolate session search --user alice --project prod
+```
+
+Logs are stored under:
+
+```text
+/opt/auth/logs/<user>/<session_id>/session.jsonl
+```
+
+Legacy raw SSH transcript and `.meta` files are still written for compatibility.
+
+## User Commands
+
+### Search
+
+```bash
+s <query>
+s prod
+s test-ubuntu
+```
+
+### Connect
+
+```bash
+g <project|host> [server_name|server_ip] [--user remote_user] [--port port] [--nosudo] [--debug]
+```
+
+Examples:
+
+```bash
+g prod test-ubuntu
+g prod 192.0.2.20 --user support --port 22
+g 192.0.2.20 --nosudo
+```
+
+### Projects
+
+```bash
+p
+```
+
+## Admin Commands
+
+### Hosts
+
+```bash
+auth-add-host --project prod --server-name web01 --ip 192.0.2.21 --port 22 --user support
+auth-dump-host 10001
+auth-del-host 10001
+```
+
+### Project defaults
+
+```bash
+auth-add-project-config prod --port 22 --user support
+auth-dump-project-config prod
+auth-del-project-config prod
+```
+
+### v2 policies
+
+```bash
+isolate policy add --subject group --name /ops --project prod --remote-user support
+isolate policy add --subject user --name alice --project prod --host 10001 --remote-user alice
+isolate policy test --user alice --group /ops --project prod --host 10001
+```
+
+Policy precedence:
+
+1. user + host
+2. user + project
+3. group + host
+4. group + project
+5. host/project defaults
+6. configured fallback remote user
+
+If no remote user can be resolved, access is denied.
+
+## Session Logging
+
+v2 writes structured JSONL events:
+
+- `helper_start`
+- `policy_selected`
+- `policy_denied`
+- `ssh_start`
+- `ssh_end`
+- `ssh_argument_denied`
+
+Each event includes session and identity fields where available:
+
+- `session_id`
+- `keycloak_sub`
+- `username`
+- `groups`
+- `project`
+- `host_id`
+- `target_host`
+- `remote_user`
+- `source_ip`
+- `exit_code`
+
+The local JSONL sink is implemented first. It is intentionally easy to ship with Filebeat, Vector, syslog, OpenSearch, ClickHouse, S3, or another external collector.
+
+## Keycloak Notes
+
+Create a Keycloak client for the bastion:
+
+- Client type: OpenID Connect
+- Flow: Device Authorization Grant enabled
+- Client authentication: public or confidential
+- Scopes: `openid`, `profile`, `email`
+- Group claim: include `groups` in the token if group-based policies are used
+
+Set:
+
+```bash
+export ISOLATE_KEYCLOAK_ISSUER='https://keycloak.example.org/realms/infra'
+export ISOLATE_KEYCLOAK_CLIENT_ID='isolate-bastion'
+export ISOLATE_KEYCLOAK_CLIENT_SECRET='optional-secret'
+```
+
+Then:
+
+```bash
+isolate login
+```
+
+## Legacy OTP/PAM-OATH
+
+For older deployments that still use OTP through PAM-OATH:
+
+```bash
+apt install -y libpam-oath liboath0 liboath-dev oathtool qrencode
+mkdir -p /etc/oath
+touch /etc/oath/users.oath
+chmod 0600 /etc/oath/users.oath
+```
+
+Generate a user secret:
+
+```bash
+gen-oath-safe alice totp
+```
+
+Add the generated record to `/etc/oath/users.oath`.
+
+Add to `/etc/pam.d/sshd` or your common auth stack:
+
+```pam
+auth required pam_oath.so usersfile=/etc/oath/users.oath window=20 digits=6
+```
+
+Modern OpenSSH uses `KbdInteractiveAuthentication` rather than old `ChallengeResponseAuthentication` naming:
+
+```sshconfig
+KbdInteractiveAuthentication yes
+
+Match Group auth
+    AuthenticationMethods keyboard-interactive
+```
+
+Restart SSH after PAM changes.
+
+## Development Verification
+
+Run syntax verification:
+
+```powershell
+py -3 -m compileall shared wrappers tests
+```
+
+Run tests:
+
+```powershell
+py -3 -m unittest discover -s tests
+```
+
+Current focused tests cover:
+
+- policy precedence
+- deny when no remote user can be resolved
+- safe SSH argv construction
+- rejection of unknown SSH arguments
+- Keycloak claim normalization
+
+## Troubleshooting
+
+Enable helper debug:
+
+```bash
+g prod test-ubuntu --debug
+```
+
+Open Redis with current password:
+
+```bash
+redis-dev
+```
+
+Check generated logs:
+
+```bash
+find /opt/auth/logs -type f -name 'session.jsonl' -o -name '*.meta' -o -name '*.log'
+```
+
+Check SSH key and known hosts:
+
+```bash
+ls -la /home/auth/.ssh
+ls -la /opt/auth/known_hosts
+```
+
+If policy resolution denies access, run:
+
+```bash
+isolate policy test --user <username> --group <group> --project <project> --host <server_id>
+```
+
+## Compatibility Notes
+
+- Existing Redis `server_*` host records are still read by the helper.
+- Existing `auth-add-host`, `auth-dump-host`, `auth-del-host`, `s`, `g`, and `p` workflows remain available.
+- v2 policies are stored as Redis `policy_*` keys.
+- The old global `StrictHostKeyChecking no` default was replaced with `accept-new` and `/opt/auth/known_hosts`.
+- `UseRoaming` was removed because modern OpenSSH no longer supports it.

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 import os
 import sys
 import socket
@@ -9,6 +9,13 @@ import time
 import argparse
 import logging
 import uuid
+import subprocess
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared')))
+from isolate_config import load_config
+from isolate_identity import local_identity
+from isolate_logging import SessionLogger
+from isolate_ssh import SSHArgumentError, build_ssh_argv
 
 LOGGER = logging.getLogger('ssh-wrapper')
 LOG_FORMAT = '[%(asctime)s] [%(levelname)6s] %(name)s %(message)s'
@@ -41,10 +48,6 @@ term_colors = {
     'orange': '\033[38;5;220m',
     'bebe': '\033[38;5;142m'
 }
-
-
-# ssh config
-ssh_command = '/usr/bin/ssh' + ' -e none -F ' + os.path.join(ssh_configs_path, 'defaults.conf')
 
 
 def mkdir(path):
@@ -88,7 +91,7 @@ def is_valid_fqdn(hostname):
         return False
     if hostname[-1] == '.' or hostname[0] == '.':
         return False
-    if re.match('^([a-z\d\-.]*)$', hostname) is None:
+    if re.match(r'^([a-z\d\-.]*)$', hostname) is None:
         return False
     if hostname.startswith('-'):
         return False
@@ -119,7 +122,7 @@ def verify_args(args):
 
     if args.user is not None:
         user = args.user[0]
-        if re.match('^[A-Za-z,\d\-]*$', user) is None or \
+        if re.match(r'^[A-Za-z,\d\-]*$', user) is None or \
                                         len(user) > 48 or \
                                         user.startswith('-'):
             LOGGER.critical('[user] Validation not passed')
@@ -150,7 +153,7 @@ def verify_args(args):
 
     if args.proxy_user is not None:
         proxy_user = args.proxy_user[0]
-        if re.match('^[A-Za-z\d\-]*$', proxy_user) is None or \
+        if re.match(r'^[A-Za-z\d\-]*$', proxy_user) is None or \
                                                    len(proxy_user) > 48 or \
                                                    proxy_user.startswith('-'):
             LOGGER.critical('[proxy_user] Validation not passed')
@@ -193,8 +196,6 @@ def init_log_file(host):
                                                             host['uuid'][:12])
 
     host['log_path'] = current_log_path
-    loger_pipe_cmd = 'tee >( awk -f {0}/timecode.awk >> {1} );'.format(working_dir, current_log_path)
-
     LOGGER.debug(current_log_path)
 
     # write logfile metadata
@@ -204,19 +205,39 @@ def init_log_file(host):
 
     LOGGER.debug(log_meta)
 
-    return loger_pipe_cmd
+    return current_log_path
 
 
-def run_command(cmd):
+def run_command(argv, raw_log_path, audit, metadata):
 
-    LOGGER.debug(cmd)
+    LOGGER.debug(argv)
+    audit.event("ssh_start", argv=argv, **metadata)
+    started = time.time()
 
-    exit_code = os.system(cmd)
+    with open(raw_log_path, 'a', encoding='utf-8', errors='replace') as raw_log:
+        proc = subprocess.Popen(
+            argv,
+            stdin=None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            bufsize=0,
+        )
+        while True:
+            chunk = proc.stdout.readline()
+            if not chunk:
+                break
+            text = chunk.decode('utf-8', errors='replace')
+            sys.stdout.write(text)
+            sys.stdout.flush()
+            raw_log.write('{0:.6f}\n{1}'.format(time.time(), text))
+            raw_log.flush()
+        exit_code = proc.wait()
 
     if exit_code != 0:
         msg = 'Exit code: {1}{0}{2}'.format(exit_code, term_colors['red'], term_colors['reset'])
         msg = '\n  {0}\n'.format(msg)
-        LOGGER.warn(msg)
+        LOGGER.warning(msg)
+    audit.event("ssh_end", exit_code=exit_code, duration=round(time.time() - started, 3), **metadata)
     return exit_code
 
 
@@ -235,7 +256,7 @@ if __name__ == '__main__':
     parser.add_argument('--proxy-user', type=str, nargs=1)
     parser.add_argument('--proxy-port', type=int)
     parser.add_argument('--proxy-id', type=str, nargs=1, help='just for pretty logs')
-    args = parser.parse_args()
+    args, extra_args = parser.parse_known_args()
     #
     if args.debug:
         logging.basicConfig(stream=sys.stdout, level=logging.DEBUG,
@@ -252,46 +273,43 @@ if __name__ == '__main__':
     LOGGER.debug(args)
     #
     host_meta = verify_args(args)
-    log_pipe = init_log_file(host_meta)
-    #
-    ssh_args = []
-    ssh_proxy_args = []
-
-    # host connection
-    if args.debug:
-        ssh_args.append('-v')
-    if bool(host_meta['user']):
-        ssh_args.append('-l ' + str(host_meta['user']))
-    if bool(host_meta['port']):
-        ssh_args.append('-p ' + str(host_meta['port']))
-    if bool(host_meta['hostname']):
-        ssh_args.append(host_meta['hostname'])
-    if host_meta['nosudo'] is False:  # if nosudo disabled <_<
-        ssh_args.append('\'sudo -i\'')
-    ssh_args = ' '.join(ssh_args)
-    ssh_args += ' 2>&1'
-
-    # ProxyCommand
-    # if configs present
+    raw_log_path = init_log_file(host_meta)
+    config = load_config()
+    identity = local_identity(local_sudo_user, [])
+    audit = SessionLogger(config["logging"]["base_path"], identity, session_id=host_meta["uuid"])
+    remote_command = None if host_meta['nosudo'] else 'sudo -i'
+    proxy = None
     if args.proxy_host:
-        # if args.debug:
-        #     ssh_proxy_args.append('-v')
-        if bool(host_meta['proxy_user']):
-            ssh_proxy_args.append('-l ' + str(host_meta['proxy_user']))
-        if bool(host_meta['proxy_port']):
-            ssh_proxy_args.append('-p ' + str(host_meta['proxy_port']))
-        if bool(host_meta['proxy_host']):
-            ssh_proxy_args.append(host_meta['proxy_host'])
+        proxy = {
+            "host": host_meta["proxy_host"],
+            "port": host_meta["proxy_port"],
+            "user": host_meta["proxy_user"],
+        }
+    try:
+        argv = build_ssh_argv(
+            config["ssh"],
+            {
+                "hostname": host_meta["hostname"],
+                "port": host_meta["port"],
+                "user": host_meta["user"],
+                "debug": host_meta["debug"],
+            },
+            extra_args=extra_args,
+            proxy=proxy,
+            remote_command=remote_command,
+        )
+    except SSHArgumentError as exc:
+        audit.event("ssh_argument_denied", reason=str(exc), **host_meta)
+        LOGGER.critical(str(exc))
+        sys.exit(1)
 
-        ssh_proxy_args = ' '.join(ssh_proxy_args)
-        proxy_cmd = '-o ProxyCommand=\'{0} {1} nc %h %p\''.format(ssh_command, ssh_proxy_args)
-
-        cmd = 'bash --norc -c "{0} -t {1} {2} | {3} "'.format(ssh_command, proxy_cmd, ssh_args, log_pipe)
-    else:
-        cmd = 'bash --norc -c "{0} -t {1} | {2} "'.format(ssh_command, ssh_args, log_pipe)
-
-    LOGGER.debug(cmd)
+    LOGGER.debug(argv)
     LOGGER.debug(host_meta)
 
-    host_meta['cmd'] = cmd
-    run_command(cmd)
+    host_meta['argv'] = argv
+    sys.exit(run_command(argv, raw_log_path, audit, {
+        "target_host": host_meta["hostname"],
+        "target_port": host_meta["port"],
+        "remote_user": host_meta["user"],
+        "source_ip": os.getenv("SSH_CONNECTION", "").split(" ")[0] if os.getenv("SSH_CONNECTION") else None,
+    }))

@@ -1,10 +1,14 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import sys
 import os
 import socket
 import re
-import GeoIP
+
+try:
+    import geoip2.database
+except ImportError:
+    geoip2 = None
 
 sys.dont_write_bytecode = True
 
@@ -42,7 +46,7 @@ def is_valid_fqdn(hostname):
         return False
     if hostname[-1] == '.' or hostname[0] == '.':
         return False
-    if re.match('^([a-z\d\-.]*)$', hostname) is None:
+    if re.match(r'^([a-z\d\-.]*)$', hostname) is None:
         return False
     return True
 
@@ -51,8 +55,20 @@ class IsolateGeoIP(object):
 
     def __init__(self, **kwargs):
         self.kwargs = kwargs
-        self.ASN_DB = os.getenv('ISOLATE_GEOIP_ASN', '/opt/auth/shared/geoip/GeoIPASNum.dat')
-        self.asn = GeoIP.open(self.ASN_DB, GeoIP.GEOIP_STANDARD)
+        self.ASN_DB = os.getenv('ISOLATE_GEOIP_ASN', '/opt/auth/shared/geoip/GeoLite2-ASN.mmdb')
+        self.asn = self
+        self.reader = None
+        if geoip2 is not None and os.path.exists(self.ASN_DB):
+            self.reader = geoip2.database.Reader(self.ASN_DB)
+
+    def name_by_addr(self, address):
+        if self.reader is None:
+            return None
+        try:
+            response = self.reader.asn(address)
+            return response.autonomous_system_organization
+        except Exception:
+            return None
 
 
 class IsolateStorage(object):

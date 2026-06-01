@@ -1,0 +1,45 @@
+schema_version: 2
+data_root: /opt/auth
+
+redis:
+  host: 127.0.0.1
+  port: 6379
+  db: 0
+  password: null
+
+keycloak:
+  issuer: null
+  client_id: isolate-bastion
+  client_secret: null
+  scopes:
+    - openid
+    - profile
+    - email
+  poll_timeout: 300
+
+ssh:
+  binary: /usr/bin/ssh
+  config_path: /opt/auth/configs/defaults.conf
+  allow_unknown_args: false
+  allowed_extra_args:
+    - -4
+    - -6
+    - -A
+    - -a
+    - -C
+    - -v
+    - -vv
+    - -vvv
+  default_remote_user: null
+  default_sudo_mode: sudo-i
+  require_known_hosts: true
+
+logging:
+  base_path: /opt/auth/logs
+  jsonl_name: session.jsonl
+  sink: local
+
+policy:
+  default_allowed_actions:
+    - ssh
+  fallback_remote_user: null

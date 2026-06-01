@@ -3,6 +3,7 @@ USER="${USER:-NO_USER_ENV}";
 ISOLATE_DATA_ROOT="${ISOLATE_DATA_ROOT:-/opt/auth}";
 ISOLATE_SHARED="${ISOLATE_DATA_ROOT}/shared";
 ISOLATE_HELPER="${ISOLATE_SHARED}/helper.py";
+ISOLATE_CLI="${ISOLATE_SHARED}/isolate.py";
 ISOLATE_DEPLOY_LOCK="${ISOLATE_DATA_ROOT}/.deploy";
 ISOLATE_COLORS=true;
 ISOLATE_DEFAULT_PROJECT="${ISOLATE_DEFAULT_PROJECT:-main}";
@@ -11,6 +12,7 @@ export USER;
 export ISOLATE_DATA_ROOT;
 export ISOLATE_SHARED;
 export ISOLATE_HELPER;
+export ISOLATE_CLI;
 export ISOLATE_COLORS;
 export ISOLATE_DEPLOY_LOCK;
 export ISOLATE_COLORS;
@@ -41,6 +43,10 @@ add-support-user-helper () {
 
 redis-dev () {
     redis-cli -a "${ISOLATE_REDIS_PASS}" "${@}";
+}
+
+isolate () {
+    "${ISOLATE_CLI}" "${@}";
 }
 
 deploy_lock () {

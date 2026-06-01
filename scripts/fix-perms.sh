@@ -20,6 +20,9 @@ find "${AUTH_DATA_ROOT}/shared" -type d -print0 | xargs -n60 -P 5 -0 chmod 0750
 find "${AUTH_DATA_ROOT}/shared" -type f -print0 | xargs -n60 -P 5 -0 chmod 0640
 chmod 0750 "${AUTH_DATA_ROOT}/shared/helper.py";
 chmod 0700 "${AUTH_DATA_ROOT}/shared/auth-manager.py";
+chmod 0700 "${AUTH_DATA_ROOT}/shared/isolate.py";
+touch "${AUTH_DATA_ROOT}/known_hosts";
+chmod 0600 "${AUTH_DATA_ROOT}/known_hosts";
 
 # python fixes
 #find /usr/lib/python2.7/site-packages/ -type d -print0 | xargs -n60 -P 5 -0 chmod 0755

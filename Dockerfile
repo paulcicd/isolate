@@ -1,18 +1,18 @@
-FROM ubuntu:xenial
+FROM ubuntu:24.04
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     apt-get install -y \
         vim \
         sudo \
-        python \
-        python-dev \
-        python-pip \
+        python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
         openssh-server \
         libpam-oath \
         liboath0 \
         liboath-dev \
         oathtool \
-        libgeoip-dev \
         caca-utils \
         qrencode \
     && apt-get clean \
@@ -23,7 +23,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update && \
     && echo "[ -f /opt/auth/shared/bash.sh ] && source /opt/auth/shared/bash.sh" >> /etc/bash.bashrc
 
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install -r /tmp/requirements.txt
+RUN python3 -m pip install --break-system-packages -r /tmp/requirements.txt
 
 EXPOSE 22
 

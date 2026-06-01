@@ -31,7 +31,7 @@ common_utils_yum:
   - nc
   - ncdu
   - net-tools
-  - ntp
+  - chrony
   - numactl
   - pciutils
   - pigz
@@ -82,7 +82,6 @@ common_utils_apt:
   - ntp
   - smartmontools
   - ncdu
-  - dstat
   - jq
   - ipmitool
   - nano
@@ -96,7 +95,11 @@ common_utils_apt:
   - ethtool
   - sudo
   - software-properties-common
-  - libgeoip-dev
+  - python3
+  - python3-dev
+  - python3-pip
+  - python3-venv
+  - python3-yaml
   - qrencode
   - caca-utils
   - pwgen

@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 import os
 import sys
@@ -59,7 +59,7 @@ class AuthManager(object):
 
         self.params['project_name'] = self.params['project'][0]
         if self.params['project_name'] is not None:
-            if re.match('^[A-Za-z,\d\-]*$', self.params['project_name']) is None and len(self.params['project_name']) < 48:
+            if re.match(r'^[A-Za-z,\d\-]*$', self.params['project_name']) is None or len(self.params['project_name']) > 48:
                 LOGGER.critical('[project_name] Validation not passed')
                 sys.exit(1)
             self.params['project_name'] = self.params['project_name'].lower()
@@ -88,7 +88,7 @@ class AuthManager(object):
 
         self.params['server_user'] = self.params['user'][0]
         if self.params['server_user'] is not None:
-            if re.match('^[A-Za-z,\d\-]*$', self.params['server_user']) is None and len(self.params['server_user']) < 48:
+            if re.match(r'^[A-Za-z,\d\-]*$', self.params['server_user']) is None or len(self.params['server_user']) > 48:
                 LOGGER.critical('[user] Validation not passed')
                 sys.exit(1)
 
@@ -132,6 +132,8 @@ class AuthManager(object):
         if self.params['server_id'] is not None:
             key = 'server_{0}'.format(self.params['server_id'])
             host = self.redis.get(key)
+            if isinstance(host, bytes):
+                host = host.decode('utf-8')
             print(json.dumps(json.loads(host), indent=4))
         else:
             LOGGER.critical('--server-id not passed')
@@ -158,6 +160,8 @@ class AuthManager(object):
         if self.params['project_name'] is not None:
             redis_key = 'ssh_config_{0}'.format(self.params['project_name'])
             host = self.redis.get(redis_key)
+            if isinstance(host, bytes):
+                host = host.decode('utf-8')
             print(json.dumps(json.loads(host), indent=4))
         else:
             LOGGER.critical('--project not passed')

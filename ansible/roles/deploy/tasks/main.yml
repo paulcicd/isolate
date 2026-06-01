@@ -22,7 +22,11 @@
     mode: "u+rw,g+rw,o-rwx"
 
 - name: Installing pip requirements.txt...
-  pip: requirements="{{ deploy_path }}/requirements.txt" umask=0022
+  pip:
+    requirements: "{{ deploy_path }}/requirements.txt"
+    executable: pip3
+    extra_args: --break-system-packages
+    umask: "0022"
 
 - name: Executing deploy script...
   shell: "bash --norc {{ deploy_path }}/scripts/fix-perms.sh"

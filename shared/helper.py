@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 from time import time
 import argparse
@@ -15,6 +15,10 @@ from redis import Redis
 from operator import itemgetter
 from pyzabbix import ZabbixAPI
 # from IsolateCore import __version__
+from isolate_config import load_config
+from isolate_identity import local_identity
+from isolate_logging import SessionLogger
+from isolate_policy import PolicyDenied, resolve_policy
 
 
 LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
@@ -37,7 +41,7 @@ def merge_dicts(*dict_args):
         if dictionary is None:
             continue
         else:
-            for key in dictionary.keys():
+            for key in list(dictionary.keys()):
                 if dictionary[key] is None:
                     del dictionary[key]
         result.update(dictionary)
@@ -133,6 +137,8 @@ class IsolateRedisHosts(object):
     def get_hosts(self):
         for server_key in self.redis.keys('server_*'):
             server_data = self.redis.get(server_key)
+            if isinstance(server_data, bytes):
+                server_data = server_data.decode('utf-8')
             server_data = json.loads(server_data)
             self.projects.append(server_data['project_name'])
             self.hosts_dump.append(server_data)
@@ -145,6 +151,8 @@ class IsolateRedisHosts(object):
         redis_key = 'ssh_config_{0}'.format(project)
         res = self.redis.get(redis_key)
         if res is not None:
+            if isinstance(res, bytes):
+                res = res.decode('utf-8')
             return json.loads(res)
         else:
             return None
@@ -155,9 +163,20 @@ class IsolateRedisHosts(object):
         LOGGER.debug(redis_key)
         res = self.redis.get(redis_key)
         if res is not None:
+            if isinstance(res, bytes):
+                res = res.decode('utf-8')
             return json.loads(res)
         else:
             return None
+
+    def get_policy_rules(self):
+        rules = []
+        for policy_key in self.redis.keys('policy_*'):
+            policy_data = self.redis.get(policy_key)
+            if isinstance(policy_data, bytes):
+                policy_data = policy_data.decode('utf-8')
+            rules.append(json.loads(policy_data))
+        return rules
 
     def put_projects_list(self):
         self.redis.set('projects_list', ' '.join(self.projects))
@@ -228,6 +247,8 @@ class ServerConnection(object):
             self.proxy_port = proxy_config.get('server_port', None)
             self.proxy_user = proxy_config.get('server_user', None)
 
+        self._resolve_v2_policy(final_config)
+
         # LOGGER.critical(json.dumps(project_config, indent=4))
         # LOGGER.critical(json.dumps(host_config, indent=4))
         # LOGGER.critical(json.dumps(proxy_config, indent=4))
@@ -270,6 +291,26 @@ class ServerConnection(object):
         LOGGER.debug(json.dumps(proxy_config, indent=4))
         return proxy_config
 
+    def _resolve_v2_policy(self, host_config):
+        config = getattr(self.helper, "config", {})
+        identity = getattr(self.helper, "identity", {})
+        policy_defaults = {}
+        policy_defaults.update(config.get("policy", {}))
+        policy_defaults.update(config.get("ssh", {}))
+        try:
+            decision = resolve_policy(
+                identity,
+                project=self.project_name,
+                host=host_config,
+                rules=self.helper.db.get_policy_rules() if hasattr(self.helper.db, "get_policy_rules") else [],
+                defaults=policy_defaults,
+            )
+            self.user = decision["remote_user"]
+            self.policy_decision = decision
+        except PolicyDenied as exc:
+            self.policy_decision = {"denied": str(exc)}
+            raise
+
     #
     # build commands
     #
@@ -308,9 +349,27 @@ class ServerConnection(object):
 
     def start(self):
         self._validate()
-        self.resolve()
+        try:
+            self.resolve()
+        except PolicyDenied as exc:
+            self.helper.audit.event(
+                "policy_denied",
+                project=self.project_name,
+                host_id=self.server_id,
+                reason=str(exc),
+            )
+            raise
         self.build_cmd()
         self._write_session()
+
+        self.helper.audit.event(
+            "policy_selected",
+            project=self.project_name,
+            host_id=self.server_id,
+            target_host=self.host,
+            remote_user=self.user,
+            policy=self.policy_decision,
+        )
 
         # debug
         self.__dict__.pop('helper', None)
@@ -328,7 +387,11 @@ class AuthHelper(object):
         self.time_start = time()
         self.args = args
         self.unknown_args = unknown_args
+        self.config = load_config()
         self._init_env_vars()
+        self.identity = local_identity(os.getenv('USER', 'USER_ENV_NOT_SET'), [])
+        self.audit = SessionLogger(self.config["logging"]["base_path"], self.identity)
+        self.audit.event("helper_start", argv=sys.argv)
         self.hosts_dump = []
         self.projects = []
 
@@ -395,7 +458,7 @@ class AuthHelper(object):
             return False
         if hostname[-1] == '.' or hostname[0] == '.' or '.' not in hostname:
             return False
-        if re.match('^([a-z\d\-.]*)$', hostname) is None:
+        if re.match(r'^([a-z\d\-.]*)$', hostname) is None:
             return False
         return True
 
