@@ -550,6 +550,29 @@ Re-apply permissions after deploy:
 bash /opt/auth/scripts/fix-perms.sh
 ```
 
+If `g` fails with `PermissionError: /opt/auth/configs/isolate.yml`, verify that
+the runtime user `auth` can read the config:
+
+```bash
+sudo -u auth test -r /opt/auth/configs/isolate.yml && echo OK
+sudo -u auth test -r /opt/auth/configs/defaults.conf && echo OK
+namei -l /opt/auth/configs/isolate.yml
+```
+
+Expected config permissions:
+
+```text
+/opt/auth/configs              auth:auth 0750
+/opt/auth/configs/isolate.yml  auth:auth 0640
+/opt/auth/configs/defaults.conf auth:auth 0640
+```
+
+Re-apply permissions:
+
+```bash
+bash /opt/auth/scripts/fix-perms.sh
+```
+
 Check SSH key and known hosts:
 
 ```bash

@@ -14,7 +14,11 @@ find "${AUTH_DATA_ROOT}" -type f -print0 | xargs -n60 -P 5 -0 chmod 0600
 chmod 0750 "${AUTH_DATA_ROOT}";
 chmod 0700 "${AUTH_DATA_ROOT}/wrappers/ssh.py";
 
-chmod 0700 "${AUTH_DATA_ROOT}/configs"
+# Runtime processes run as the auth user and must be able to read configs.
+# Configs may contain secrets, so keep them readable only by auth/auth group.
+chown -R auth:auth "${AUTH_DATA_ROOT}/configs"
+chmod 0750 "${AUTH_DATA_ROOT}/configs"
+find "${AUTH_DATA_ROOT}/configs" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
 
 # Logs are written by interactive users in the auth group. Keep the rest of
 # /opt/auth strict, but preserve group-write and setgid for session logs.
