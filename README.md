@@ -153,6 +153,7 @@ keycloak:
     - openid
     - profile
     - email
+  tls_verify: true
 
 ssh:
   binary: /usr/bin/ssh
@@ -572,6 +573,43 @@ Re-apply permissions:
 ```bash
 bash /opt/auth/scripts/fix-perms.sh
 ```
+
+If `isolate login` fails with `Permission denied` for
+`/opt/auth/shared/isolate.py`, verify that the user is in the `auth` group and
+that the CLI file is executable by that group:
+
+```bash
+id <user>
+ls -l /opt/auth/shared/isolate.py
+test -x /opt/auth/shared/isolate.py && echo OK
+```
+
+Expected permission:
+
+```text
+/opt/auth/shared/isolate.py auth:auth 0750
+```
+
+If `isolate login` fails with a Keycloak HTTP error, the CLI prints the
+response status and `error_description` when Keycloak returns JSON. Validate the
+device endpoint directly:
+
+```bash
+ISSUER='https://keycloak.example.org/realms/infra'
+CLIENT_ID='isolate-bastion'
+CLIENT_SECRET='secret'
+
+curl -i -X POST "$ISSUER/protocol/openid-connect/auth/device" \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  --data-urlencode "client_id=$CLIENT_ID" \
+  --data-urlencode "client_secret=$CLIENT_SECRET" \
+  --data-urlencode "scope=openid profile email"
+```
+
+The isolate client sends `User-Agent: isolate-bastion/2.0` and
+`Accept: application/json` to avoid generic WAF blocks. Keep `tls_verify: true`
+for production; set it to `false` only for temporary lab environments with
+self-signed certificates.
 
 Check SSH key and known hosts:
 

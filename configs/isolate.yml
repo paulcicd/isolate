@@ -16,6 +16,7 @@ keycloak:
     - profile
     - email
   poll_timeout: 300
+  tls_verify: true
 
 ssh:
   binary: /usr/bin/ssh

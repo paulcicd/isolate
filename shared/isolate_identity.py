@@ -4,9 +4,10 @@
 
 import json
 import base64
+import ssl
 import time
 import uuid
-from urllib import parse, request
+from urllib import error, parse, request
 
 
 class IdentityError(Exception):
@@ -71,6 +72,7 @@ class KeycloakDeviceClient(object):
             issuer + "/protocol/openid-connect/token"
         )
         self.poll_timeout = int(self.config.get("poll_timeout", 300))
+        self.tls_verify = bool(self.config.get("tls_verify", True))
 
     def start(self):
         payload = {
@@ -125,17 +127,39 @@ class KeycloakDeviceClient(object):
         return response
 
     @staticmethod
-    def _post(url, payload, allow_error=False):
+    def _format_http_error(exc):
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+            detail = parsed.get("error_description") or parsed.get("error") or body
+        except ValueError:
+            detail = body
+        return "Keycloak HTTP {} {}: {}".format(exc.code, exc.reason, detail.strip())
+
+    def _post(self, url, payload, allow_error=False):
         data = parse.urlencode(payload).encode("utf-8")
         req = request.Request(
             url,
             data=data,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                "Accept": "application/json",
+                "User-Agent": "isolate-bastion/2.0",
+            },
         )
+        context = None
+        if not self.tls_verify:
+            context = ssl._create_unverified_context()
         try:
-            with request.urlopen(req, timeout=15) as resp:
+            with request.urlopen(req, timeout=15, context=context) as resp:
                 return json.loads(resp.read().decode("utf-8"))
-        except Exception as exc:
-            if allow_error and hasattr(exc, "read"):
-                return json.loads(exc.read().decode("utf-8"))
-            raise
+        except error.HTTPError as exc:
+            if allow_error:
+                body = exc.read().decode("utf-8", errors="replace")
+                try:
+                    return json.loads(body)
+                except ValueError:
+                    raise IdentityError("Keycloak HTTP {} {}: {}".format(exc.code, exc.reason, body.strip()))
+            raise IdentityError(self._format_http_error(exc))
+        except error.URLError as exc:
+            raise IdentityError("Keycloak request failed: {}".format(exc.reason))

@@ -10,7 +10,7 @@ import sys
 from redis import Redis
 
 from isolate_config import load_config
-from isolate_identity import KeycloakDeviceClient, decode_jwt_payload, normalize_claims
+from isolate_identity import IdentityError, KeycloakDeviceClient, decode_jwt_payload, normalize_claims
 from isolate_policy import PolicyDenied, resolve_policy
 
 
@@ -106,22 +106,26 @@ def cmd_session_search(args, config):
 
 def cmd_login(args, config):
     client = KeycloakDeviceClient(config["keycloak"])
-    device = client.start()
-    url = device.get("verification_uri_complete") or device.get("verification_uri")
-    print("Open this URL to authorize Isolate:")
-    print(url)
-    if device.get("user_code"):
-        print("Code: {}".format(device["user_code"]))
-    tokens = client.poll(device["device_code"], interval=int(device.get("interval", 5)))
-    claims = {}
-    if tokens.get("access_token"):
-        introspected = client.introspect(tokens["access_token"])
-        if introspected:
-            claims.update(introspected)
-    if tokens.get("id_token"):
-        claims.update(decode_jwt_payload(tokens["id_token"]))
-    identity = normalize_claims(claims)
-    print(json.dumps(identity, indent=2, sort_keys=True))
+    try:
+        device = client.start()
+        url = device.get("verification_uri_complete") or device.get("verification_uri")
+        print("Open this URL to authorize Isolate:")
+        print(url)
+        if device.get("user_code"):
+            print("Code: {}".format(device["user_code"]))
+        tokens = client.poll(device["device_code"], interval=int(device.get("interval", 5)))
+        claims = {}
+        if tokens.get("access_token"):
+            introspected = client.introspect(tokens["access_token"])
+            if introspected:
+                claims.update(introspected)
+        if tokens.get("id_token"):
+            claims.update(decode_jwt_payload(tokens["id_token"]))
+        identity = normalize_claims(claims)
+        print(json.dumps(identity, indent=2, sort_keys=True))
+    except IdentityError as exc:
+        print("isolate login failed: {}".format(exc), file=sys.stderr)
+        return 2
 
 
 def build_parser():

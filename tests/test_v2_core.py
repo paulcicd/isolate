@@ -3,11 +3,13 @@ import shutil
 import sys
 import uuid
 import unittest
+from io import BytesIO
+from urllib.error import HTTPError
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 
-from isolate_identity import normalize_claims
+from isolate_identity import IdentityError, KeycloakDeviceClient, normalize_claims
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, resolve_policy
 from isolate_ssh import SSHArgumentError, build_ssh_argv
@@ -77,6 +79,22 @@ class IdentityTest(unittest.TestCase):
         self.assertEqual(identity["username"], "alice")
         self.assertEqual(identity["groups"], ["/ops", "/prod"])
         self.assertEqual(identity["roles"], ["bastion"])
+
+    def test_formats_keycloak_http_error_body(self):
+        exc = HTTPError(
+            "https://keycloak.example/auth/device",
+            403,
+            "Forbidden",
+            {},
+            BytesIO(b'{"error":"access_denied","error_description":"blocked by policy"}'),
+        )
+        client = KeycloakDeviceClient({"issuer": "https://keycloak.example", "client_id": "isolate"})
+
+        with self.assertRaises(IdentityError) as ctx:
+            raise IdentityError(client._format_http_error(exc))
+
+        self.assertIn("HTTP 403 Forbidden", str(ctx.exception))
+        self.assertIn("blocked by policy", str(ctx.exception))
 
 
 class SessionLoggerTest(unittest.TestCase):

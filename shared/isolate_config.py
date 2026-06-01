@@ -35,6 +35,7 @@ DEFAULT_CONFIG = {
         "introspection_endpoint": None,
         "jwks_uri": None,
         "poll_timeout": 300,
+        "tls_verify": True,
     },
     "ssh": {
         "binary": "/usr/bin/ssh",
