@@ -66,6 +66,23 @@ ansible-playbook main.yml -e redis_pass='CHANGE_ME_STRONG_PASSWORD'
 
 The playbook creates the `auth` service user, installs Redis and system packages, deploys the repository to `/opt/auth`, installs Python dependencies with `pip3`, and applies file permissions.
 
+Enable Git permission repair hooks on the bastion checkout:
+
+```bash
+cd /opt/auth
+git config core.hooksPath .githooks
+sudo bash /opt/auth/scripts/fix-perms.sh
+```
+
+Git does not preserve Unix owners/groups or the full permission model required
+by the runtime. After any manual `git pull`, `git checkout`, or
+`git reset --hard origin/master`, either let the hooks run or repair
+permissions explicitly:
+
+```bash
+sudo bash /opt/auth/scripts/fix-perms.sh
+```
+
 ### 3. Load shell helpers
 
 Add this to `/etc/bash.bashrc` on Ubuntu/Debian:
@@ -572,6 +589,17 @@ Re-apply permissions:
 
 ```bash
 bash /opt/auth/scripts/fix-perms.sh
+```
+
+If shell helpers disappear after a Git update, verify the whole path and repair
+permissions as root:
+
+```bash
+id alice
+namei -l /opt/auth/shared/bash.sh
+namei -l /opt/auth/configs/isolate.yml
+ls -ld /opt/auth /opt/auth/shared /opt/auth/configs /opt/auth/logs
+sudo bash /opt/auth/scripts/fix-perms.sh
 ```
 
 If `isolate login` fails with `Permission denied` for

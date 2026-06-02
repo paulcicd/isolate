@@ -1,4 +1,5 @@
 !.gitignore
+.githooks
 ansible/develop-hosts.ini
 keys/*
 logs/*

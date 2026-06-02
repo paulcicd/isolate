@@ -31,7 +31,7 @@
 - name: Executing deploy script...
   shell: "bash --norc {{ deploy_path }}/scripts/fix-perms.sh"
   become: yes
-  become_user: auth
+  become_user: root
 
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"
