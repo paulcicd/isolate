@@ -11,6 +11,7 @@ from copy import copy
 from uuid import uuid4
 import socket
 import re
+import shlex
 from redis import Redis
 from operator import itemgetter
 from pyzabbix import ZabbixAPI
@@ -236,6 +237,7 @@ class ServerConnection(object):
     def __init__(self, helper=None, unknown_args=None):
         self.helper = helper
         self.unknown_args = unknown_args
+        self.ssh_wrapper_argv = shlex.split(os.getenv('ISOLATE_WRAPPER', self.ssh_wrapper_cmd))
 
     #
     # perform connection structure checks
@@ -327,6 +329,9 @@ class ServerConnection(object):
                 defaults=policy_defaults,
             )
             self.user = decision["remote_user"]
+            sudo_mode = str(decision.get("sudo_mode") or "").lower()
+            if sudo_mode in ("none", "no", "false", "nosudo", "no-sudo"):
+                self.nosudo = True
             self.policy_decision = decision
         except PolicyDenied as exc:
             self.policy_decision = {"denied": str(exc)}
@@ -338,27 +343,28 @@ class ServerConnection(object):
     def build_cmd(self):
 
         if self.host:
-            self.ssh_wrapper_cmd += ' {}'.format(self.host)
+            self.ssh_wrapper_argv.append(str(self.host))
         if self.port:
-            self.ssh_wrapper_cmd += ' --port {}'.format(self.port)
+            self.ssh_wrapper_argv.extend(['--port', str(self.port)])
         if self.user:
-            self.ssh_wrapper_cmd += ' --user {}'.format(self.user)
+            self.ssh_wrapper_argv.extend(['--user', str(self.user)])
         if self.nosudo:
-            self.ssh_wrapper_cmd += ' --nosudo'
+            self.ssh_wrapper_argv.append('--nosudo')
 
         if self.proxy_id:
-            self.ssh_wrapper_cmd += ' --proxy-id {}'.format(self.proxy_id)
+            self.ssh_wrapper_argv.extend(['--proxy-id', str(self.proxy_id)])
         if self.proxy_host:
-            self.ssh_wrapper_cmd += ' --proxy-host {}'.format(self.proxy_host)
+            self.ssh_wrapper_argv.extend(['--proxy-host', str(self.proxy_host)])
         if self.proxy_port:
-            self.ssh_wrapper_cmd += ' --proxy-port {}'.format(self.proxy_port)
+            self.ssh_wrapper_argv.extend(['--proxy-port', str(self.proxy_port)])
         if self.proxy_user:
-            self.ssh_wrapper_cmd += ' --proxy-user {}'.format(self.proxy_user)
+            self.ssh_wrapper_argv.extend(['--proxy-user', str(self.proxy_user)])
 
         if bool(self.unknown_args):
-            self.ssh_wrapper_cmd += ' ' + ' '.join(self.unknown_args)
+            self.ssh_wrapper_argv.extend(self.unknown_args)
 
-        self.session_exports.append('ISOLATE_CALLBACK_CMD="{}"'.format(self.ssh_wrapper_cmd))
+        callback_argv = ' '.join([shlex.quote(str(arg)) for arg in self.ssh_wrapper_argv])
+        self.session_exports.append('ISOLATE_CALLBACK_CMD=({})'.format(callback_argv))
 
     def _write_session(self):
         if self.ISOLATE_SESSION is None:

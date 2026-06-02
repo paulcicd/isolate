@@ -306,7 +306,7 @@ Create a project set and allow a Keycloak group to access it:
 
 ```bash
 isolate project-set add prod-all --project prod --project-glob '*-prod'
-isolate grant add --group DevOps --project-set prod-all --remote-user support
+isolate grant add --group DevOps --project-set prod-all --remote-user support --sudo-mode none
 ```
 
 Add a more specific user/host override:
@@ -401,9 +401,9 @@ isolate project-set add prod-all --project prod --project-glob '*-prod'
 isolate project-set add-pattern poker-all --project-glob 'poker*'
 isolate project-set remove-project prod-all old-prod
 
-isolate grant add --group DevOps --project-set prod-all --remote-user support
-isolate grant add --group OS-admin --project '*' --remote-user root
-isolate grant add --group pokerteam --project-glob 'poker*' --remote-user poker-support
+isolate grant add --group DevOps --project-set prod-all --remote-user support --sudo-mode none
+isolate grant add --group OS-admin --project '*' --remote-user root --sudo-mode none
+isolate grant add --group pokerteam --project-glob 'poker*' --remote-user poker-support --sudo-mode none
 isolate grant add --user alice --project prod --host 10001 --remote-user alice
 isolate grant revoke --group pokerteam --project poker-old
 isolate grant test --user alice --group DevOps --project prod --host 10001
@@ -414,6 +414,7 @@ Grant selectors are designed for large fleets:
 - `--project prod` grants one exact project.
 - `--project-glob '*-prod'` grants every matching project name.
 - `--project-set prod-all` grants a named set containing exact projects and glob patterns.
+- `--sudo-mode none` opens the remote user's normal shell. The default `sudo-i` runs `sudo -i` after SSH and therefore requires passwordless sudo on the target for that remote user.
 
 Grant precedence:
 

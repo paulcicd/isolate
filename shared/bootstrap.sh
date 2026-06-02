@@ -85,7 +85,11 @@ auth_callback () {
     auth_callback_cleanup;
 
     if [ "${ISOLATE_CALLBACK}" == "${ISOLATE_SESSION}" ]; then
-        ${ISOLATE_CALLBACK_CMD:-/bin/false};
+        if [ -n "${ISOLATE_CALLBACK_CMD+x}" ]; then
+            "${ISOLATE_CALLBACK_CMD[@]}";
+        else
+            /bin/false;
+        fi
     fi
 }
 
