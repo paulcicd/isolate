@@ -282,29 +282,7 @@ Connect without remote `sudo -i`:
 g prod test-ubuntu --nosudo
 ```
 
-### 6. Test v2 policy resolver
-
-Add a group policy:
-
-```bash
-isolate policy add --subject group --name /ops --project prod --remote-user support
-```
-
-Add a more specific user/host policy:
-
-```bash
-isolate policy add --subject user --name alice --project prod --host 10001 --remote-user alice
-```
-
-Test policy resolution:
-
-```bash
-isolate policy test --user alice --group /ops --project prod --host 10001
-```
-
-Expected result: `remote_user` is `alice`, because user+host policy has higher priority than group+project policy.
-
-### 7. Test Keycloak device-flow login
+### 6. Test Keycloak device-flow login
 
 Configure Keycloak:
 
@@ -317,11 +295,40 @@ Run:
 
 ```bash
 isolate login
+isolate whoami
 ```
 
-Open the printed verification URL, enter the user code if required, and approve the login. The command prints normalized identity fields: `session_id`, `keycloak_sub`, `username`, `email`, `groups`, and `roles`.
+Open the printed verification URL, enter the user code if required, and approve the login. The command saves normalized identity fields to `~/.isolate/identity.json`: `session_id`, `keycloak_sub`, `username`, `email`, `groups`, `roles`, and token expiration. User-facing `s` and `g` require this valid identity.
 
-Current status: this is the v2 CLI/PAM-helper foundation. Full PAM wiring can be added on top of the same device-flow client.
+### 7. Test grant-based RBAC
+
+Create a project set and allow a Keycloak group to access it:
+
+```bash
+isolate project-set add prod-all --project prod --project-glob '*-prod'
+isolate grant add --group DevOps --project-set prod-all --remote-user support
+```
+
+Add a more specific user/host override:
+
+```bash
+isolate grant add --user alice --project prod --host 10001 --remote-user alice
+```
+
+Test resolution:
+
+```bash
+isolate grant test --user alice --group DevOps --project prod --host 10001
+```
+
+Expected result: `remote_user` is `alice`, because user+host grants have higher priority than group/project-set grants.
+
+Now `alice` should only see hosts covered by matching grants:
+
+```bash
+s .
+g prod test-ubuntu --debug
+```
 
 ### 8. Test session audit logs
 
@@ -387,24 +394,37 @@ auth-dump-project-config prod
 auth-del-project-config prod
 ```
 
-### v2 policies
+### v2 grants and project sets
 
 ```bash
-isolate policy add --subject group --name /ops --project prod --remote-user support
-isolate policy add --subject user --name alice --project prod --host 10001 --remote-user alice
-isolate policy test --user alice --group /ops --project prod --host 10001
+isolate project-set add prod-all --project prod --project-glob '*-prod'
+isolate project-set add-pattern poker-all --project-glob 'poker*'
+isolate project-set remove-project prod-all old-prod
+
+isolate grant add --group DevOps --project-set prod-all --remote-user support
+isolate grant add --group OS-admin --project '*' --remote-user root
+isolate grant add --group pokerteam --project-glob 'poker*' --remote-user poker-support
+isolate grant add --user alice --project prod --host 10001 --remote-user alice
+isolate grant revoke --group pokerteam --project poker-old
+isolate grant test --user alice --group DevOps --project prod --host 10001
 ```
 
-Policy precedence:
+Grant selectors are designed for large fleets:
+
+- `--project prod` grants one exact project.
+- `--project-glob '*-prod'` grants every matching project name.
+- `--project-set prod-all` grants a named set containing exact projects and glob patterns.
+
+Grant precedence:
 
 1. user + host
 2. user + project
 3. group + host
 4. group + project
-5. host/project defaults
-6. configured fallback remote user
+5. project set
+6. project glob
 
-If no remote user can be resolved, access is denied.
+Access is denied by default. Without a valid `isolate login` identity and a matching grant, `s` hides the server and `g` refuses to connect before SSH starts.
 
 ## Session Logging
 
@@ -508,7 +528,9 @@ py -3 -m unittest discover -s tests
 
 Current focused tests cover:
 
-- policy precedence
+- grant precedence
+- project-set and project-glob matching
+- identity cache roundtrip and expiry
 - deny when no remote user can be resolved
 - safe SSH argv construction
 - rejection of unknown SSH arguments
@@ -649,13 +671,16 @@ ls -la /opt/auth/known_hosts
 If policy resolution denies access, run:
 
 ```bash
-isolate policy test --user <username> --group <group> --project <project> --host <server_id>
+isolate whoami
+isolate grant test --user <username> --group <group> --project <project> --host <server_id>
 ```
+
+If `isolate whoami` fails or shows an expired token, run `isolate login` again.
 
 ## Compatibility Notes
 
 - Existing Redis `server_*` host records are still read by the helper.
 - Existing `auth-add-host`, `auth-dump-host`, `auth-del-host`, `s`, `g`, and `p` workflows remain available.
-- v2 policies are stored as Redis `policy_*` keys.
+- v2 grants are stored as Redis `grant_*` keys and project sets as `project_set_*` keys. Existing `policy_*` keys are still read as compatibility grants.
 - The old global `StrictHostKeyChecking no` default was replaced with `accept-new` and `/opt/auth/known_hosts`.
 - `UseRoaming` was removed because modern OpenSSH no longer supports it.

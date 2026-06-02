@@ -16,9 +16,9 @@ from operator import itemgetter
 from pyzabbix import ZabbixAPI
 # from IsolateCore import __version__
 from isolate_config import load_config
-from isolate_identity import local_identity
+from isolate_identity import IdentityError, load_cached_identity, local_identity
 from isolate_logging import SessionLogger
-from isolate_policy import PolicyDenied, resolve_policy
+from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 
 
 LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
@@ -178,6 +178,26 @@ class IsolateRedisHosts(object):
             rules.append(json.loads(policy_data))
         return rules
 
+    def get_grants(self):
+        grants = []
+        for pattern in ('grant_*', 'policy_*'):
+            for grant_key in self.redis.keys(pattern):
+                grant_data = self.redis.get(grant_key)
+                if isinstance(grant_data, bytes):
+                    grant_data = grant_data.decode('utf-8')
+                grants.append(json.loads(grant_data))
+        return grants
+
+    def get_project_sets(self):
+        project_sets = {}
+        for project_set_key in self.redis.keys('project_set_*'):
+            project_set_data = self.redis.get(project_set_key)
+            if isinstance(project_set_data, bytes):
+                project_set_data = project_set_data.decode('utf-8')
+            project_set = json.loads(project_set_data)
+            project_sets[project_set['name']] = project_set
+        return project_sets
+
     def put_projects_list(self):
         self.redis.set('projects_list', ' '.join(self.projects))
 
@@ -298,11 +318,12 @@ class ServerConnection(object):
         policy_defaults.update(config.get("policy", {}))
         policy_defaults.update(config.get("ssh", {}))
         try:
-            decision = resolve_policy(
+            decision = resolve_grant(
                 identity,
                 project=self.project_name,
                 host=host_config,
-                rules=self.helper.db.get_policy_rules() if hasattr(self.helper.db, "get_policy_rules") else [],
+                grants=self.helper.db.get_grants() if hasattr(self.helper.db, "get_grants") else [],
+                project_sets=self.helper.db.get_project_sets() if hasattr(self.helper.db, "get_project_sets") else {},
                 defaults=policy_defaults,
             )
             self.user = decision["remote_user"]
@@ -358,7 +379,8 @@ class ServerConnection(object):
                 host_id=self.server_id,
                 reason=str(exc),
             )
-            raise
+            self.helper.print_p("Policy denied: {}".format(exc), stderr=True)
+            sys.exit(2)
         self.build_cmd()
         self._write_session()
 
@@ -389,7 +411,7 @@ class AuthHelper(object):
         self.unknown_args = unknown_args
         self.config = load_config()
         self._init_env_vars()
-        self.identity = local_identity(os.getenv('USER', 'USER_ENV_NOT_SET'), [])
+        self.identity = self._load_identity()
         self.audit = SessionLogger(self.config["logging"]["base_path"], self.identity)
         self.audit.event("helper_start", argv=sys.argv)
         self.hosts_dump = []
@@ -405,6 +427,15 @@ class AuthHelper(object):
 
         self._load_data()
         LOGGER.debug('AuthHelper init done')
+
+    def _load_identity(self):
+        if self.args.action[0] == 'cron':
+            return local_identity(os.getenv('USER', 'USER_ENV_NOT_SET'), [])
+        try:
+            return load_cached_identity()
+        except IdentityError as exc:
+            self.print_p("Isolate identity unavailable: {}; run isolate login".format(exc), stderr=True)
+            sys.exit(2)
 
     @staticmethod
     def print_p(arg, stderr=False):
@@ -487,7 +518,18 @@ class AuthHelper(object):
 
     def _load_data(self):
         self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
-        self.projects = list(sorted(set(self.db.get_projects())))
+        if self.args.action[0] != 'cron':
+            policy_defaults = {}
+            policy_defaults.update(self.config.get("policy", {}))
+            policy_defaults.update(self.config.get("ssh", {}))
+            self.hosts_dump = filter_allowed_hosts(
+                self.identity,
+                self.hosts_dump,
+                grants=self.db.get_grants() if hasattr(self.db, "get_grants") else [],
+                project_sets=self.db.get_project_sets() if hasattr(self.db, "get_project_sets") else {},
+                defaults=policy_defaults,
+            )
+        self.projects = list(sorted(set([host['project_name'] for host in self.hosts_dump])))
         self.projects = [x.lower() for x in self.projects]
         self.projects_configs = self.db
         LOGGER.debug('_load_data')

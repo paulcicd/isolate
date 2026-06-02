@@ -4,6 +4,7 @@
 
 import json
 import base64
+import os
 import ssl
 import time
 import uuid
@@ -33,6 +34,7 @@ def normalize_claims(claims):
         "email": claims.get("email"),
         "groups": sorted(set(groups)),
         "roles": sorted(set(roles)),
+        "exp": claims.get("exp"),
         "raw_claims": claims,
     }
 
@@ -54,6 +56,62 @@ def decode_jwt_payload(token):
     payload = token.split(".")[1]
     payload += "=" * (-len(payload) % 4)
     return json.loads(base64.urlsafe_b64decode(payload.encode("utf-8")).decode("utf-8"))
+
+
+def identity_cache_path(path=None):
+    if path:
+        return path
+    override = os.getenv("ISOLATE_IDENTITY_PATH")
+    if override:
+        return override
+    return os.path.join(os.path.expanduser("~"), ".isolate", "identity.json")
+
+
+def save_identity(identity, path=None):
+    path = identity_cache_path(path)
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(directory, 0o700)
+    except OSError:
+        pass
+
+    tmp_path = "{}.tmp".format(path)
+    with open(tmp_path, "w", encoding="utf-8") as identity_f:
+        json.dump(identity, identity_f, indent=2, sort_keys=True)
+        identity_f.write("\n")
+    try:
+        os.chmod(tmp_path, 0o600)
+    except OSError:
+        pass
+    os.replace(tmp_path, path)
+    return path
+
+
+def load_cached_identity(path=None, now=None, require_valid=True):
+    path = identity_cache_path(path)
+    if not os.path.exists(path):
+        raise IdentityError("no isolate identity found; run isolate login")
+
+    with open(path, "r", encoding="utf-8") as identity_f:
+        identity = json.load(identity_f)
+
+    if require_valid:
+        exp = identity.get("exp")
+        if exp is None:
+            exp = (identity.get("raw_claims") or {}).get("exp")
+        if exp is not None and int(exp) <= int(now if now is not None else time.time()):
+            raise IdentityError("isolate identity expired; run isolate login")
+    return identity
+
+
+def clear_cached_identity(path=None):
+    path = identity_cache_path(path)
+    try:
+        os.unlink(path)
+        return True
+    except FileNotFoundError:
+        return False
 
 
 class KeycloakDeviceClient(object):
