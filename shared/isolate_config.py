@@ -52,6 +52,11 @@ DEFAULT_CONFIG = {
         "jsonl_name": "session.jsonl",
         "sink": "local",
     },
+    "history": {
+        "admin_groups": [],
+        "default_limit": 10,
+        "max_limit": 100,
+    },
     "policy": {
         "default_allowed_actions": ["ssh"],
         "fallback_remote_user": None,

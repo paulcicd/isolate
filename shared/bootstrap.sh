@@ -118,6 +118,11 @@ p () {
     "${ISOLATE_HELPER}" projects;
 }
 
+f () {
+    deploy_lock
+    "${ISOLATE_CLI}" history "${@}";
+}
+
 auth-add-user () {
     if [[ $# -eq 0 ]] ; then
         echo -e "\\n  Usage: auth-add-user <username> \\n";

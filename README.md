@@ -376,6 +376,18 @@ g 192.0.2.20 --nosudo
 p
 ```
 
+### Connection history
+
+```bash
+f
+f kube
+f 10004
+f voskoboinikov
+```
+
+By default `f` shows the current user's last 10 connections. Users in
+`history.admin_groups` can search other users, projects, hosts, and server ids.
+
 ## Admin Commands
 
 ### Hosts
@@ -399,12 +411,19 @@ auth-del-project-config prod
 ```bash
 isolate project-set add prod-all --project prod --project-glob '*-prod'
 isolate project-set add-pattern poker-all --project-glob 'poker*'
+isolate project-set list
+isolate project-set show prod-all
 isolate project-set remove-project prod-all old-prod
+isolate project-set remove-pattern prod-all '*-old'
+isolate project-set remove prod-all
 
 isolate grant add --group DevOps --project-set prod-all --remote-user support --sudo-mode none
 isolate grant add --group OS-admin --project '*' --remote-user root --sudo-mode none
 isolate grant add --group pokerteam --project-glob 'poker*' --remote-user poker-support --sudo-mode none
 isolate grant add --user alice --project prod --host 10001 --remote-user alice
+isolate grant list --group DevOps
+isolate grant show --id 1
+isolate grant update --id 1 --remote-user l2-support --sudo-mode none
 isolate grant revoke --group pokerteam --project poker-old
 isolate grant test --user alice --group DevOps --project prod --host 10001
 ```
@@ -426,6 +445,30 @@ Grant precedence:
 6. project glob
 
 Access is denied by default. Without a valid `isolate login` identity and a matching grant, `s` hides the server and `g` refuses to connect before SSH starts.
+
+### History admin config
+
+Ordinary users can read only their own history. Users in configured admin groups
+can query everyone:
+
+```yaml
+history:
+  admin_groups:
+    - DevOps
+    - OS-admin
+  default_limit: 10
+  max_limit: 100
+```
+
+CLI equivalent:
+
+```bash
+isolate history
+isolate history kube
+isolate history --user voskoboinikov
+isolate history --project kube --limit 20
+isolate history --host 10004 --json
+```
 
 ## Session Logging
 
@@ -531,6 +574,8 @@ Current focused tests cover:
 
 - grant precedence
 - project-set and project-glob matching
+- grant list/update helpers
+- connection history parsing and ACL
 - identity cache roundtrip and expiry
 - deny when no remote user can be resolved
 - safe SSH argv construction

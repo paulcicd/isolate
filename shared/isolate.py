@@ -18,6 +18,7 @@ from isolate_identity import (
     normalize_claims,
     save_identity,
 )
+from isolate_history import HistoryAccessDenied, format_history_table, read_history
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
 
 
@@ -60,6 +61,69 @@ def load_project_sets(redis):
         data = json.loads(decode(redis.get(key)))
         project_sets[data["name"]] = data
     return project_sets
+
+
+def _redis_key_name(key):
+    return decode(key)
+
+
+def list_grant_records(redis, **filters):
+    grants = []
+    for key in redis.keys("grant_*"):
+        key_name = _redis_key_name(key)
+        grant = json.loads(decode(redis.get(key)))
+        grant["id"] = key_name.replace("grant_", "", 1)
+        if filters.get("user") and not (grant.get("subject") == "user" and grant.get("name") == filters["user"]):
+            continue
+        if filters.get("group") and not (grant.get("subject") == "group" and grant.get("name") == filters["group"]):
+            continue
+        if filters.get("project") and grant.get("project") != filters["project"]:
+            continue
+        if filters.get("project_set") and grant.get("project_set") != filters["project_set"]:
+            continue
+        if filters.get("project_glob") and grant.get("project_glob") != filters["project_glob"]:
+            continue
+        grants.append(grant)
+    return sorted(grants, key=lambda grant: int(grant["id"]) if str(grant["id"]).isdigit() else grant["id"])
+
+
+def get_grant_record(redis, grant_id):
+    raw = redis.get("grant_{}".format(grant_id))
+    if raw is None:
+        return None
+    grant = json.loads(decode(raw))
+    grant["id"] = str(grant_id)
+    return grant
+
+
+def update_grant_record(redis, grant_id, updates):
+    grant = get_grant_record(redis, grant_id)
+    if grant is None:
+        return None
+    grant.pop("id", None)
+    grant.update({key: value for key, value in updates.items() if value is not None})
+    redis.set("grant_{}".format(grant_id), json.dumps(grant, sort_keys=True))
+    grant["id"] = str(grant_id)
+    return grant
+
+
+def format_grants_table(grants):
+    columns = [
+        ("id", "id", 4),
+        ("subject", "subject", 7),
+        ("name", "name", 18),
+        ("selector", "selector", 24),
+        ("host", "host", 8),
+        ("remote_user", "remote_user", 12),
+        ("sudo_mode", "sudo_mode", 10),
+    ]
+    lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
+    for grant in grants:
+        selector = grant.get("project") or grant.get("project_set") or grant.get("project_glob") or ""
+        row = dict(grant)
+        row["selector"] = selector
+        lines.append("  ".join(str(row.get(key) or "").ljust(width) for key, _, width in columns))
+    return "\n".join(lines)
 
 
 def cmd_policy_add(args, config):
@@ -213,6 +277,46 @@ def cmd_project_set_remove_project(args, config):
     print("Project removed from set: {} {}".format(args.name, args.project))
 
 
+def cmd_project_set_list(args, config):
+    redis = redis_client(config)
+    rows = sorted(load_project_sets(redis).values(), key=lambda item: item["name"])
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("name                 projects  globs")
+    for row in rows:
+        print("{:<20} {:<8} {}".format(row["name"], len(row.get("projects") or []), len(row.get("project_globs") or [])))
+
+
+def cmd_project_set_show(args, config):
+    redis = redis_client(config)
+    project_set = load_project_sets(redis).get(args.name)
+    if project_set is None:
+        print("Project set not found: {}".format(args.name), file=sys.stderr)
+        return 2
+    print(json.dumps(project_set, indent=2, sort_keys=True))
+
+
+def cmd_project_set_remove_pattern(args, config):
+    redis = redis_client(config)
+    key = "project_set_{}".format(args.name)
+    existing = redis.get(key)
+    if existing is None:
+        print("Project set not found: {}".format(args.name), file=sys.stderr)
+        return 2
+    project_set = json.loads(decode(existing))
+    project_set["project_globs"] = [p for p in project_set.get("project_globs") or [] if p != args.project_glob]
+    redis.set(key, json.dumps(project_set, sort_keys=True))
+    print("Pattern removed from set: {} {}".format(args.name, args.project_glob))
+
+
+def cmd_project_set_remove(args, config):
+    redis = redis_client(config)
+    deleted = redis.delete("project_set_{}".format(args.name))
+    print("Project sets removed: {}".format(deleted))
+    return 0 if deleted else 2
+
+
 def cmd_grant_add(args, config):
     redis = redis_client(config)
     try:
@@ -267,6 +371,65 @@ def cmd_grant_revoke(args, config):
     return 0 if deleted else 2
 
 
+def cmd_grant_list(args, config):
+    redis = redis_client(config)
+    grants = list_grant_records(
+        redis,
+        user=args.user,
+        group=args.group,
+        project=args.project,
+        project_set=args.project_set,
+        project_glob=args.project_glob,
+    )
+    if args.json:
+        print(json.dumps(grants, indent=2, sort_keys=True))
+    else:
+        print(format_grants_table(grants))
+
+
+def cmd_grant_show(args, config):
+    redis = redis_client(config)
+    grant = get_grant_record(redis, args.id)
+    if grant is None:
+        print("Grant not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    print(json.dumps(grant, indent=2, sort_keys=True))
+
+
+def cmd_grant_update(args, config):
+    redis = redis_client(config)
+    selector_updates = {
+        "project": args.project,
+        "project_glob": args.project_glob,
+        "project_set": args.project_set,
+    }
+    selected = [key for key, value in selector_updates.items() if value is not None]
+    updates = {
+        "host": args.host,
+        "remote_user": args.remote_user,
+        "sudo_mode": args.sudo_mode,
+    }
+    if selected:
+        updates.update({"project": None, "project_glob": None, "project_set": None})
+        updates[selected[0]] = selector_updates[selected[0]]
+    if args.allowed_action is not None:
+        updates["allowed_actions"] = args.allowed_action
+
+    grant = get_grant_record(redis, args.id)
+    if grant is None:
+        print("Grant not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    grant.pop("id", None)
+    for key, value in updates.items():
+        if value is None and key in ("project", "project_glob", "project_set") and selected:
+            grant[key] = None
+        elif value is not None:
+            grant[key] = value
+    redis.set("grant_{}".format(args.id), json.dumps(grant, sort_keys=True))
+    grant["id"] = str(args.id)
+    print(json.dumps(grant, indent=2, sort_keys=True))
+
+
 def cmd_grant_test(args, config):
     redis = redis_client(config)
     identity = normalize_claims(
@@ -300,6 +463,40 @@ def cmd_grant_test(args, config):
         print(json.dumps({"denied": str(exc)}, indent=2, sort_keys=True))
         return 2
     return 0
+
+
+def cmd_history(args, config):
+    try:
+        identity = load_cached_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+
+    history_cfg = config.get("history", {})
+    default_limit = int(history_cfg.get("default_limit", 10))
+    max_limit = int(history_cfg.get("max_limit", 100))
+    limit = min(max(args.limit or default_limit, 1), max_limit)
+    try:
+        rows = read_history(
+            config["logging"]["base_path"],
+            identity,
+            query=args.query,
+            user=args.user,
+            project=args.project,
+            host=args.host,
+            limit=limit,
+            admin_groups=history_cfg.get("admin_groups") or [],
+        )
+    except HistoryAccessDenied as exc:
+        print("history denied: {}".format(exc), file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    elif rows:
+        print(format_history_table(rows))
+    else:
+        print("No connection history found")
 
 
 def build_parser():
@@ -348,10 +545,27 @@ def build_parser():
     ps_add_pattern.add_argument("--project-glob", action="append", required=True)
     ps_add_pattern.set_defaults(func=cmd_project_set_add)
 
+    ps_list = project_set_sub.add_parser("list")
+    ps_list.add_argument("--json", action="store_true")
+    ps_list.set_defaults(func=cmd_project_set_list)
+
+    ps_show = project_set_sub.add_parser("show")
+    ps_show.add_argument("name")
+    ps_show.set_defaults(func=cmd_project_set_show)
+
     ps_remove = project_set_sub.add_parser("remove-project")
     ps_remove.add_argument("name")
     ps_remove.add_argument("project")
     ps_remove.set_defaults(func=cmd_project_set_remove_project)
+
+    ps_remove_pattern = project_set_sub.add_parser("remove-pattern")
+    ps_remove_pattern.add_argument("name")
+    ps_remove_pattern.add_argument("project_glob")
+    ps_remove_pattern.set_defaults(func=cmd_project_set_remove_pattern)
+
+    ps_remove_set = project_set_sub.add_parser("remove")
+    ps_remove_set.add_argument("name")
+    ps_remove_set.set_defaults(func=cmd_project_set_remove)
 
     grant = sub.add_parser("grant")
     grant_sub = grant.add_subparsers(dest="grant_command", required=True)
@@ -381,6 +595,31 @@ def build_parser():
     grant_revoke.add_argument("--host")
     grant_revoke.set_defaults(func=cmd_grant_revoke)
 
+    grant_list = grant_sub.add_parser("list")
+    grant_list.add_argument("--user")
+    grant_list.add_argument("--group")
+    grant_list.add_argument("--project")
+    grant_list.add_argument("--project-glob")
+    grant_list.add_argument("--project-set")
+    grant_list.add_argument("--json", action="store_true")
+    grant_list.set_defaults(func=cmd_grant_list)
+
+    grant_show = grant_sub.add_parser("show")
+    grant_show.add_argument("--id", required=True)
+    grant_show.set_defaults(func=cmd_grant_show)
+
+    grant_update = grant_sub.add_parser("update")
+    grant_update.add_argument("--id", required=True)
+    selector_update = grant_update.add_mutually_exclusive_group()
+    selector_update.add_argument("--project")
+    selector_update.add_argument("--project-glob")
+    selector_update.add_argument("--project-set")
+    grant_update.add_argument("--host")
+    grant_update.add_argument("--remote-user")
+    grant_update.add_argument("--sudo-mode")
+    grant_update.add_argument("--allowed-action", action="append")
+    grant_update.set_defaults(func=cmd_grant_update)
+
     grant_test = grant_sub.add_parser("test")
     grant_test.add_argument("--user", required=True)
     grant_test.add_argument("--group", action="append")
@@ -394,6 +633,15 @@ def build_parser():
     search.add_argument("--user")
     search.add_argument("--project")
     search.set_defaults(func=cmd_session_search)
+
+    history = sub.add_parser("history")
+    history.add_argument("query", nargs="?")
+    history.add_argument("--user")
+    history.add_argument("--project")
+    history.add_argument("--host")
+    history.add_argument("--limit", type=int)
+    history.add_argument("--json", action="store_true")
+    history.set_defaults(func=cmd_history)
     return parser
 
 
