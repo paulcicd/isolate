@@ -458,6 +458,23 @@ history:
     - OS-admin
   default_limit: 10
   max_limit: 100
+
+access:
+  admin_groups:
+    - DevOps
+    - OS-admin
+  default_ttl: 2h
+  max_ttl: 24h
+
+dashboard:
+  enabled: true
+  listen_host: 127.0.0.1
+  listen_port: 8080
+  public_url: https://bastion.example.com
+  secret_key_file: /opt/auth/keys/dashboard_secret
+  admin_groups:
+    - DevOps
+    - OS-admin
 ```
 
 CLI equivalent:
@@ -469,6 +486,46 @@ isolate history --user voskoboinikov
 isolate history --project kube --limit 20
 isolate history --host 10004 --json
 ```
+
+### Break-glass access
+
+Users can request temporary access when a normal grant is missing:
+
+```bash
+isolate access request --project kube --host 10004 --remote-user dba --sudo-mode none --reason INC-1234
+```
+
+Admins approve or deny requests:
+
+```bash
+isolate access list --status pending
+isolate access show --id 1
+isolate access approve --id 1 --ttl 2h
+isolate access deny --id 2 --reason "not needed"
+```
+
+Approved requests create temporary `grant_*` records with `expires_at`; expired
+grants are ignored automatically by policy resolution.
+
+### Admin dashboard
+
+The lightweight dashboard uses Keycloak OIDC Authorization Code flow. Add this
+redirect URI to the Keycloak client:
+
+```text
+https://bastion.example.com/auth/callback
+```
+
+Run locally on the bastion:
+
+```bash
+python3 /opt/auth/shared/isolate_web.py
+```
+
+Expose it through Nginx/Apache or another TLS reverse proxy. Only users whose
+Keycloak groups match `dashboard.admin_groups` can open the dashboard. The MVP
+shows active sessions, history, access requests, grants/project-sets, and links
+to raw transcripts.
 
 ## Session Logging
 
@@ -576,6 +633,9 @@ Current focused tests cover:
 - project-set and project-glob matching
 - grant list/update helpers
 - connection history parsing and ACL
+- break-glass access request approval flow
+- active session registry
+- dashboard admin group checks
 - identity cache roundtrip and expiry
 - deny when no remote user can be resolved
 - safe SSH argv construction

@@ -19,7 +19,18 @@ from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 import isolate
+from isolate_access import (
+    AccessDenied,
+    approve_access_request,
+    create_access_request,
+    deny_access_request,
+    is_access_admin,
+    list_access_requests,
+    parse_duration,
+)
 from isolate import list_grant_records, load_project_sets, update_grant_record
+from isolate_sessions import list_active_sessions, mark_session_end, mark_session_start
+from isolate_web import is_dashboard_admin
 
 
 class FakeRedis(object):
@@ -45,6 +56,9 @@ class FakeRedis(object):
         value = int(self.store.get(key, 0)) + 1
         self.store[key] = str(value)
         return value
+
+    def expire(self, key, ttl):
+        return True
 
 
 class PolicyResolverTest(unittest.TestCase):
@@ -135,6 +149,68 @@ class PolicyResolverTest(unittest.TestCase):
         allowed = filter_allowed_hosts(identity, hosts, grants=grants)
 
         self.assertEqual([host["server_id"] for host in allowed], ["1"])
+
+    def test_expired_grant_does_not_match(self):
+        identity = {"username": "alice", "groups": []}
+        host = {"server_id": "1", "project_name": "prod"}
+        grants = [
+            {
+                "subject": "user",
+                "name": "alice",
+                "project": "prod",
+                "remote_user": "dba",
+                "expires_at": 1,
+            }
+        ]
+
+        with self.assertRaises(PolicyDenied):
+            resolve_grant(identity, project="prod", host=host, grants=grants)
+
+
+class AccessRequestTest(unittest.TestCase):
+    def test_create_approve_and_deny_access_request(self):
+        redis = FakeRedis()
+        requester = {"username": "alice", "keycloak_sub": "sub-a", "groups": ["DBA"]}
+        approver = {"username": "admin", "groups": ["DevOps"]}
+
+        record = create_access_request(
+            redis,
+            requester,
+            project="kube",
+            host="10004",
+            remote_user="dba",
+            sudo_mode="none",
+            reason="INC-1",
+        )
+        self.assertEqual(record["status"], "pending")
+        self.assertEqual(len(list_access_requests(redis, status="pending")), 1)
+
+        approved, grant = approve_access_request(redis, record["id"], approver, parse_duration("2h"), max_ttl=parse_duration("24h"))
+        self.assertEqual(approved["status"], "approved")
+        self.assertTrue(grant["temporary"])
+        self.assertEqual(grant["request_id"], record["id"])
+        self.assertEqual(grant["remote_user"], "dba")
+
+        second = create_access_request(redis, requester, project="prod", reason="test")
+        denied = deny_access_request(redis, second["id"], approver, reason="no")
+        self.assertEqual(denied["status"], "denied")
+
+    def test_access_admin_check_and_max_ttl(self):
+        redis = FakeRedis()
+        record = create_access_request(redis, {"username": "alice"}, project="prod", reason="test")
+        self.assertTrue(is_access_admin({"groups": ["DevOps"]}, ["DevOps"]))
+        self.assertFalse(is_access_admin({"groups": ["DBA"]}, ["DevOps"]))
+        with self.assertRaises(AccessDenied):
+            approve_access_request(redis, record["id"], {"username": "admin"}, parse_duration("25h"), max_ttl=parse_duration("24h"))
+
+
+class ActiveSessionRegistryTest(unittest.TestCase):
+    def test_active_session_lifecycle(self):
+        redis = FakeRedis()
+        mark_session_start(redis, "conn-1", {"username": "alice", "project": "kube"})
+        self.assertEqual(len(list_active_sessions(redis)), 1)
+        mark_session_end(redis, "conn-1", exit_code=0)
+        self.assertEqual(list_active_sessions(redis), [])
 
 
 class GrantAdminUxTest(unittest.TestCase):
@@ -319,6 +395,7 @@ class HistoryTest(unittest.TestCase):
                         "session_id": "session-1",
                         "username": "alice",
                         "exit_code": 0,
+                        "raw_log_path": "/opt/auth/logs/alice/raw.log",
                     },
                 ],
             )
@@ -328,6 +405,7 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["project"], "kube")
             self.assertEqual(rows[0]["result"], "exit=0")
+            self.assertEqual(rows[0]["raw_log_path"], "/opt/auth/logs/alice/raw.log")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -360,6 +438,13 @@ class HistoryTest(unittest.TestCase):
             self.assertEqual(rows[0]["username"], "bob")
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class DashboardTest(unittest.TestCase):
+    def test_dashboard_admin_check(self):
+        config = {"dashboard": {"admin_groups": ["DevOps"]}}
+        self.assertTrue(is_dashboard_admin({"groups": ["DevOps"]}, config))
+        self.assertFalse(is_dashboard_admin({"groups": ["DBA"]}, config))
 
 
 if __name__ == "__main__":

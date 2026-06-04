@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from isolate_config import load_config
 from isolate_identity import local_identity
 from isolate_logging import SessionLogger
+from isolate_sessions import mark_session_end, mark_session_start
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 
 LOGGER = logging.getLogger('ssh-wrapper')
@@ -330,11 +331,29 @@ def _run_pty_command(argv, raw_log):
     return proc.wait()
 
 
-def run_command(argv, raw_log_path, audit, metadata):
+def _redis_client(config):
+    from redis import Redis
+    redis_cfg = config["redis"]
+    return Redis(
+        host=redis_cfg["host"],
+        port=int(redis_cfg["port"]),
+        password=redis_cfg.get("password"),
+        db=int(redis_cfg["db"]),
+    )
+
+
+def run_command(argv, raw_log_path, audit, metadata, config=None):
 
     LOGGER.debug(argv)
-    audit.event("ssh_start", argv=argv, **metadata)
+    audit.event("ssh_start", argv=argv, raw_log_path=raw_log_path, **metadata)
     started = time.time()
+    redis = None
+    if config and metadata.get("connection_id"):
+        try:
+            redis = _redis_client(config)
+            mark_session_start(redis, metadata["connection_id"], metadata)
+        except Exception as exc:
+            LOGGER.warning("active session registry start failed: {}".format(exc))
 
     with open(raw_log_path, 'a', encoding='utf-8', errors='replace') as raw_log:
         try:
@@ -350,7 +369,12 @@ def run_command(argv, raw_log_path, audit, metadata):
         msg = 'Exit code: {1}{0}{2}'.format(exit_code, term_colors['red'], term_colors['reset'])
         msg = '\n  {0}\n'.format(msg)
         LOGGER.warning(msg)
-    audit.event("ssh_end", exit_code=exit_code, duration=round(time.time() - started, 3), **metadata)
+    audit.event("ssh_end", exit_code=exit_code, duration=round(time.time() - started, 3), raw_log_path=raw_log_path, **metadata)
+    if redis is not None and metadata.get("connection_id"):
+        try:
+            mark_session_end(redis, metadata["connection_id"], exit_code=exit_code)
+        except Exception as exc:
+            LOGGER.warning("active session registry end failed: {}".format(exc))
     return exit_code
 
 
@@ -369,6 +393,11 @@ if __name__ == '__main__':
     parser.add_argument('--proxy-user', type=str, nargs=1)
     parser.add_argument('--proxy-port', type=int)
     parser.add_argument('--proxy-id', type=str, nargs=1, help='just for pretty logs')
+    parser.add_argument('--connection-id')
+    parser.add_argument('--project')
+    parser.add_argument('--host-id')
+    parser.add_argument('--human-user')
+    parser.add_argument('--keycloak-sub')
     args, extra_args = parser.parse_known_args()
     #
     if args.debug:
@@ -388,8 +417,10 @@ if __name__ == '__main__':
     host_meta = verify_args(args)
     raw_log_path = init_log_file(host_meta)
     config = load_config()
-    identity = local_identity(local_sudo_user, [])
-    audit = SessionLogger(config["logging"]["base_path"], identity, session_id=host_meta["uuid"])
+    identity = local_identity(args.human_user or local_sudo_user, [])
+    identity["keycloak_sub"] = args.keycloak_sub
+    connection_id = args.connection_id or host_meta["uuid"]
+    audit = SessionLogger(config["logging"]["base_path"], identity, session_id=connection_id)
     remote_command = None if host_meta['nosudo'] else 'sudo -i'
     proxy = None
     if args.proxy_host:
@@ -421,8 +452,11 @@ if __name__ == '__main__':
 
     host_meta['argv'] = argv
     sys.exit(run_command(argv, raw_log_path, audit, {
+        "connection_id": connection_id,
+        "project": args.project,
+        "host_id": args.host_id,
         "target_host": host_meta["hostname"],
         "target_port": host_meta["port"],
         "remote_user": host_meta["user"],
         "source_ip": os.getenv("SSH_CONNECTION", "").split(" ")[0] if os.getenv("SSH_CONNECTION") else None,
-    }))
+    }, config=config))

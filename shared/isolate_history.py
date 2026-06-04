@@ -73,7 +73,9 @@ def _row_from_events(events):
         "host_id": source.get("host_id"),
         "target": source.get("target_host"),
         "remote_user": source.get("remote_user"),
+        "connection_id": source.get("connection_id"),
         "session_id": source.get("session_id"),
+        "raw_log_path": (ssh_end or ssh_start or {}).get("raw_log_path"),
         "result": result,
     }
 

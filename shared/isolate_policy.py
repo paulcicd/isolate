@@ -3,6 +3,7 @@
 """Access policy and grant resolution for Isolate v2."""
 
 import fnmatch
+import time
 
 
 class PolicyDenied(Exception):
@@ -95,10 +96,18 @@ def _grant_rank(grant):
 
 def _matches(grant, identity, project=None, host=None, project_sets=None):
     return (
-        _subject_matches(grant, identity)
+        not _is_expired(grant)
+        and _subject_matches(grant, identity)
         and _host_matches(grant, host)
         and _project_matches(grant, project, project_sets=project_sets)
     )
+
+
+def _is_expired(grant, now=None):
+    expires_at = grant.get("expires_at")
+    if expires_at is None:
+        return False
+    return int(expires_at) <= int(now if now is not None else time.time())
 
 
 def resolve_grant(identity, project=None, host=None, grants=None, project_sets=None, defaults=None, action="ssh"):

@@ -57,6 +57,19 @@ DEFAULT_CONFIG = {
         "default_limit": 10,
         "max_limit": 100,
     },
+    "access": {
+        "admin_groups": [],
+        "default_ttl": "2h",
+        "max_ttl": "24h",
+    },
+    "dashboard": {
+        "enabled": False,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8080,
+        "public_url": "http://127.0.0.1:8080",
+        "secret_key_file": "/opt/auth/keys/dashboard_secret",
+        "admin_groups": [],
+    },
     "policy": {
         "default_allowed_actions": ["ssh"],
         "fallback_remote_user": None,

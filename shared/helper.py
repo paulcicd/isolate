@@ -238,6 +238,7 @@ class ServerConnection(object):
         self.helper = helper
         self.unknown_args = unknown_args
         self.ssh_wrapper_argv = shlex.split(os.getenv('ISOLATE_WRAPPER', self.ssh_wrapper_cmd))
+        self.connection_id = str(uuid4())
 
     #
     # perform connection structure checks
@@ -351,6 +352,16 @@ class ServerConnection(object):
         if self.nosudo:
             self.ssh_wrapper_argv.append('--nosudo')
 
+        self.ssh_wrapper_argv.extend(['--connection-id', self.connection_id])
+        if self.project_name:
+            self.ssh_wrapper_argv.extend(['--project', str(self.project_name)])
+        if self.server_id:
+            self.ssh_wrapper_argv.extend(['--host-id', str(self.server_id)])
+        if self.helper.identity.get('username'):
+            self.ssh_wrapper_argv.extend(['--human-user', str(self.helper.identity.get('username'))])
+        if self.helper.identity.get('keycloak_sub'):
+            self.ssh_wrapper_argv.extend(['--keycloak-sub', str(self.helper.identity.get('keycloak_sub'))])
+
         if self.proxy_id:
             self.ssh_wrapper_argv.extend(['--proxy-id', str(self.proxy_id)])
         if self.proxy_host:
@@ -385,6 +396,13 @@ class ServerConnection(object):
                 host_id=self.server_id,
                 reason=str(exc),
             )
+            self.helper.print_p(
+                "Request access: isolate access request --project {}{} --reason '<reason>'".format(
+                    self.project_name or "<project>",
+                    " --host {}".format(self.server_id) if self.server_id else "",
+                ),
+                stderr=True,
+            )
             self.helper.print_p("Policy denied: {}".format(exc), stderr=True)
             sys.exit(2)
         self.build_cmd()
@@ -396,6 +414,7 @@ class ServerConnection(object):
             host_id=self.server_id,
             target_host=self.host,
             remote_user=self.user,
+            connection_id=self.connection_id,
             policy=self.policy_decision,
         )
 

@@ -7,6 +7,16 @@ import json
 import os
 import sys
 
+from isolate_access import (
+    AccessDenied,
+    approve_access_request,
+    create_access_request,
+    deny_access_request,
+    get_access_request,
+    is_access_admin,
+    list_access_requests,
+    parse_duration,
+)
 from isolate_config import load_config
 from isolate_identity import (
     IdentityError,
@@ -124,6 +134,34 @@ def format_grants_table(grants):
         row["selector"] = selector
         lines.append("  ".join(str(row.get(key) or "").ljust(width) for key, _, width in columns))
     return "\n".join(lines)
+
+
+def format_access_table(records):
+    columns = [
+        ("id", "id", 4),
+        ("status", "status", 9),
+        ("requester", "user", 16),
+        ("project", "project", 14),
+        ("host", "host", 8),
+        ("remote_user", "remote_user", 12),
+        ("sudo_mode", "sudo", 8),
+        ("reason", "reason", 24),
+    ]
+    lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
+    for record in records:
+        lines.append("  ".join(str(record.get(key) or "").ljust(width) for key, _, width in columns))
+    return "\n".join(lines)
+
+
+def _load_cli_identity():
+    return load_cached_identity()
+
+
+def _require_access_admin(config):
+    identity = _load_cli_identity()
+    if not is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        raise AccessDenied("access administration is allowed only for configured admin groups")
+    return identity
 
 
 def cmd_policy_add(args, config):
@@ -499,6 +537,101 @@ def cmd_history(args, config):
         print("No connection history found")
 
 
+def cmd_access_request(args, config):
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    record = create_access_request(
+        redis,
+        identity,
+        project=args.project,
+        host=args.host,
+        remote_user=args.remote_user,
+        sudo_mode=args.sudo_mode,
+        reason=args.reason,
+    )
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_list(args, config):
+    redis = redis_client(config)
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if args.user and args.user != identity.get("username") and not admin:
+        print("access list denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    user = args.user if admin else identity.get("username")
+    records = list_access_requests(redis, status=args.status, user=user)
+    if args.json:
+        print(json.dumps(records, indent=2, sort_keys=True))
+    else:
+        print(format_access_table(records))
+
+
+def cmd_access_show(args, config):
+    redis = redis_client(config)
+    record = get_access_request(redis, args.id)
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if record.get("requester") != identity.get("username") and not admin:
+        print("access show denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_approve(args, config):
+    redis = redis_client(config)
+    try:
+        approver = _require_access_admin(config)
+        access_cfg = config.get("access", {})
+        ttl = parse_duration(args.ttl, default=access_cfg.get("default_ttl", "2h"))
+        max_ttl = parse_duration(access_cfg.get("max_ttl", "24h"))
+        record, grant = approve_access_request(
+            redis,
+            args.id,
+            approver,
+            ttl,
+            remote_user=args.remote_user,
+            sudo_mode=args.sudo_mode,
+            max_ttl=max_ttl,
+        )
+    except (AccessDenied, IdentityError, ValueError) as exc:
+        print("access approve failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    print(json.dumps({"request": record, "grant": grant}, indent=2, sort_keys=True))
+
+
+def cmd_access_deny(args, config):
+    redis = redis_client(config)
+    try:
+        approver = _require_access_admin(config)
+        record = deny_access_request(redis, args.id, approver, reason=args.reason)
+    except (AccessDenied, IdentityError) as exc:
+        print("access deny failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="isolate")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -642,6 +775,38 @@ def build_parser():
     history.add_argument("--limit", type=int)
     history.add_argument("--json", action="store_true")
     history.set_defaults(func=cmd_history)
+
+    access = sub.add_parser("access")
+    access_sub = access.add_subparsers(dest="access_command", required=True)
+    access_request = access_sub.add_parser("request")
+    access_request.add_argument("--project", required=True)
+    access_request.add_argument("--host")
+    access_request.add_argument("--remote-user")
+    access_request.add_argument("--sudo-mode")
+    access_request.add_argument("--reason", required=True)
+    access_request.set_defaults(func=cmd_access_request)
+
+    access_list = access_sub.add_parser("list")
+    access_list.add_argument("--status", choices=["pending", "approved", "denied"])
+    access_list.add_argument("--user")
+    access_list.add_argument("--json", action="store_true")
+    access_list.set_defaults(func=cmd_access_list)
+
+    access_show = access_sub.add_parser("show")
+    access_show.add_argument("--id", required=True)
+    access_show.set_defaults(func=cmd_access_show)
+
+    access_approve = access_sub.add_parser("approve")
+    access_approve.add_argument("--id", required=True)
+    access_approve.add_argument("--ttl")
+    access_approve.add_argument("--remote-user")
+    access_approve.add_argument("--sudo-mode")
+    access_approve.set_defaults(func=cmd_access_approve)
+
+    access_deny = access_sub.add_parser("deny")
+    access_deny.add_argument("--id", required=True)
+    access_deny.add_argument("--reason", required=True)
+    access_deny.set_defaults(func=cmd_access_deny)
     return parser
 
 
