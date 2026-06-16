@@ -6,7 +6,7 @@ The main idea is simple:
 
 1. A human user logs in to the bastion.
 2. The user runs `isolate login` and authenticates through Keycloak.
-3. Isolate reads Keycloak identity claims such as `username`, `groups`, and `roles`.
+3. Isolate verifies the signed Keycloak JWT on every command and derives `username`, `groups`, and `roles` only from verified claims.
 4. The `s` command shows only servers allowed by grants.
 5. The `g` command checks policy, selects the correct remote user, and starts SSH.
 6. Every step is written to JSONL audit logs and legacy raw transcripts.
@@ -359,6 +359,10 @@ keycloak:
     - groups
   poll_timeout: 300
   tls_verify: true
+  verify_tokens: true
+  expected_audience: isolate-bastion
+  jwks_cache_path: /opt/auth/cache/keycloak_jwks.json
+  jwks_cache_ttl: 3600
 
 ssh:
   binary: /usr/bin/ssh
@@ -503,6 +507,22 @@ dashboard:
     - Demo-Security
 ```
 
+### Trusted JWKS Cache
+
+Isolate verifies the signed `id_token` locally for every `s`, `g`, `f`, and protected admin command. Public signing keys are read from the Keycloak JWKS endpoint and cached in:
+
+```text
+/opt/auth/cache/keycloak_jwks.json
+```
+
+The cache must not be writable by ordinary bastion users. After deploy, refresh it as root or as the `auth` service user:
+
+```bash
+sudo -u auth /opt/auth/shared/isolate.py jwks refresh
+```
+
+If the cache is missing, Isolate can fetch JWKS over HTTPS at runtime, but preloading the cache avoids extra network calls on every command.
+
 ## User Login Flow
 
 Run:
@@ -519,13 +539,15 @@ https://keycloak.example.org/realms/demo-infra/device?user_code=ABCD-EFGH
 Code: ABCD-EFGH
 ```
 
-After approval, Isolate saves identity to:
+After approval, Isolate saves a token cache to:
 
 ```text
 ~/.isolate/identity.json
 ```
 
-Example normalized identity:
+The cache contains tokens and display-only fields. Authorization does not trust editable cached `groups`; it verifies the signed JWT and extracts claims from the verified token.
+
+Example verified identity shown by `isolate whoami`:
 
 ```json
 {
@@ -550,7 +572,7 @@ Logout:
 isolate logout
 ```
 
-If identity is missing or expired, `s`, `g`, `f`, and protected admin commands will ask the user to run `isolate login`.
+If token cache is missing, legacy, invalid, tampered, or expired, `s`, `g`, `f`, and protected admin commands will ask the user to run `isolate login`.
 
 ## Host Inventory
 
@@ -1404,6 +1426,8 @@ Current focused tests cover:
 - break-glass access request approval flow;
 - active session registry;
 - dashboard admin group checks;
+- trusted JWT identity verification;
+- JWKS cache safety;
 - identity cache roundtrip and expiry;
 - safe SSH argv generation;
 - SSH unknown argument rejection;
@@ -1627,6 +1651,8 @@ keys active_session_*
 - Configure Keycloak Device Authorization Grant for CLI.
 - Configure Keycloak Authorization Code callback for dashboard.
 - Ensure `groups` claim is present in tokens.
+- Ensure `groups` claim is present in the signed `id_token`.
+- Refresh trusted JWKS cache with `sudo -u auth /opt/auth/shared/isolate.py jwks refresh`.
 - Define admin groups for access, history, and dashboard.
 - Create project sets.
 - Create grants.

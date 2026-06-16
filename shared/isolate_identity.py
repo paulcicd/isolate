@@ -88,6 +88,27 @@ def save_identity(identity, path=None):
     return path
 
 
+def save_token_cache(tokens, identity=None, path=None):
+    identity = identity or {}
+    claims = identity.get("raw_claims") or {}
+    expires_at = claims.get("exp")
+    if expires_at is None and tokens.get("expires_in"):
+        expires_at = int(time.time()) + int(tokens["expires_in"])
+    cache = {
+        "schema_version": 3,
+        "id_token": tokens.get("id_token"),
+        "access_token": tokens.get("access_token"),
+        "token_type": tokens.get("token_type", "Bearer"),
+        "expires_at": expires_at,
+        "session_id": identity.get("session_id"),
+        "cached_display": {
+            "username": identity.get("username"),
+            "email": identity.get("email"),
+        },
+    }
+    return save_identity(cache, path=path)
+
+
 def load_cached_identity(path=None, now=None, require_valid=True):
     path = identity_cache_path(path)
     if not os.path.exists(path):
@@ -103,6 +124,168 @@ def load_cached_identity(path=None, now=None, require_valid=True):
         if exp is not None and int(exp) <= int(now if now is not None else time.time()):
             raise IdentityError("isolate identity expired; run isolate login")
     return identity
+
+
+def load_verified_identity(config, path=None, now=None):
+    cache = _load_token_cache(path=path)
+    token = cache.get("id_token")
+    if not token:
+        raise IdentityError("legacy or incomplete identity cache; run isolate login")
+    claims = verify_jwt_claims(token, config.get("keycloak", {}), now=now)
+    identity = normalize_claims(claims)
+    identity["session_id"] = cache.get("session_id") or identity.get("session_id")
+    return identity
+
+
+def _load_token_cache(path=None):
+    path = identity_cache_path(path)
+    if not os.path.exists(path):
+        raise IdentityError("no isolate identity found; run isolate login")
+    with open(path, "r", encoding="utf-8") as identity_f:
+        cache = json.load(identity_f)
+    if cache.get("schema_version") != 3:
+        raise IdentityError("legacy identity cache is not trusted; run isolate login")
+    return cache
+
+
+def verify_jwt_claims(token, keycloak_config, now=None):
+    if not keycloak_config.get("verify_tokens", True):
+        return decode_jwt_payload(token)
+    try:
+        from authlib.jose import JsonWebKey, JsonWebToken
+    except ImportError:
+        raise IdentityError("Authlib is required for JWT verification")
+
+    jwks = load_jwks(keycloak_config)
+    try:
+        key_set = JsonWebKey.import_key_set(jwks)
+        jwt = JsonWebToken(["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"])
+        claims = jwt.decode(token, key_set)
+        claims.validate()
+    except Exception as exc:
+        raise IdentityError("invalid identity token: {}".format(exc))
+
+    claims = dict(claims)
+    _validate_claims(claims, keycloak_config, now=now)
+    return claims
+
+
+def _validate_claims(claims, keycloak_config, now=None):
+    now = int(now if now is not None else time.time())
+    issuer = (keycloak_config.get("issuer") or "").rstrip("/")
+    if issuer and claims.get("iss") != issuer:
+        raise IdentityError("invalid token issuer")
+    exp = claims.get("exp")
+    if exp is None or int(exp) <= now:
+        raise IdentityError("identity token expired")
+    nbf = claims.get("nbf")
+    if nbf is not None and int(nbf) > now:
+        raise IdentityError("identity token is not valid yet")
+    expected_audience = keycloak_config.get("expected_audience") or keycloak_config.get("client_id")
+    if expected_audience:
+        aud = claims.get("aud")
+        audiences = aud if isinstance(aud, list) else [aud]
+        azp = claims.get("azp")
+        if expected_audience not in audiences and expected_audience != azp:
+            raise IdentityError("invalid token audience")
+
+
+def load_jwks(keycloak_config):
+    cache_path = keycloak_config.get("jwks_cache_path")
+    cache_ttl = int(keycloak_config.get("jwks_cache_ttl", 3600))
+    cached = _read_jwks_cache(cache_path, cache_ttl)
+    if cached is not None:
+        return cached
+    jwks = _fetch_jwks(keycloak_config)
+    _write_jwks_cache(cache_path, jwks)
+    return jwks
+
+
+def refresh_jwks_cache(keycloak_config):
+    jwks = _fetch_jwks(keycloak_config)
+    _write_jwks_cache(keycloak_config.get("jwks_cache_path"), jwks)
+    return jwks
+
+
+def _read_jwks_cache(path, ttl):
+    if not path or not os.path.exists(path):
+        return None
+    if not _is_safe_cache_path(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as cache_f:
+            cache = json.load(cache_f)
+    except (OSError, ValueError):
+        return None
+    if int(cache.get("fetched_at", 0)) + int(ttl) <= int(time.time()):
+        return None
+    return cache.get("jwks")
+
+
+def _write_jwks_cache(path, jwks):
+    if not path:
+        return
+    directory = os.path.dirname(path)
+    try:
+        os.makedirs(directory, mode=0o750, exist_ok=True)
+        tmp_path = "{}.tmp".format(path)
+        with open(tmp_path, "w", encoding="utf-8") as cache_f:
+            json.dump({"fetched_at": int(time.time()), "jwks": jwks}, cache_f, sort_keys=True)
+            cache_f.write("\n")
+        if os.name == "posix":
+            os.chmod(tmp_path, 0o640)
+        os.replace(tmp_path, path)
+    except OSError:
+        return
+
+
+def _is_safe_cache_path(path):
+    if os.name != "posix":
+        return True
+    try:
+        directory = os.path.dirname(path)
+        for candidate in (directory, path):
+            if not os.path.exists(candidate):
+                continue
+            mode = os.stat(candidate).st_mode
+            if mode & 0o022:
+                return False
+    except OSError:
+        return False
+    return True
+
+
+def _fetch_jwks(keycloak_config):
+    jwks_uri = keycloak_config.get("jwks_uri") or _discover_jwks_uri(keycloak_config)
+    if not jwks_uri:
+        issuer = (keycloak_config.get("issuer") or "").rstrip("/")
+        jwks_uri = issuer + "/protocol/openid-connect/certs"
+    return _get_json(jwks_uri, tls_verify=bool(keycloak_config.get("tls_verify", True)))
+
+
+def _discover_jwks_uri(keycloak_config):
+    issuer = (keycloak_config.get("issuer") or "").rstrip("/")
+    if not issuer:
+        return None
+    try:
+        metadata = _get_json(issuer + "/.well-known/openid-configuration", tls_verify=bool(keycloak_config.get("tls_verify", True)))
+        return metadata.get("jwks_uri")
+    except IdentityError:
+        return None
+
+
+def _get_json(url, tls_verify=True):
+    context = None
+    if not tls_verify:
+        context = ssl._create_unverified_context()
+    req = request.Request(url, headers={"Accept": "application/json", "User-Agent": "isolate-bastion/2.0"})
+    try:
+        with request.urlopen(req, timeout=15, context=context) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except error.HTTPError as exc:
+        raise IdentityError(KeycloakDeviceClient._format_http_error(exc))
+    except error.URLError as exc:
+        raise IdentityError("Keycloak request failed: {}".format(exc.reason))
 
 
 def clear_cached_identity(path=None):

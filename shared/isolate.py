@@ -24,9 +24,10 @@ from isolate_identity import (
     clear_cached_identity,
     decode_jwt_payload,
     identity_cache_path,
-    load_cached_identity,
+    load_verified_identity,
     normalize_claims,
-    save_identity,
+    refresh_jwks_cache,
+    save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, format_history_table, read_history
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
@@ -154,7 +155,7 @@ def format_access_table(records):
 
 
 def _load_cli_identity():
-    return load_cached_identity()
+    return load_verified_identity(load_config())
 
 
 def _require_access_admin(config):
@@ -233,7 +234,7 @@ def cmd_session_search(args, config):
 
 def cmd_whoami(args, config):
     try:
-        identity = load_cached_identity()
+        identity = load_verified_identity(config)
     except IdentityError as exc:
         print("isolate identity unavailable: {}".format(exc), file=sys.stderr)
         return 2
@@ -266,7 +267,7 @@ def cmd_login(args, config):
         if tokens.get("id_token"):
             claims.update(decode_jwt_payload(tokens["id_token"]))
         identity = normalize_claims(claims)
-        save_identity(identity)
+        save_token_cache(tokens, identity)
         print(json.dumps(identity, indent=2, sort_keys=True))
     except IdentityError as exc:
         print("isolate login failed: {}".format(exc), file=sys.stderr)
@@ -505,7 +506,7 @@ def cmd_grant_test(args, config):
 
 def cmd_history(args, config):
     try:
-        identity = load_cached_identity()
+        identity = load_verified_identity(config)
     except IdentityError as exc:
         print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
         return 2
@@ -630,6 +631,15 @@ def cmd_access_deny(args, config):
         print("Access request not found: {}".format(args.id), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_jwks_refresh(args, config):
+    try:
+        jwks = refresh_jwks_cache(config.get("keycloak", {}))
+    except IdentityError as exc:
+        print("jwks refresh failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"keys": len(jwks.get("keys") or []), "cache_path": config.get("keycloak", {}).get("jwks_cache_path")}, indent=2, sort_keys=True))
 
 
 def build_parser():
@@ -807,6 +817,11 @@ def build_parser():
     access_deny.add_argument("--id", required=True)
     access_deny.add_argument("--reason", required=True)
     access_deny.set_defaults(func=cmd_access_deny)
+
+    jwks = sub.add_parser("jwks")
+    jwks_sub = jwks.add_subparsers(dest="jwks_command", required=True)
+    jwks_refresh = jwks_sub.add_parser("refresh")
+    jwks_refresh.set_defaults(func=cmd_jwks_refresh)
     return parser
 
 

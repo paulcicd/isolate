@@ -13,7 +13,16 @@ from urllib.error import HTTPError
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 
-from isolate_identity import IdentityError, KeycloakDeviceClient, load_cached_identity, normalize_claims, save_identity
+import isolate_identity
+from isolate_identity import (
+    IdentityError,
+    KeycloakDeviceClient,
+    load_cached_identity,
+    load_verified_identity,
+    normalize_claims,
+    save_identity,
+    save_token_cache,
+)
 from isolate_history import HistoryAccessDenied, read_history
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
@@ -342,6 +351,82 @@ class IdentityTest(unittest.TestCase):
             with self.assertRaises(IdentityError):
                 load_cached_identity(path=path, now=201)
         finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_legacy_identity_cache_is_rejected_for_verified_load(self):
+        tmpdir = os.path.join(ROOT, ".tmp-identity-cache-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        path = os.path.join(tmpdir, "identity.json")
+        try:
+            save_identity({"username": "alice", "groups": ["Admin"]}, path=path)
+            with self.assertRaises(IdentityError):
+                load_verified_identity({"keycloak": {}}, path=path)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_verified_identity_ignores_tampered_cached_display(self):
+        tmpdir = os.path.join(ROOT, ".tmp-identity-cache-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        path = os.path.join(tmpdir, "identity.json")
+        original_verify = isolate_identity.verify_jwt_claims
+        try:
+            save_token_cache(
+                {"id_token": "signed.jwt.token", "access_token": "access", "expires_in": 300},
+                {"username": "alice", "email": "alice@example.org", "raw_claims": {"exp": 9999999999}},
+                path=path,
+            )
+            with open(path, "r", encoding="utf-8") as cache_f:
+                cache = json.load(cache_f)
+            cache["cached_display"]["username"] = "mallory"
+            cache["cached_display"]["groups"] = ["Admin"]
+            with open(path, "w", encoding="utf-8") as cache_f:
+                json.dump(cache, cache_f)
+
+            isolate_identity.verify_jwt_claims = lambda token, config, now=None: {
+                "sub": "abc",
+                "preferred_username": "alice",
+                "email": "alice@example.org",
+                "groups": ["DBA"],
+                "exp": 9999999999,
+            }
+            identity = load_verified_identity({"keycloak": {}}, path=path)
+            self.assertEqual(identity["username"], "alice")
+            self.assertEqual(identity["groups"], ["DBA"])
+        finally:
+            isolate_identity.verify_jwt_claims = original_verify
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_validates_jwt_issuer_audience_and_expiry(self):
+        claims = {
+            "iss": "https://keycloak.example.org/realms/demo",
+            "aud": "isolate-bastion",
+            "exp": 200,
+        }
+        isolate_identity._validate_claims(
+            claims,
+            {"issuer": "https://keycloak.example.org/realms/demo", "expected_audience": "isolate-bastion"},
+            now=100,
+        )
+        with self.assertRaises(IdentityError):
+            isolate_identity._validate_claims(dict(claims, exp=99), {"expected_audience": "isolate-bastion"}, now=100)
+        with self.assertRaises(IdentityError):
+            isolate_identity._validate_claims(dict(claims, iss="bad"), {"issuer": "issuer"}, now=100)
+        with self.assertRaises(IdentityError):
+            isolate_identity._validate_claims(dict(claims, aud="other"), {"expected_audience": "isolate-bastion"}, now=100)
+
+    def test_jwks_cache_read_and_unsafe_ignore(self):
+        tmpdir = os.path.join(ROOT, ".tmp-jwks-cache-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        path = os.path.join(tmpdir, "keycloak_jwks.json")
+        original_safe = isolate_identity._is_safe_cache_path
+        try:
+            with open(path, "w", encoding="utf-8") as cache_f:
+                json.dump({"fetched_at": int(isolate_identity.time.time()), "jwks": {"keys": [{"kid": "1"}]}}, cache_f)
+            self.assertEqual(isolate_identity._read_jwks_cache(path, 3600), {"keys": [{"kid": "1"}]})
+            isolate_identity._is_safe_cache_path = lambda _: False
+            self.assertIsNone(isolate_identity._read_jwks_cache(path, 3600))
+        finally:
+            isolate_identity._is_safe_cache_path = original_safe
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 

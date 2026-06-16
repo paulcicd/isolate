@@ -22,7 +22,7 @@ if ! getent group auth >/dev/null 2>&1; then
 fi
 
 cd "${AUTH_DATA_ROOT}";
-mkdir -p keys logs
+mkdir -p keys logs cache
 
 chown -R auth:auth "${AUTH_DATA_ROOT}"
 
@@ -54,6 +54,11 @@ chmod 0700 "${AUTH_DATA_ROOT}/wrappers/ssh.py";
 find "${AUTH_DATA_ROOT}/wrappers" -type f ! -name ssh.py -print0 | xargs -r -n60 -P 5 -0 chmod 0600
 
 chmod 0700 "${AUTH_DATA_ROOT}/keys"
+
+# JWKS public-key cache is readable by runtime but must not be writable by
+# interactive bastion users; otherwise users could replace signing keys.
+chmod 0750 "${AUTH_DATA_ROOT}/cache"
+find "${AUTH_DATA_ROOT}/cache" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
 
 if [ -d "${AUTH_DATA_ROOT}/.githooks" ]; then
     chmod 0750 "${AUTH_DATA_ROOT}/.githooks"

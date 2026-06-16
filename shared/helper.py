@@ -17,7 +17,7 @@ from operator import itemgetter
 from pyzabbix import ZabbixAPI
 # from IsolateCore import __version__
 from isolate_config import load_config
-from isolate_identity import IdentityError, load_cached_identity, local_identity
+from isolate_identity import IdentityError, load_verified_identity, local_identity
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 
@@ -457,7 +457,7 @@ class AuthHelper(object):
         if self.args.action[0] == 'cron':
             return local_identity(os.getenv('USER', 'USER_ENV_NOT_SET'), [])
         try:
-            return load_cached_identity()
+            return load_verified_identity(self.config)
         except IdentityError as exc:
             self.print_p("Isolate identity unavailable: {}; run isolate login".format(exc), stderr=True)
             sys.exit(2)
