@@ -30,6 +30,7 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, format_history_table, read_history
+from isolate_notifications import NotificationError, notify_access_event
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
 
 
@@ -152,6 +153,11 @@ def format_access_table(records):
     for record in records:
         lines.append("  ".join(str(record.get(key) or "").ljust(width) for key, _, width in columns))
     return "\n".join(lines)
+
+
+def _print_notification_warnings(result):
+    for error in result.get("errors") or []:
+        print("notification warning: {}".format(error), file=sys.stderr)
 
 
 def _load_cli_identity():
@@ -554,6 +560,11 @@ def cmd_access_request(args, config):
         sudo_mode=args.sudo_mode,
         reason=args.reason,
     )
+    try:
+        _print_notification_warnings(notify_access_event(config, "access_request_created", record, actor=identity))
+    except NotificationError as exc:
+        print("access request notification failed: {}".format(exc), file=sys.stderr)
+        return 2
     print(json.dumps(record, indent=2, sort_keys=True))
 
 
@@ -616,6 +627,13 @@ def cmd_access_approve(args, config):
     if record is None:
         print("Access request not found: {}".format(args.id), file=sys.stderr)
         return 2
+    try:
+        _print_notification_warnings(
+            notify_access_event(config, "access_request_approved", record, actor=approver, extra={"grant": grant})
+        )
+    except NotificationError as exc:
+        print("access approve notification failed: {}".format(exc), file=sys.stderr)
+        return 2
     print(json.dumps({"request": record, "grant": grant}, indent=2, sort_keys=True))
 
 
@@ -629,6 +647,11 @@ def cmd_access_deny(args, config):
         return 2
     if record is None:
         print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    try:
+        _print_notification_warnings(notify_access_event(config, "access_request_denied", record, actor=approver))
+    except NotificationError as exc:
+        print("access deny notification failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
 

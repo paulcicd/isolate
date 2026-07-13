@@ -406,9 +406,33 @@ dashboard:
   listen_port: 8080
   public_url: https://bastion.example.org
   secret_key_file: /opt/auth/keys/dashboard_secret
+  refresh_seconds: 15
   admin_groups:
     - Demo-DevOps
     - Demo-Security
+
+notifications:
+  enabled: true
+  timeout_seconds: 5
+  fail_closed: false
+  sinks:
+    - type: webhook
+      url: https://hooks.example.org/isolate
+      headers:
+        Authorization: "Bearer CHANGE_ME"
+    - type: telegram
+      bot_token: CHANGE_ME_TELEGRAM_BOT_TOKEN
+      chat_id: "-1001234567890"
+      parse_mode: HTML
+    - type: email
+      smtp_host: smtp.example.org
+      smtp_port: 587
+      starttls: true
+      username: isolate@example.org
+      password: CHANGE_ME_SMTP_PASSWORD
+      from: isolate@example.org
+      to:
+        - devsecops@example.org
 
 policy:
   default_allowed_actions:
@@ -1043,6 +1067,68 @@ TTL examples:
 isolate access deny --id 12 --reason "Use staging environment first"
 ```
 
+### Access Notifications
+
+When notifications are enabled, Isolate sends events for request creation, approval, and denial. The access action remains successful even if Telegram, email, or webhook delivery fails, unless `notifications.fail_closed` is explicitly set to `true`.
+
+Example workflow:
+
+```bash
+isolate access request \
+  --project payments-prod \
+  --host 10042 \
+  --remote-user dba \
+  --sudo-mode none \
+  --reason DEMO-INC-1001
+```
+
+DevSecOps receives a notification with the requester, project, host, requested remote user, sudo mode, reason, and dashboard link. An admin then opens `/access`, approves with a TTL such as `2h`, and Isolate creates a temporary user grant until `expires_at`.
+
+Notification config lives in `/opt/auth/configs/isolate.yml`:
+
+```yaml
+notifications:
+  enabled: true
+  timeout_seconds: 5
+  fail_closed: false
+  sinks:
+    - type: webhook
+      url: https://hooks.example.org/isolate
+      headers:
+        Authorization: "Bearer CHANGE_ME"
+
+    - type: telegram
+      bot_token: CHANGE_ME_TELEGRAM_BOT_TOKEN
+      chat_id: "-1001234567890"
+      parse_mode: HTML
+
+    - type: email
+      smtp_host: smtp.example.org
+      smtp_port: 587
+      starttls: true
+      username: isolate@example.org
+      password: CHANGE_ME_SMTP_PASSWORD
+      from: isolate@example.org
+      to:
+        - devsecops@example.org
+```
+
+Supported events:
+
+- `access_request_created`
+- `access_request_approved`
+- `access_request_denied`
+
+Security note: notification tokens and SMTP passwords are secrets. Keep `/opt/auth/configs` owned by `auth:auth`, directory mode `0750`, and config files mode `0640`:
+
+```bash
+sudo bash /opt/auth/scripts/fix-perms.sh
+ls -ld /opt/auth/configs
+ls -l /opt/auth/configs/isolate.yml
+```
+
+`notifications.fail_closed: false` is the recommended default. It prevents an external Telegram, SMTP, or webhook outage from blocking emergency access approval.
+
 ### Access Admins
 
 Access admins are configured by Keycloak groups:
@@ -1184,6 +1270,7 @@ dashboard:
   listen_port: 8080
   public_url: https://bastion.example.org
   secret_key_file: /opt/auth/keys/dashboard_secret
+  refresh_seconds: 15
   admin_groups:
     - Demo-DevOps
     - Demo-Security
@@ -1203,11 +1290,22 @@ Routes:
 - `/logout`: logout.
 - `/sessions/active`: active SSH sessions.
 - `/history`: connection history.
-- `/access`: access requests.
+- `/access`: access requests with approve and deny forms.
 - `/grants`: grants and project sets.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 
 The dashboard is admin-only. If a user is authenticated but does not belong to `dashboard.admin_groups`, the dashboard returns HTTP 403.
+
+The `/`, `/sessions/active`, and `/access` pages auto-refresh when `dashboard.refresh_seconds` is greater than `0`. Set it to `0` to disable refresh.
+
+Access approval from the dashboard supports:
+
+- TTL, for example `30m`, `2h`, or `1d`;
+- optional remote user override;
+- optional sudo mode override;
+- denial reason.
+
+Dashboard POST actions use a per-session CSRF token.
 
 ## Security Model
 

@@ -7,8 +7,9 @@ import fnmatch
 import json
 from contextlib import redirect_stdout
 from types import SimpleNamespace
-from io import BytesIO
+from io import BytesIO, StringIO
 from urllib.error import HTTPError
+from unittest import mock
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
@@ -28,6 +29,7 @@ from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 import isolate
+import isolate_web
 from isolate_access import (
     AccessDenied,
     approve_access_request,
@@ -40,6 +42,7 @@ from isolate_access import (
 from isolate import list_grant_records, load_project_sets, update_grant_record
 from isolate_sessions import list_active_sessions, mark_session_end, mark_session_start
 from isolate_web import is_dashboard_admin
+from isolate_notifications import NotificationError, build_access_notification, notify_access_event
 
 
 class FakeRedis(object):
@@ -530,6 +533,215 @@ class DashboardTest(unittest.TestCase):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
         self.assertTrue(is_dashboard_admin({"groups": ["DevOps"]}, config))
         self.assertFalse(is_dashboard_admin({"groups": ["DBA"]}, config))
+
+    def test_access_page_renders_actions_csrf_and_refresh(self):
+        try:
+            app = isolate_web.create_app(
+                {
+                    "dashboard": {
+                        "admin_groups": ["DevOps"],
+                        "public_url": "http://bastion.example.org",
+                        "refresh_seconds": 15,
+                    },
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": "/tmp/no-history"},
+                }
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        redis = FakeRedis()
+        create_access_request(
+            redis,
+            {"username": "alice", "keycloak_sub": "sub-a", "groups": ["DBA"]},
+            project="kube",
+            host="10004",
+            remote_user="dba",
+            sudo_mode="none",
+            reason="INC-1",
+        )
+        app.config["TESTING"] = True
+        with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                sess["csrf_token"] = "csrf"
+            response = client.get("/access")
+
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn('http-equiv="refresh" content="15"', text)
+        self.assertIn('name="csrf_token" value="csrf"', text)
+        self.assertIn("Approve", text)
+        self.assertIn("Deny", text)
+
+    def test_access_post_rejects_bad_csrf(self):
+        try:
+            app = isolate_web.create_app(
+                {
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": "/tmp/no-history"},
+                }
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        redis = FakeRedis()
+        app.config["TESTING"] = True
+        with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                sess["csrf_token"] = "expected"
+            response = client.post("/access", data={"csrf_token": "bad", "action": "deny", "id": "1"})
+
+        self.assertEqual(response.status_code, 403)
+
+
+class NotificationTest(unittest.TestCase):
+    def test_build_access_notification_payload(self):
+        record = {
+            "id": "7",
+            "status": "pending",
+            "requester": "demo.alice",
+            "project": "kube",
+            "host": "10004",
+            "remote_user": "dba",
+            "sudo_mode": "none",
+            "reason": "INC-1",
+        }
+        notification = build_access_notification(
+            {"dashboard": {"public_url": "https://bastion.example.org"}},
+            "access_request_created",
+            record,
+            actor={"username": "demo.alice"},
+        )
+
+        self.assertIn("Access request created #7", notification["subject"])
+        self.assertEqual(notification["payload"]["dashboard_url"], "https://bastion.example.org/access?id=7")
+        self.assertIn("project: kube", notification["text"])
+
+    def test_webhook_and_telegram_sinks_send_expected_requests(self):
+        config = {
+            "dashboard": {"public_url": "https://bastion.example.org"},
+            "notifications": {
+                "enabled": True,
+                "sinks": [
+                    {"type": "webhook", "url": "https://hooks.example.org/isolate"},
+                    {"type": "telegram", "bot_token": "token", "chat_id": "-100"},
+                ],
+            },
+        }
+        record = {"id": "1", "status": "pending", "requester": "alice", "project": "prod"}
+        requests = []
+
+        class Response(object):
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def getcode(self):
+                return 200
+
+        def fake_urlopen(req, timeout=None):
+            requests.append(req)
+            return Response()
+
+        with mock.patch("isolate_notifications.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = notify_access_event(config, "access_request_created", record)
+
+        self.assertEqual(len(result["sent"]), 2)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].full_url, "https://hooks.example.org/isolate")
+        self.assertIn("/bottoken/sendMessage", requests[1].full_url)
+
+    def test_email_sink_uses_smtp(self):
+        config = {
+            "notifications": {
+                "enabled": True,
+                "sinks": [
+                    {
+                        "type": "email",
+                        "smtp_host": "smtp.example.org",
+                        "smtp_port": 587,
+                        "starttls": True,
+                        "username": "isolate@example.org",
+                        "password": "secret",
+                        "from": "isolate@example.org",
+                        "to": ["devsecops@example.org"],
+                    }
+                ],
+            }
+        }
+        smtp = mock.Mock()
+        smtp.__enter__ = mock.Mock(return_value=smtp)
+        smtp.__exit__ = mock.Mock(return_value=False)
+        with mock.patch("isolate_notifications.smtplib.SMTP", return_value=smtp):
+            result = notify_access_event(config, "access_request_created", {"id": "2", "status": "pending"})
+
+        self.assertEqual(result["sent"][0]["type"], "email")
+        smtp.starttls.assert_called_once()
+        smtp.login.assert_called_once_with("isolate@example.org", "secret")
+        smtp.send_message.assert_called_once()
+
+    def test_sink_failure_is_warning_or_fail_closed(self):
+        config = {
+            "notifications": {
+                "enabled": True,
+                "fail_closed": False,
+                "sinks": [{"type": "webhook", "url": "https://hooks.example.org/isolate"}],
+            }
+        }
+        with mock.patch("isolate_notifications.urllib.request.urlopen", side_effect=OSError("down")):
+            result = notify_access_event(config, "access_request_created", {"id": "3"})
+        self.assertEqual(len(result["errors"]), 1)
+
+        config["notifications"]["fail_closed"] = True
+        with mock.patch("isolate_notifications.urllib.request.urlopen", side_effect=OSError("down")):
+            with self.assertRaises(NotificationError):
+                notify_access_event(config, "access_request_created", {"id": "3"})
+
+
+class AccessNotificationCliTest(unittest.TestCase):
+    def test_access_request_calls_notifier(self):
+        redis = FakeRedis()
+        args = SimpleNamespace(project="prod", host="10001", remote_user="dba", sudo_mode="none", reason="INC-1")
+        with mock.patch.object(isolate, "_load_cli_identity", return_value={"username": "alice", "groups": ["DBA"]}), \
+                mock.patch.object(isolate, "redis_client", return_value=redis), \
+                mock.patch.object(isolate, "notify_access_event", return_value={"sent": [], "errors": []}) as notifier, \
+                redirect_stdout(StringIO()):
+            code = isolate.cmd_access_request(args, {"notifications": {"enabled": False}})
+
+        self.assertIsNone(code)
+        notifier.assert_called_once()
+        self.assertEqual(notifier.call_args[0][1], "access_request_created")
+
+    def test_access_approve_and_deny_call_notifier(self):
+        redis = FakeRedis()
+        requester = {"username": "alice", "groups": ["DBA"]}
+        approver = {"username": "admin", "groups": ["DevOps"]}
+        first = create_access_request(redis, requester, project="prod", reason="INC-1")
+        second = create_access_request(redis, requester, project="prod", reason="INC-2")
+        config = {"access": {"default_ttl": "2h", "max_ttl": "24h"}, "notifications": {"enabled": False}}
+
+        with mock.patch.object(isolate, "_require_access_admin", return_value=approver), \
+                mock.patch.object(isolate, "redis_client", return_value=redis), \
+                mock.patch.object(isolate, "notify_access_event", return_value={"sent": [], "errors": []}) as notifier, \
+                redirect_stdout(StringIO()):
+            approve_code = isolate.cmd_access_approve(
+                SimpleNamespace(id=first["id"], ttl="2h", remote_user=None, sudo_mode=None),
+                config,
+            )
+            deny_code = isolate.cmd_access_deny(SimpleNamespace(id=second["id"], reason="not needed"), config)
+
+        self.assertIsNone(approve_code)
+        self.assertIsNone(deny_code)
+        self.assertEqual([call[0][1] for call in notifier.call_args_list], ["access_request_approved", "access_request_denied"])
 
 
 if __name__ == "__main__":

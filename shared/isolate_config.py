@@ -73,6 +73,13 @@ DEFAULT_CONFIG = {
         "public_url": "http://127.0.0.1:8080",
         "secret_key_file": "/opt/auth/keys/dashboard_secret",
         "admin_groups": [],
+        "refresh_seconds": 15,
+    },
+    "notifications": {
+        "enabled": False,
+        "timeout_seconds": 5,
+        "fail_closed": False,
+        "sinks": [],
     },
     "policy": {
         "default_allowed_actions": ["ssh"],
