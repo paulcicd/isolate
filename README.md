@@ -610,7 +610,9 @@ auth-add-host \
   --server-name control-plane-01 \
   --ip 192.0.2.41 \
   --port 22 \
-  --user support
+  --user support \
+  --services "api-server, etcd, scheduler" \
+  --note "control-plane entrypoint"
 ```
 
 Arguments:
@@ -621,6 +623,54 @@ Arguments:
 - `--port`: target SSH port.
 - `--user`: default remote user from legacy config.
 - `--nosudo`: legacy flag to avoid remote `sudo -i`.
+- `--services`: optional free-form service inventory shown by `s`.
+- `--note`: optional free-form host note.
+
+Example searchable output:
+
+```text
+kube-prod
+------
+10004  | 192.0.2.41      | control-plane-01  | api-server, etcd, scheduler
+```
+
+Search can match services and notes:
+
+```bash
+s etcd
+s kube-prod scheduler
+```
+
+`g` remains conservative: it connects by exact `server_id`, `server_name`, or `server_ip`, not by service/note matches.
+
+### Inventory Admin CLI
+
+List hosts:
+
+```bash
+isolate host list
+isolate host list --project kube-prod
+isolate host list --query redis
+isolate host list --json
+```
+
+Show a host:
+
+```bash
+isolate host show 10004
+```
+
+Update only selected fields:
+
+```bash
+isolate host update 10004 --services "api-server, etcd, scheduler"
+isolate host update 10004 --note "VIP frontend"
+isolate host update 10004 --name control-plane-02
+isolate host update 10004 --ip 192.0.2.42 --port 22
+isolate host update 10004 --user support --nosudo true
+```
+
+`isolate host update` preserves all fields that were not passed and updates `updated_by` / `updated_at`.
 
 ### Show Host
 
@@ -944,6 +994,43 @@ Expected output contains:
     "subject": "group",
     "name": "Demo-DBA"
   }
+}
+```
+
+### Explain Grant Resolution
+
+Use explain for troubleshooting real access decisions:
+
+```bash
+isolate grant explain \
+  --user demo.alex \
+  --group Demo-DBA \
+  --project payments-prod \
+  --host 10042
+```
+
+Allowed output includes matched grant metadata:
+
+```json
+{
+  "allowed": true,
+  "remote_user": "dba",
+  "sudo_mode": "none",
+  "matched_grant": {
+    "id": "42",
+    "subject": "group",
+    "name": "Demo-DBA"
+  }
+}
+```
+
+Denied output includes a ready break-glass request hint:
+
+```json
+{
+  "allowed": false,
+  "reason": "no matching grant for project 'payments-prod'",
+  "suggested_request": "isolate access request --project payments-prod --host 10042 --reason <reason>"
 }
 ```
 
@@ -1290,6 +1377,7 @@ Routes:
 - `/logout`: logout.
 - `/sessions/active`: active SSH sessions.
 - `/history`: connection history.
+- `/inventory`: read-only host inventory with service/note search.
 - `/access`: access requests with approve and deny forms.
 - `/grants`: grants and project sets.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.

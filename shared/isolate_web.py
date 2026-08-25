@@ -11,6 +11,7 @@ from isolate_access import approve_access_request, deny_access_request, is_acces
 from isolate_config import load_config
 from isolate_history import read_history
 from isolate_identity import decode_jwt_payload, normalize_claims
+from isolate_inventory import list_hosts
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_sessions import list_active_sessions
 
@@ -56,7 +57,7 @@ form.inline {{ display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: cen
 .notice.error {{ border-color: #efb4b4; background: #fff1f1; }}
 .notice.warning {{ border-color: #e4c46d; background: #fff8df; }}
 </style></head><body>
-<nav><a href="/">Summary</a><a href="/sessions/active">Active</a><a href="/history">History</a><a href="/access">Access</a><a href="/grants">Grants</a><a href="/logout">Logout</a></nav>
+<nav><a href="/">Summary</a><a href="/sessions/active">Active</a><a href="/history">History</a><a href="/inventory">Inventory</a><a href="/access">Access</a><a href="/grants">Grants</a><a href="/logout">Logout</a></nav>
 {notice}
 {body}
 </body></html>""".format(refresh=refresh, title=title, notice=notice_html, body=body)
@@ -69,7 +70,7 @@ def _table(rows, columns):
         cells = []
         for key, _ in columns:
             value = row.get(key) or ""
-            if key != "raw":
+            if key not in ("raw", "project_link", "history"):
                 value = html.escape(str(value))
             cells.append("<td>{}</td>".format(value))
         body += "<tr>{}</tr>".format("".join(cells))
@@ -305,6 +306,37 @@ def create_app(config=None):
             access_table(rows, csrf_token(), config.get("access", {})),
         )
         return _html("Access Requests", body, config=config, notice=notice)
+
+    @app.route("/inventory")
+    def inventory():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        project = request.args.get("project") or None
+        query = request.args.get("q") or None
+        rows = list_hosts(redis_client(config), project=project, query=query)
+        for row in rows:
+            row["project_link"] = '<a href="/history?project={}">{}</a>'.format(
+                html.escape(str(row.get("project_name") or "")),
+                html.escape(str(row.get("project_name") or "")),
+            )
+            row["history"] = '<a href="/history?host={}">history</a>'.format(html.escape(str(row.get("server_id") or "")))
+        body = """
+<h1>Inventory</h1>
+<form method="get">
+  <input name="project" value="{project}" placeholder="project">
+  <input name="q" value="{query}" placeholder="search">
+  <button type="submit">Search</button>
+</form>
+""".format(
+            project=html.escape(project or ""),
+            query=html.escape(query or ""),
+        )
+        body += _table(rows, [
+            ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
+            ("server_user", "user"), ("server_services", "services"), ("server_note", "note"), ("history", "history")
+        ])
+        return _html("Inventory", body)
 
     @app.route("/grants")
     def grants():

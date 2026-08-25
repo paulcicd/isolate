@@ -5,7 +5,7 @@ import uuid
 import unittest
 import fnmatch
 import json
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from io import BytesIO, StringIO
 from urllib.error import HTTPError
@@ -25,6 +25,7 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, read_history
+from isolate_inventory import get_host, list_hosts, update_host
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_ssh import SSHArgumentError, build_ssh_argv
@@ -225,6 +226,100 @@ class ActiveSessionRegistryTest(unittest.TestCase):
         self.assertEqual(list_active_sessions(redis), [])
 
 
+class InventoryTest(unittest.TestCase):
+    def test_search_matches_services_and_note_but_go_fields_do_not(self):
+        try:
+            from helper import AuthHelper
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        host = {
+            "project_name": "stakepoker",
+            "server_id": "10703",
+            "server_ip": "50.19.167.140",
+            "server_name": "lobby",
+            "server_services": "poker-ls, redis, clickhouse",
+            "server_note": "VIP frontend",
+        }
+
+        self.assertTrue(AuthHelper._search_in_item(item=dict(host), query_lower="redis"))
+        self.assertTrue(AuthHelper._search_in_item(item=dict(host), query_lower="vip"))
+        self.assertFalse(
+            AuthHelper._search_in_item(
+                item=dict(host),
+                query_lower="redis",
+                fields=["server_name", "server_id", "server_ip"],
+                exact_match=True,
+            )
+        )
+
+    def test_host_list_show_update(self):
+        redis = FakeRedis()
+        redis.set(
+            "server_10703",
+            json.dumps(
+                {
+                    "server_id": 10703,
+                    "project_name": "stakepoker",
+                    "server_ip": "50.19.167.140",
+                    "server_name": "lobby",
+                    "server_user": "support",
+                }
+            ),
+        )
+
+        rows = list_hosts(redis, query="stake")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["server_services"], "")
+
+        updated = update_host(
+            redis,
+            "10703",
+            {"server_services": "redis, clickhouse", "server_note": "VIP frontend", "server_nosudo": True},
+            updated_by="tester",
+        )
+        self.assertEqual(updated["server_services"], "redis, clickhouse")
+        self.assertEqual(updated["server_note"], "VIP frontend")
+        self.assertTrue(json.loads(redis.get("server_10703"))["server_nosudo"])
+        self.assertEqual(get_host(redis, "10703")["updated_by"], "tester")
+
+    def test_host_update_cli_and_validation(self):
+        redis = FakeRedis()
+        redis.set(
+            "server_1",
+            json.dumps(
+                {
+                    "server_id": 1,
+                    "project_name": "prod",
+                    "server_ip": "10.0.0.1",
+                    "server_name": "web",
+                    "server_user": "support",
+                }
+            ),
+        )
+        args = SimpleNamespace(
+            server_id="1",
+            project=None,
+            name=None,
+            ip=None,
+            port=None,
+            user=None,
+            nosudo=None,
+            services="nginx, kafka",
+            note=None,
+            proxy_id=None,
+        )
+        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as output:
+            code = isolate.cmd_host_update(args, {})
+
+        self.assertIsNone(code)
+        self.assertEqual(json.loads(output.getvalue())["server_services"], "nginx, kafka")
+
+        args.ip = "not-an-ip"
+        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+            code = isolate.cmd_host_update(args, {})
+        self.assertEqual(code, 2)
+
+
 class GrantAdminUxTest(unittest.TestCase):
     def test_lists_and_filters_grants(self):
         redis = FakeRedis()
@@ -276,6 +371,51 @@ class GrantAdminUxTest(unittest.TestCase):
             self.assertEqual(load_project_sets(redis), {})
         finally:
             isolate.redis_client = original_redis_client
+
+    def test_grant_explain_allowed_and_denied(self):
+        redis = FakeRedis()
+        redis.set(
+            "server_10703",
+            json.dumps(
+                {
+                    "server_id": 10703,
+                    "project_name": "stakepoker",
+                    "server_ip": "50.19.167.140",
+                    "server_name": "lobby",
+                }
+            ),
+        )
+        redis.set(
+            "grant_42",
+            json.dumps(
+                {
+                    "subject": "group",
+                    "name": "Demo-DevOps",
+                    "project": "stakepoker",
+                    "remote_user": "support",
+                    "sudo_mode": "none",
+                    "allowed_actions": ["ssh"],
+                }
+            ),
+        )
+        args = SimpleNamespace(user="demo.alex", group=["Demo-DevOps"], role=None, project=None, host="10703")
+        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as output:
+            code = isolate.cmd_grant_explain(args, {"policy": {}, "ssh": {}})
+
+        self.assertEqual(code, 0)
+        allowed = json.loads(output.getvalue())
+        self.assertTrue(allowed["allowed"])
+        self.assertEqual(allowed["matched_grant"]["id"], "42")
+        self.assertEqual(allowed["remote_user"], "support")
+
+        denied_args = SimpleNamespace(user="demo.alex", group=["Demo-DBA"], role=None, project=None, host="10703")
+        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as denied_output:
+            code = isolate.cmd_grant_explain(denied_args, {"policy": {}, "ssh": {}})
+
+        self.assertEqual(code, 2)
+        denied = json.loads(denied_output.getvalue())
+        self.assertFalse(denied["allowed"])
+        self.assertIn("isolate access request", denied["suggested_request"])
 
 
 class SSHBuilderTest(unittest.TestCase):
@@ -597,6 +737,46 @@ class DashboardTest(unittest.TestCase):
             response = client.post("/access", data={"csrf_token": "bad", "action": "deny", "id": "1"})
 
         self.assertEqual(response.status_code, 403)
+
+    def test_inventory_page_filters_and_renders_links(self):
+        try:
+            app = isolate_web.create_app(
+                {
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": "/tmp/no-history"},
+                }
+            )
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        redis = FakeRedis()
+        redis.set(
+            "server_10703",
+            json.dumps(
+                {
+                    "server_id": 10703,
+                    "project_name": "stakepoker",
+                    "server_ip": "50.19.167.140",
+                    "server_name": "lobby",
+                    "server_user": "support",
+                    "server_services": "redis, clickhouse",
+                    "server_note": "<vip>",
+                }
+            ),
+        )
+        app.config["TESTING"] = True
+        with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+            response = client.get("/inventory?q=redis")
+
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn("redis, clickhouse", text)
+        self.assertIn('/history?host=10703', text)
+        self.assertIn("&lt;vip&gt;", text)
 
 
 class NotificationTest(unittest.TestCase):

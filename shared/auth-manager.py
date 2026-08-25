@@ -98,6 +98,19 @@ class AuthManager(object):
                 LOGGER.critical('proxy with id {} not found!'.format(self.params['proxy_id']))
                 sys.exit(1)
         self.params['server_nosudo'] = self.params['nosudo']
+        self.params['server_services'] = self.params['services'][0]
+        if self.params['server_services'] is not None:
+            self.params['server_services'] = str(self.params['server_services']).strip()
+            if len(self.params['server_services']) > 2048:
+                LOGGER.critical('[services] Validation not passed')
+                sys.exit(1)
+
+        self.params['server_note'] = self.params['note'][0]
+        if self.params['server_note'] is not None:
+            self.params['server_note'] = str(self.params['server_note']).strip()
+            if len(self.params['server_note']) > 2048:
+                LOGGER.critical('[note] Validation not passed')
+                sys.exit(1)
 
         # Meta clean up
         del self.params['action']
@@ -106,6 +119,8 @@ class AuthManager(object):
         del self.params['port']
         del self.params['user']
         del self.params['nosudo']
+        del self.params['services']
+        del self.params['note']
         del self.params['debug']
 
     def add_host(self):
@@ -179,6 +194,8 @@ def main():
     arg_parser.add_argument('--port', '--server-port', type=int, nargs=1, default=[None])
     arg_parser.add_argument('--user', type=str, nargs=1, default=[None])
     arg_parser.add_argument('--nosudo', action='store_true', default=None)
+    arg_parser.add_argument('--services', type=str, nargs=1, default=[None])
+    arg_parser.add_argument('--note', type=str, nargs=1, default=[None])
 
     arg_parser.add_argument('--proxy-id', type=int, nargs=1,
                             default=[None], help="server_id of proxy")

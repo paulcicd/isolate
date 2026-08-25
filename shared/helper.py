@@ -539,7 +539,7 @@ class AuthHelper(object):
         self.ISOLATE_COLORS = str2bool(os.getenv('ISOLATE_COLORS', False))
 
         # Search Print Line: fields names and order, not template
-        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name').strip().split(' ')
+        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_services').strip().split(' ')
 
     def _load_data(self):
         self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
@@ -574,6 +574,8 @@ class AuthHelper(object):
                                        'server_name',
                                        'server_id',
                                        'server_ip',
+                                       'server_services',
+                                       'server_note',
                                        'os_version',
                                        'geoip_asn'])  # 'alerts'
 
@@ -716,6 +718,8 @@ class AuthHelper(object):
             host['match_info'] = self.colorize(', '.join(match_info), color='okgreen')
 
         host['geoip_asn'] = host.get('geoip_asn', None)
+        host['server_services'] = host.get('server_services') or ''
+        host['server_note'] = host.get('server_note') or ''
 
         return host
 
@@ -758,7 +762,7 @@ class AuthHelper(object):
             host_line = []
 
             for field in self.ISOLATE_SPF:
-                if field in host.keys():
+                if field in host.keys() and host[field] not in [None, '']:
                     host_line.append(host[field])
 
             if ambiguous or not title:

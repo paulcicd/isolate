@@ -30,6 +30,7 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, format_history_table, read_history
+from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, update_host
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
 
@@ -63,7 +64,13 @@ def load_grants(redis):
     grants = []
     for pattern in ("grant_*", "policy_*"):
         for key in redis.keys(pattern):
-            grants.append(json.loads(decode(redis.get(key))))
+            key_name = _redis_key_name(key)
+            grant = json.loads(decode(redis.get(key)))
+            if key_name.startswith("grant_"):
+                grant["id"] = key_name.replace("grant_", "", 1)
+            elif key_name.startswith("policy_"):
+                grant["id"] = key_name
+            grants.append(grant)
     return grants
 
 
@@ -510,6 +517,123 @@ def cmd_grant_test(args, config):
     return 0
 
 
+def _str2bool(value):
+    if value is None:
+        return None
+    value = str(value).strip().lower()
+    if value in ("1", "true", "yes", "y", "on"):
+        return True
+    if value in ("0", "false", "no", "n", "off"):
+        return False
+    raise argparse.ArgumentTypeError("expected true or false")
+
+
+def cmd_host_list(args, config):
+    rows = list_hosts(redis_client(config), project=args.project, query=args.query)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print(format_hosts_table(rows))
+
+
+def cmd_host_show(args, config):
+    host = get_host(redis_client(config), args.server_id)
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    print(json.dumps(host, indent=2, sort_keys=True))
+
+
+def cmd_host_update(args, config):
+    redis = redis_client(config)
+    updates = {
+        "project_name": args.project,
+        "server_name": args.name,
+        "server_ip": args.ip,
+        "server_port": args.port,
+        "server_user": args.user,
+        "server_nosudo": args.nosudo,
+        "server_services": args.services,
+        "server_note": args.note,
+        "proxy_id": args.proxy_id,
+    }
+    try:
+        host = update_host(redis, args.server_id, updates, updated_by=os.getenv("USER") or os.getenv("USERNAME"))
+    except (HostValidationError, ValueError) as exc:
+        print("host update failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    print(json.dumps(host, indent=2, sort_keys=True))
+
+
+def cmd_grant_explain(args, config):
+    redis = redis_client(config)
+    host = get_host(redis, args.host) if args.host else None
+    if args.host and host is None:
+        host = {"server_id": args.host, "server_name": args.host}
+    project = args.project or (host or {}).get("project_name")
+
+    identity = {"username": args.user, "groups": args.group or [], "roles": args.role or []}
+    if not args.group:
+        try:
+            current = load_verified_identity(config)
+            if not args.user or args.user == current.get("username"):
+                identity = current
+        except IdentityError:
+            pass
+    if args.user:
+        identity["username"] = args.user
+
+    try:
+        decision = resolve_grant(
+            identity,
+            project=project,
+            host=host,
+            grants=load_grants(redis),
+            project_sets=load_project_sets(redis),
+            defaults={**config.get("policy", {}), **config.get("ssh", {})},
+        )
+        matched = decision.get("matched_rule") or {}
+        output = {
+            "allowed": True,
+            "user": identity.get("username"),
+            "groups": identity.get("groups") or [],
+            "project": project,
+            "host": host,
+            "remote_user": decision.get("remote_user"),
+            "sudo_mode": decision.get("sudo_mode"),
+            "allowed_actions": decision.get("allowed_actions"),
+            "matched_grant": {
+                "id": matched.get("id"),
+                "subject": matched.get("subject"),
+                "name": matched.get("name"),
+                "host": matched.get("host") or matched.get("host_id") or matched.get("server_id"),
+                "project": matched.get("project"),
+                "project_glob": matched.get("project_glob"),
+                "project_set": matched.get("project_set"),
+            },
+        }
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return 0
+    except PolicyDenied as exc:
+        output = {
+            "allowed": False,
+            "user": identity.get("username"),
+            "groups": identity.get("groups") or [],
+            "project": project,
+            "host": host,
+            "reason": str(exc),
+            "suggested_request": "isolate access request --project {}{} --reason <reason>".format(
+                project or "<project>",
+                " --host {}".format(args.host) if args.host else "",
+            ),
+        }
+        print(json.dumps(output, indent=2, sort_keys=True))
+        return 2
+
+
 def cmd_history(args, config):
     try:
         identity = load_verified_identity(config)
@@ -792,6 +916,39 @@ def build_parser():
     grant_test.add_argument("--project")
     grant_test.add_argument("--host")
     grant_test.set_defaults(func=cmd_grant_test)
+
+    grant_explain = grant_sub.add_parser("explain")
+    grant_explain.add_argument("--user", required=True)
+    grant_explain.add_argument("--group", action="append")
+    grant_explain.add_argument("--role", action="append")
+    grant_explain.add_argument("--project")
+    grant_explain.add_argument("--host")
+    grant_explain.set_defaults(func=cmd_grant_explain)
+
+    host = sub.add_parser("host")
+    host_sub = host.add_subparsers(dest="host_command", required=True)
+    host_list = host_sub.add_parser("list")
+    host_list.add_argument("--project")
+    host_list.add_argument("--query")
+    host_list.add_argument("--json", action="store_true")
+    host_list.set_defaults(func=cmd_host_list)
+
+    host_show = host_sub.add_parser("show")
+    host_show.add_argument("server_id")
+    host_show.set_defaults(func=cmd_host_show)
+
+    host_update = host_sub.add_parser("update")
+    host_update.add_argument("server_id")
+    host_update.add_argument("--project")
+    host_update.add_argument("--name")
+    host_update.add_argument("--ip")
+    host_update.add_argument("--port", type=int)
+    host_update.add_argument("--user")
+    host_update.add_argument("--nosudo", type=_str2bool)
+    host_update.add_argument("--services")
+    host_update.add_argument("--note")
+    host_update.add_argument("--proxy-id")
+    host_update.set_defaults(func=cmd_host_update)
 
     session = sub.add_parser("session")
     session_sub = session.add_subparsers(dest="session_command", required=True)

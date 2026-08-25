@@ -135,7 +135,7 @@ auth-add-user () {
 
 auth-add-host () {
     if [[ $# -eq 0 ]] ; then
-        echo -e "\\n  Usage: auth-add-host --project <project_name> --server-name <server_name> --ip 1.2.3.4 --port 22 --user root --nosudo \\n";
+        echo -e "\\n  Usage: auth-add-host --project <project_name> --server-name <server_name> --ip 1.2.3.4 --port 22 --user root --nosudo --services 'nginx, redis' --note 'VIP frontend' \\n";
         return
     elif [[ $# -gt 0 ]] ; then
         "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-host" "${@}";
