@@ -35,6 +35,11 @@ def normalize_host(host):
     row["server_ip"] = str(row.get("server_ip") or "")
     row["server_services"] = normalize_services(row.get("server_services"))
     row["server_note"] = str(row.get("server_note") or "").strip()
+    row["server_vip"] = bool(row.get("server_vip"))
+    row["server_vip_marker"] = "VIP" if row["server_vip"] else ""
+    row["privileged_access_provider"] = str(row.get("privileged_access_provider") or "").strip()
+    row["privileged_access_url"] = str(row.get("privileged_access_url") or "").strip()
+    row["privileged_access_hint"] = str(row.get("privileged_access_hint") or "").strip()
     return row
 
 
@@ -72,6 +77,10 @@ def host_matches_query(host, query):
         "server_user",
         "server_services",
         "server_note",
+        "server_vip_marker",
+        "privileged_access_provider",
+        "privileged_access_url",
+        "privileged_access_hint",
     )
     return any(query_l in str(host.get(field) or "").lower() for field in fields)
 
@@ -105,6 +114,8 @@ def validate_host_updates(redis, updates):
         normalized["server_user"] = user
     if updates.get("server_nosudo") is not None:
         normalized["server_nosudo"] = bool(updates["server_nosudo"])
+    if updates.get("server_vip") is not None:
+        normalized["server_vip"] = bool(updates["server_vip"])
     if updates.get("server_services") is not None:
         services = normalize_services(updates["server_services"])
         if len(services) > 2048:
@@ -115,6 +126,16 @@ def validate_host_updates(redis, updates):
         if len(note) > 2048:
             raise HostValidationError("note value is too long")
         normalized["server_note"] = note
+    for source, target in (
+        ("privileged_access_provider", "privileged_access_provider"),
+        ("privileged_access_url", "privileged_access_url"),
+        ("privileged_access_hint", "privileged_access_hint"),
+    ):
+        if updates.get(source) is not None:
+            value = str(updates[source]).strip()
+            if len(value) > 2048:
+                raise HostValidationError("{} value is too long".format(target))
+            normalized[target] = value
     if updates.get("proxy_id") is not None:
         proxy_id = str(updates["proxy_id"]).strip()
         if proxy_id and redis.get("server_{}".format(proxy_id)) is None:
@@ -141,6 +162,7 @@ def format_hosts_table(rows):
         ("project_name", "project", 16),
         ("server_ip", "ip", 16),
         ("server_name", "name", 20),
+        ("server_vip_marker", "vip", 4),
         ("server_user", "user", 12),
         ("server_services", "services", 32),
     ]

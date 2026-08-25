@@ -25,9 +25,10 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, read_history
-from isolate_inventory import get_host, list_hosts, update_host
+from isolate_inventory import format_hosts_table, get_host, list_hosts, update_host
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
+from isolate_replay import find_session, parse_raw_replay
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 import isolate
 import isolate_web
@@ -304,8 +305,12 @@ class InventoryTest(unittest.TestCase):
             port=None,
             user=None,
             nosudo=None,
+            vip=None,
             services="nginx, kafka",
             note=None,
+            privileged_provider=None,
+            privileged_url=None,
+            privileged_hint=None,
             proxy_id=None,
         )
         with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as output:
@@ -318,6 +323,37 @@ class InventoryTest(unittest.TestCase):
         with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
             code = isolate.cmd_host_update(args, {})
         self.assertEqual(code, 2)
+
+    def test_vip_privileged_fields_update_and_render(self):
+        redis = FakeRedis()
+        redis.set(
+            "server_10",
+            json.dumps(
+                {
+                    "server_id": 10,
+                    "project_name": "vip-prod",
+                    "server_ip": "10.0.0.10",
+                    "server_name": "vip-db",
+                    "server_user": "support",
+                }
+            ),
+        )
+        updated = update_host(
+            redis,
+            "10",
+            {
+                "server_vip": True,
+                "privileged_access_provider": "Warpgate",
+                "privileged_access_url": "https://pam.example.org",
+                "privileged_access_hint": "Use external PAM for sudo",
+            },
+            updated_by="tester",
+        )
+
+        self.assertTrue(updated["server_vip"])
+        self.assertEqual(updated["server_vip_marker"], "VIP")
+        self.assertEqual(updated["privileged_access_provider"], "Warpgate")
+        self.assertIn("VIP", format_hosts_table([updated]))
 
 
 class GrantAdminUxTest(unittest.TestCase):
@@ -668,6 +704,83 @@ class HistoryTest(unittest.TestCase):
             shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+class SessionReplayTest(unittest.TestCase):
+    def test_find_session_details_and_parse_replay(self):
+        tmpdir = os.path.join(ROOT, ".tmp-session-{}".format(uuid.uuid4().hex))
+        raw_path = os.path.join(tmpdir, "alice", "session-1", "raw.log")
+        try:
+            self._write_session(
+                tmpdir,
+                "alice",
+                "session-1",
+                [
+                    {
+                        "event": "policy_selected",
+                        "ts": 10.0,
+                        "username": "alice",
+                        "project": "prod",
+                        "host_id": "10001",
+                        "target_host": "10.0.0.1",
+                        "remote_user": "support",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                    },
+                    {
+                        "event": "ssh_start",
+                        "ts": 11.0,
+                        "username": "alice",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                        "raw_log_path": raw_path,
+                    },
+                    {
+                        "event": "ssh_end",
+                        "ts": 12.0,
+                        "username": "alice",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                        "exit_code": 0,
+                        "raw_log_path": raw_path,
+                    },
+                ],
+            )
+            with open(raw_path, "w", encoding="utf-8") as raw_f:
+                raw_f.write("1000.000000\nwhoami\n1000.500000\nsupport\n")
+
+            details = find_session(tmpdir, "conn-1")
+            self.assertEqual(details["summary"]["connection_id"], "conn-1")
+            self.assertEqual(details["summary"]["result"], "exit=0")
+            self.assertEqual(details["raw_log_path"], raw_path)
+
+            replay = parse_raw_replay(raw_path)
+            self.assertIsNone(replay["error"])
+            self.assertEqual(replay["chunks"][0]["t"], 0.0)
+            self.assertIn("whoami", replay["plain"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_malformed_replay_falls_back_to_plain_text(self):
+        tmpdir = os.path.join(ROOT, ".tmp-replay-{}".format(uuid.uuid4().hex))
+        raw_path = os.path.join(tmpdir, "raw.log")
+        try:
+            os.makedirs(tmpdir)
+            with open(raw_path, "w", encoding="utf-8") as raw_f:
+                raw_f.write("plain transcript without timestamps")
+            replay = parse_raw_replay(raw_path)
+            self.assertEqual(replay["chunks"], [])
+            self.assertIn("plain transcript", replay["plain"])
+            self.assertIsNotNone(replay["error"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def _write_session(self, base, user, session_id, events):
+        session_dir = os.path.join(base, user, session_id)
+        os.makedirs(session_dir)
+        with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as session_f:
+            for event in events:
+                session_f.write("{}\n".format(json.dumps(event, sort_keys=True)))
+
+
 class DashboardTest(unittest.TestCase):
     def test_dashboard_admin_check(self):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
@@ -762,6 +875,9 @@ class DashboardTest(unittest.TestCase):
                     "server_user": "support",
                     "server_services": "redis, clickhouse",
                     "server_note": "<vip>",
+                    "server_vip": True,
+                    "privileged_access_provider": "Warpgate",
+                    "privileged_access_hint": "<sudo via PAM>",
                 }
             ),
         )
@@ -775,8 +891,74 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         text = response.get_data(as_text=True)
         self.assertIn("redis, clickhouse", text)
+        self.assertIn("VIP", text)
+        self.assertIn("Warpgate", text)
+        self.assertIn("&lt;sudo via PAM&gt;", text)
         self.assertIn('/history?host=10703', text)
         self.assertIn("&lt;vip&gt;", text)
+
+    def test_session_details_and_replay_routes(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-session-{}".format(uuid.uuid4().hex))
+        raw_path = os.path.join(tmpdir, "admin", "session-1", "raw.log")
+        try:
+            try:
+                app = isolate_web.create_app(
+                    {
+                        "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                        "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                        "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                        "logging": {"base_path": tmpdir},
+                    }
+                )
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            os.makedirs(os.path.dirname(raw_path))
+            with open(os.path.join(os.path.dirname(raw_path), "session.jsonl"), "w", encoding="utf-8") as session_f:
+                for event in [
+                    {
+                        "event": "policy_selected",
+                        "ts": 10.0,
+                        "username": "admin",
+                        "project": "prod",
+                        "host_id": "10001",
+                        "target_host": "10.0.0.1",
+                        "remote_user": "support",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                    },
+                    {
+                        "event": "ssh_end",
+                        "ts": 11.0,
+                        "username": "admin",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                        "exit_code": 0,
+                        "raw_log_path": raw_path,
+                    },
+                ]:
+                    session_f.write("{}\n".format(json.dumps(event, sort_keys=True)))
+            with open(raw_path, "w", encoding="utf-8") as raw_f:
+                raw_f.write("1000.000000\nhello\n1000.250000\nworld\n")
+
+            app.config["TESTING"] = True
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+
+            details = client.get("/session/conn-1")
+            self.assertEqual(details.status_code, 200)
+            self.assertIn("Session Details", details.get_data(as_text=True))
+            self.assertIn("/replay/conn-1", details.get_data(as_text=True))
+
+            events = client.get("/session/conn-1/events.json")
+            self.assertEqual(events.status_code, 200)
+            self.assertIn("policy_selected", events.get_data(as_text=True))
+
+            replay = client.get("/replay/conn-1.json")
+            self.assertEqual(replay.status_code, 200)
+            self.assertIn("hello", replay.get_data(as_text=True))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class NotificationTest(unittest.TestCase):

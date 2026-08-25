@@ -3,6 +3,7 @@
 """Lightweight Isolate admin dashboard."""
 
 import html
+import json
 import os
 import secrets
 
@@ -13,6 +14,7 @@ from isolate_history import read_history
 from isolate_identity import decode_jwt_payload, normalize_claims
 from isolate_inventory import list_hosts
 from isolate_notifications import NotificationError, notify_access_event
+from isolate_replay import find_session, parse_raw_replay
 from isolate_sessions import list_active_sessions
 
 
@@ -70,7 +72,7 @@ def _table(rows, columns):
         cells = []
         for key, _ in columns:
             value = row.get(key) or ""
-            if key not in ("raw", "project_link", "history"):
+            if key not in ("raw", "project_link", "history", "details", "replay"):
                 value = html.escape(str(value))
             cells.append("<td>{}</td>".format(value))
         body += "<tr>{}</tr>".format("".join(cells))
@@ -256,11 +258,14 @@ def create_app(config=None):
             admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
         )
         for row in rows:
+            connection_id = row.get("connection_id") or row.get("session_id")
+            if connection_id:
+                row["details"] = '<a href="/session/{}">details</a>'.format(html.escape(str(connection_id)))
             if row.get("raw_log_path"):
                 row["raw"] = '<a href="/raw/{}/{}">raw</a>'.format(row.get("username"), row.get("connection_id") or row.get("session_id"))
         return _html("History", "<h1>History</h1>" + _table(rows, [
             ("time", "time"), ("username", "user"), ("project", "project"), ("host_id", "host"),
-            ("target", "target"), ("remote_user", "remote_user"), ("result", "result"), ("raw", "raw")
+            ("target", "target"), ("remote_user", "remote_user"), ("result", "result"), ("details", "details"), ("raw", "raw")
         ]))
 
     @app.route("/access", methods=["GET", "POST"])
@@ -334,9 +339,136 @@ def create_app(config=None):
         )
         body += _table(rows, [
             ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
-            ("server_user", "user"), ("server_services", "services"), ("server_note", "note"), ("history", "history")
+            ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services", "services"),
+            ("server_note", "note"), ("privileged_access_provider", "privileged"), ("privileged_access_hint", "hint"),
+            ("history", "history")
         ])
         return _html("Inventory", body)
+
+    @app.route("/session/<connection_id>")
+    def session_details(connection_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        details = find_session(config["logging"]["base_path"], connection_id)
+        if details is None:
+            abort(404)
+        summary = details.get("summary") or {}
+        raw_link = ""
+        replay_link = ""
+        if summary.get("raw_log_path"):
+            raw_link = '<a href="/raw/{}/{}">raw transcript</a>'.format(
+                html.escape(str(summary.get("username") or "")),
+                html.escape(str(connection_id)),
+            )
+            replay_link = '<a href="/replay/{}">replay</a>'.format(html.escape(str(connection_id)))
+        summary_rows = [
+            {"key": key, "value": summary.get(key)}
+            for key in ("time", "username", "project", "host_id", "target", "remote_user", "result", "connection_id", "session_id")
+        ]
+        event_rows = []
+        for event in details.get("events") or []:
+            event_rows.append(
+                {
+                    "ts": event.get("ts"),
+                    "event": event.get("event"),
+                    "project": event.get("project"),
+                    "host_id": event.get("host_id"),
+                    "remote_user": event.get("remote_user"),
+                    "exit_code": event.get("exit_code"),
+                }
+            )
+        body = "<h1>Session Details</h1>"
+        body += "<p>{} {} <a href=\"/session/{}/events.json\">events.json</a></p>".format(raw_link, replay_link, html.escape(str(connection_id)))
+        body += "<h2>Summary</h2>" + _table(summary_rows, [("key", "field"), ("value", "value")])
+        body += "<h2>Timeline</h2>" + _table(event_rows, [
+            ("ts", "ts"), ("event", "event"), ("project", "project"), ("host_id", "host"),
+            ("remote_user", "remote_user"), ("exit_code", "exit")
+        ])
+        return _html("Session Details", body)
+
+    @app.route("/session/<connection_id>/events.json")
+    def session_events_json(connection_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        details = find_session(config["logging"]["base_path"], connection_id)
+        if details is None:
+            abort(404)
+        return app.response_class(
+            response=json.dumps(details.get("events") or [], indent=2, sort_keys=True),
+            status=200,
+            mimetype="application/json",
+        )
+
+    @app.route("/replay/<connection_id>.json")
+    def replay_json(connection_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        details = find_session(config["logging"]["base_path"], connection_id)
+        if details is None:
+            abort(404)
+        replay = parse_raw_replay(details.get("raw_log_path"))
+        return app.response_class(
+            response=json.dumps(replay, indent=2, sort_keys=True),
+            status=200,
+            mimetype="application/json",
+        )
+
+    @app.route("/replay/<connection_id>")
+    def replay(connection_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        details = find_session(config["logging"]["base_path"], connection_id)
+        if details is None:
+            abort(404)
+        replay_data = parse_raw_replay(details.get("raw_log_path"))
+        plain = html.escape(replay_data.get("plain") or "")
+        error = replay_data.get("error")
+        body = """
+<h1>Session Replay</h1>
+<p><a href="/session/{connection_id}">details</a> <a href="/replay/{connection_id}.json">chunks.json</a></p>
+<p>
+  <button id="play">Play</button>
+  <button id="pause">Pause</button>
+  <button id="reset">Reset</button>
+  <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option><option value="5">5x</option></select>
+</p>
+<pre id="terminal" style="background:#111;color:#eee;padding:12px;min-height:360px;white-space:pre-wrap;"></pre>
+<pre id="fallback" style="display:none;">{plain}</pre>
+<script>
+let chunks = [];
+let timers = [];
+let speed = 1;
+let cursor = 0;
+const terminal = document.getElementById("terminal");
+function clearTimers() {{ timers.forEach(clearTimeout); timers = []; }}
+function renderUntil(index) {{ terminal.textContent = chunks.slice(0, index).map(c => c.data).join(""); }}
+function play() {{
+  clearTimers();
+  speed = parseFloat(document.getElementById("speed").value || "1");
+  const base = chunks[cursor] ? chunks[cursor].t : 0;
+  for (let i = cursor; i < chunks.length; i++) {{
+    timers.push(setTimeout(() => {{
+      terminal.textContent += chunks[i].data;
+      cursor = i + 1;
+    }}, Math.max(0, (chunks[i].t - base) * 1000 / speed)));
+  }}
+}}
+document.getElementById("play").onclick = play;
+document.getElementById("pause").onclick = clearTimers;
+document.getElementById("reset").onclick = () => {{ clearTimers(); cursor = 0; terminal.textContent = ""; }};
+fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
+  chunks = data.chunks || [];
+  if (!chunks.length) {{ terminal.textContent = document.getElementById("fallback").textContent; }}
+}});
+</script>
+""".format(connection_id=html.escape(str(connection_id)), plain=plain)
+        if error:
+            body = '<div class="notice warning">{}</div>'.format(html.escape(str(error))) + body
+        return _html("Session Replay", body)
 
     @app.route("/grants")
     def grants():

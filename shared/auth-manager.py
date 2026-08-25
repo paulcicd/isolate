@@ -112,6 +112,17 @@ class AuthManager(object):
                 LOGGER.critical('[note] Validation not passed')
                 sys.exit(1)
 
+        self.params['server_vip'] = self.params['vip']
+        self.params['privileged_access_provider'] = self.params['privileged_provider'][0]
+        self.params['privileged_access_url'] = self.params['privileged_url'][0]
+        self.params['privileged_access_hint'] = self.params['privileged_hint'][0]
+        for key in ('privileged_access_provider', 'privileged_access_url', 'privileged_access_hint'):
+            if self.params[key] is not None:
+                self.params[key] = str(self.params[key]).strip()
+                if len(self.params[key]) > 2048:
+                    LOGGER.critical('[{}] Validation not passed'.format(key))
+                    sys.exit(1)
+
         # Meta clean up
         del self.params['action']
         del self.params['project']
@@ -121,6 +132,10 @@ class AuthManager(object):
         del self.params['nosudo']
         del self.params['services']
         del self.params['note']
+        del self.params['vip']
+        del self.params['privileged_provider']
+        del self.params['privileged_url']
+        del self.params['privileged_hint']
         del self.params['debug']
 
     def add_host(self):
@@ -196,6 +211,10 @@ def main():
     arg_parser.add_argument('--nosudo', action='store_true', default=None)
     arg_parser.add_argument('--services', type=str, nargs=1, default=[None])
     arg_parser.add_argument('--note', type=str, nargs=1, default=[None])
+    arg_parser.add_argument('--vip', action='store_true', default=False)
+    arg_parser.add_argument('--privileged-provider', type=str, nargs=1, default=[None])
+    arg_parser.add_argument('--privileged-url', type=str, nargs=1, default=[None])
+    arg_parser.add_argument('--privileged-hint', type=str, nargs=1, default=[None])
 
     arg_parser.add_argument('--proxy-id', type=int, nargs=1,
                             default=[None], help="server_id of proxy")

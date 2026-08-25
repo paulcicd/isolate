@@ -668,9 +668,18 @@ isolate host update 10004 --note "VIP frontend"
 isolate host update 10004 --name control-plane-02
 isolate host update 10004 --ip 192.0.2.42 --port 22
 isolate host update 10004 --user support --nosudo true
+isolate host update 10004 \
+  --vip true \
+  --privileged-provider Warpgate \
+  --privileged-url https://warpgate.example.org \
+  --privileged-hint "Use external bastion for sudo/root access"
 ```
 
 `isolate host update` preserves all fields that were not passed and updates `updated_by` / `updated_at`.
+
+VIP and privileged access fields are informational. They do not change grants by themselves. Use them to document that ordinary non-sudo SSH access stays in Isolate, while sudo/root access is handled by an external privileged access provider such as Warpgate, Teleport, PAM, or another bastion.
+
+If a VIP host is denied by policy and privileged access metadata is configured, `g` prints a hint with the external provider and URL.
 
 ### Show Host
 
@@ -1329,7 +1338,23 @@ Raw transcripts are written as legacy `.log` files under:
 /opt/auth/logs/<user>/
 ```
 
-The dashboard can link to raw transcripts for admins.
+The dashboard can link to raw transcripts for admins. It can also render a session details page and replay MVP from the current raw log format.
+
+Session details:
+
+```text
+/session/<connection_id>
+/session/<connection_id>/events.json
+```
+
+Replay MVP:
+
+```text
+/replay/<connection_id>
+/replay/<connection_id>.json
+```
+
+Replay uses the existing raw `.log` chunks and does not attempt reliable command extraction. Structured command audit remains a separate future feature.
 
 ## Admin Dashboard
 
@@ -1377,9 +1402,13 @@ Routes:
 - `/logout`: logout.
 - `/sessions/active`: active SSH sessions.
 - `/history`: connection history.
+- `/session/<connection_id>`: session details and timeline.
+- `/session/<connection_id>/events.json`: session JSONL events.
 - `/inventory`: read-only host inventory with service/note search.
 - `/access`: access requests with approve and deny forms.
 - `/grants`: grants and project sets.
+- `/replay/<connection_id>`: raw transcript replay MVP.
+- `/replay/<connection_id>.json`: parsed replay chunks.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 
 The dashboard is admin-only. If a user is authenticated but does not belong to `dashboard.admin_groups`, the dashboard returns HTTP 403.

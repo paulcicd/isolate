@@ -390,12 +390,29 @@ class ServerConnection(object):
         try:
             self.resolve()
         except PolicyDenied as exc:
+            host_meta = self.search_results[0] if len(self.search_results) == 1 else {}
             self.helper.audit.event(
                 "policy_denied",
                 project=self.project_name,
                 host_id=self.server_id,
                 reason=str(exc),
+                privileged_access_provider=host_meta.get('privileged_access_provider'),
+                privileged_access_url=host_meta.get('privileged_access_url'),
             )
+            if host_meta.get('server_vip') and (
+                host_meta.get('privileged_access_provider')
+                or host_meta.get('privileged_access_url')
+                or host_meta.get('privileged_access_hint')
+            ):
+                provider = host_meta.get('privileged_access_provider') or 'external bastion'
+                self.helper.print_p(
+                    "Privileged access for this VIP host is handled via {}.".format(provider),
+                    stderr=True,
+                )
+                if host_meta.get('privileged_access_url'):
+                    self.helper.print_p(str(host_meta.get('privileged_access_url')), stderr=True)
+                if host_meta.get('privileged_access_hint'):
+                    self.helper.print_p(str(host_meta.get('privileged_access_hint')), stderr=True)
             self.helper.print_p(
                 "Request access: isolate access request --project {}{} --reason '<reason>'".format(
                     self.project_name or "<project>",
@@ -539,7 +556,7 @@ class AuthHelper(object):
         self.ISOLATE_COLORS = str2bool(os.getenv('ISOLATE_COLORS', False))
 
         # Search Print Line: fields names and order, not template
-        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_services').strip().split(' ')
+        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker server_services').strip().split(' ')
 
     def _load_data(self):
         self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
@@ -576,6 +593,10 @@ class AuthHelper(object):
                                        'server_ip',
                                        'server_services',
                                        'server_note',
+                                       'server_vip_marker',
+                                       'privileged_access_provider',
+                                       'privileged_access_url',
+                                       'privileged_access_hint',
                                        'os_version',
                                        'geoip_asn'])  # 'alerts'
 
@@ -720,6 +741,7 @@ class AuthHelper(object):
         host['geoip_asn'] = host.get('geoip_asn', None)
         host['server_services'] = host.get('server_services') or ''
         host['server_note'] = host.get('server_note') or ''
+        host['server_vip_marker'] = 'VIP' if host.get('server_vip') else ''
 
         return host
 

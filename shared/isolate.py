@@ -553,8 +553,12 @@ def cmd_host_update(args, config):
         "server_port": args.port,
         "server_user": args.user,
         "server_nosudo": args.nosudo,
+        "server_vip": args.vip,
         "server_services": args.services,
         "server_note": args.note,
+        "privileged_access_provider": args.privileged_provider,
+        "privileged_access_url": args.privileged_url,
+        "privileged_access_hint": args.privileged_hint,
         "proxy_id": args.proxy_id,
     }
     try:
@@ -945,8 +949,12 @@ def build_parser():
     host_update.add_argument("--port", type=int)
     host_update.add_argument("--user")
     host_update.add_argument("--nosudo", type=_str2bool)
+    host_update.add_argument("--vip", type=_str2bool)
     host_update.add_argument("--services")
     host_update.add_argument("--note")
+    host_update.add_argument("--privileged-provider")
+    host_update.add_argument("--privileged-url")
+    host_update.add_argument("--privileged-hint")
     host_update.add_argument("--proxy-id")
     host_update.set_defaults(func=cmd_host_update)
 
