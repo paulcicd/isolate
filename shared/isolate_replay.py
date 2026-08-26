@@ -50,18 +50,18 @@ def build_session_details(session_path, events):
     }
 
 
-def parse_raw_replay(raw_log_path):
+def parse_raw_replay(raw_log_path, max_bytes=None):
     if not raw_log_path or not os.path.exists(raw_log_path):
-        return {"chunks": [], "plain": "", "error": "raw log not found"}
+        return {"duration": 0, "chunks": [], "plain": "", "error": "raw log not found"}
     try:
         with open(raw_log_path, "r", encoding="utf-8", errors="replace") as raw_f:
-            text = raw_f.read()
+            text = raw_f.read(max_bytes if max_bytes else -1)
     except OSError as exc:
-        return {"chunks": [], "plain": "", "error": str(exc)}
+        return {"duration": 0, "chunks": [], "plain": "", "error": str(exc)}
 
     matches = list(TIMESTAMP_RE.finditer(text))
     if not matches:
-        return {"chunks": [], "plain": text, "error": "raw log does not contain replay timestamps"}
+        return {"duration": 0, "chunks": [], "plain": text, "error": "raw log does not contain replay timestamps"}
 
     chunks = []
     first_ts = None
@@ -75,7 +75,8 @@ def parse_raw_replay(raw_log_path):
         start = match.end()
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         chunks.append({"t": round(ts - first_ts, 6), "data": text[start:end]})
-    return {"chunks": chunks, "plain": "".join(chunk["data"] for chunk in chunks), "error": None}
+    duration = chunks[-1]["t"] if chunks else 0
+    return {"duration": duration, "chunks": chunks, "plain": "".join(chunk["data"] for chunk in chunks), "error": None}
 
 
 def events_json(events):

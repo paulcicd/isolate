@@ -10,13 +10,17 @@ import sys
 from isolate_access import (
     AccessDenied,
     approve_access_request,
+    comment_access_request,
     create_access_request,
     deny_access_request,
     get_access_request,
     is_access_admin,
     list_access_requests,
     parse_duration,
+    repeat_access_request,
+    set_notification_status,
 )
+from isolate_command_audit import CommandAuditError, append_command_event
 from isolate_config import load_config
 from isolate_identity import (
     IdentityError,
@@ -165,6 +169,13 @@ def format_access_table(records):
 def _print_notification_warnings(result):
     for error in result.get("errors") or []:
         print("notification warning: {}".format(error), file=sys.stderr)
+
+
+def _record_notification_status(redis, request_id, result=None, error=None):
+    if error:
+        set_notification_status(redis, request_id, {"ok": False, "errors": [str(error)], "sent": []})
+    elif result is not None:
+        set_notification_status(redis, request_id, {"ok": not bool(result.get("errors")), "errors": result.get("errors") or [], "sent": result.get("sent") or []})
 
 
 def _load_cli_identity():
@@ -679,18 +690,29 @@ def cmd_access_request(args, config):
         print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
         return 2
     redis = redis_client(config)
-    record = create_access_request(
-        redis,
-        identity,
-        project=args.project,
-        host=args.host,
-        remote_user=args.remote_user,
-        sudo_mode=args.sudo_mode,
-        reason=args.reason,
-    )
     try:
-        _print_notification_warnings(notify_access_event(config, "access_request_created", record, actor=identity))
+        record = create_access_request(
+            redis,
+            identity,
+            project=args.project,
+            host=args.host,
+            remote_user=args.remote_user,
+            sudo_mode=args.sudo_mode,
+            reason=args.reason,
+            ticket=args.ticket,
+            template=args.template,
+            config=config,
+        )
+    except AccessDenied as exc:
+        print("access request failed: {}".format(exc), file=sys.stderr)
+        return 2
+    try:
+        notify_result = notify_access_event(config, "access_request_created", record, actor=identity)
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
     except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
         print("access request notification failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
@@ -708,7 +730,7 @@ def cmd_access_list(args, config):
         print("access list denied: other users are visible only to admins", file=sys.stderr)
         return 2
     user = args.user if admin else identity.get("username")
-    records = list_access_requests(redis, status=args.status, user=user)
+    records = list_access_requests(redis, status=args.status, user=user, project=args.project, ticket=args.ticket)
     if args.json:
         print(json.dumps(records, indent=2, sort_keys=True))
     else:
@@ -748,6 +770,7 @@ def cmd_access_approve(args, config):
             remote_user=args.remote_user,
             sudo_mode=args.sudo_mode,
             max_ttl=max_ttl,
+            comment=args.comment,
         )
     except (AccessDenied, IdentityError, ValueError) as exc:
         print("access approve failed: {}".format(exc), file=sys.stderr)
@@ -756,10 +779,12 @@ def cmd_access_approve(args, config):
         print("Access request not found: {}".format(args.id), file=sys.stderr)
         return 2
     try:
-        _print_notification_warnings(
-            notify_access_event(config, "access_request_approved", record, actor=approver, extra={"grant": grant})
-        )
+        notify_result = notify_access_event(config, "access_request_approved", record, actor=approver, extra={"grant": grant})
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
     except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
         print("access approve notification failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps({"request": record, "grant": grant}, indent=2, sort_keys=True))
@@ -769,7 +794,7 @@ def cmd_access_deny(args, config):
     redis = redis_client(config)
     try:
         approver = _require_access_admin(config)
-        record = deny_access_request(redis, args.id, approver, reason=args.reason)
+        record = deny_access_request(redis, args.id, approver, reason=args.reason, comment=args.comment)
     except (AccessDenied, IdentityError) as exc:
         print("access deny failed: {}".format(exc), file=sys.stderr)
         return 2
@@ -777,9 +802,75 @@ def cmd_access_deny(args, config):
         print("Access request not found: {}".format(args.id), file=sys.stderr)
         return 2
     try:
-        _print_notification_warnings(notify_access_event(config, "access_request_denied", record, actor=approver))
+        notify_result = notify_access_event(config, "access_request_denied", record, actor=approver)
+        _record_notification_status(redis, record["id"], result=notify_result)
+        record = get_access_request(redis, record["id"]) or record
+        _print_notification_warnings(notify_result)
     except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
         print("access deny notification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_comment(args, config):
+    redis = redis_client(config)
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    record = get_access_request(redis, args.id)
+    if record is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if record.get("requester") != identity.get("username") and not admin:
+        print("access comment denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    record = comment_access_request(redis, args.id, identity, args.text)
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_access_repeat(args, config):
+    redis = redis_client(config)
+    try:
+        identity = _load_cli_identity()
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    old = get_access_request(redis, args.id)
+    if old is None:
+        print("Access request not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
+    if old.get("requester") != identity.get("username") and not admin:
+        print("access repeat denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    try:
+        record = repeat_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket, config=config)
+    except AccessDenied as exc:
+        print("access repeat failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_command_log_append(args, config):
+    try:
+        record = append_command_event(
+            config["logging"]["base_path"],
+            args.connection_id,
+            args.command,
+            cwd=args.cwd,
+            exit_code=args.exit_code,
+            project=args.project,
+            host_id=args.host_id,
+            shell=args.shell,
+            source=args.source,
+            config=config,
+        )
+    except (CommandAuditError, ValueError) as exc:
+        print("command audit failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
 
@@ -974,6 +1065,19 @@ def build_parser():
     history.add_argument("--json", action="store_true")
     history.set_defaults(func=cmd_history)
 
+    command_log = sub.add_parser("command-log")
+    command_log_sub = command_log.add_subparsers(dest="command_log_command", required=True)
+    command_append = command_log_sub.add_parser("append")
+    command_append.add_argument("--connection-id", required=True)
+    command_append.add_argument("--host-id")
+    command_append.add_argument("--project")
+    command_append.add_argument("--cwd")
+    command_append.add_argument("--exit-code", type=int)
+    command_append.add_argument("--shell", default="unknown")
+    command_append.add_argument("--source", default="target-shell-hook")
+    command_append.add_argument("--command", required=True)
+    command_append.set_defaults(func=cmd_command_log_append)
+
     access = sub.add_parser("access")
     access_sub = access.add_subparsers(dest="access_command", required=True)
     access_request = access_sub.add_parser("request")
@@ -982,11 +1086,15 @@ def build_parser():
     access_request.add_argument("--remote-user")
     access_request.add_argument("--sudo-mode")
     access_request.add_argument("--reason", required=True)
+    access_request.add_argument("--ticket")
+    access_request.add_argument("--template")
     access_request.set_defaults(func=cmd_access_request)
 
     access_list = access_sub.add_parser("list")
     access_list.add_argument("--status", choices=["pending", "approved", "denied"])
     access_list.add_argument("--user")
+    access_list.add_argument("--project")
+    access_list.add_argument("--ticket")
     access_list.add_argument("--json", action="store_true")
     access_list.set_defaults(func=cmd_access_list)
 
@@ -999,12 +1107,25 @@ def build_parser():
     access_approve.add_argument("--ttl")
     access_approve.add_argument("--remote-user")
     access_approve.add_argument("--sudo-mode")
+    access_approve.add_argument("--comment")
     access_approve.set_defaults(func=cmd_access_approve)
 
     access_deny = access_sub.add_parser("deny")
     access_deny.add_argument("--id", required=True)
     access_deny.add_argument("--reason", required=True)
+    access_deny.add_argument("--comment")
     access_deny.set_defaults(func=cmd_access_deny)
+
+    access_comment = access_sub.add_parser("comment")
+    access_comment.add_argument("--id", required=True)
+    access_comment.add_argument("--text", required=True)
+    access_comment.set_defaults(func=cmd_access_comment)
+
+    access_repeat = access_sub.add_parser("repeat")
+    access_repeat.add_argument("--id", required=True)
+    access_repeat.add_argument("--reason")
+    access_repeat.add_argument("--ticket")
+    access_repeat.set_defaults(func=cmd_access_repeat)
 
     jwks = sub.add_parser("jwks")
     jwks_sub = jwks.add_subparsers(dest="jwks_command", required=True)

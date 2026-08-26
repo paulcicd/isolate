@@ -65,6 +65,18 @@ DEFAULT_CONFIG = {
         "admin_groups": [],
         "default_ttl": "2h",
         "max_ttl": "24h",
+        "ticket_required": False,
+        "ticket_pattern": None,
+        "request_templates": {},
+    },
+    "command_audit": {
+        "enabled": False,
+        "require_connection_id": True,
+        "max_command_length": 4096,
+    },
+    "replay": {
+        "max_bytes": 10485760,
+        "default_speed": 1,
     },
     "dashboard": {
         "enabled": False,

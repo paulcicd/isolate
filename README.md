@@ -399,6 +399,13 @@ access:
     - Demo-Security
   default_ttl: 2h
   max_ttl: 24h
+  ticket_required: false
+  ticket_pattern: "^(INC|CHG)-[0-9]+$"
+  request_templates:
+    dba-prod:
+      remote_user: dba
+      sudo_mode: none
+      ttl: 2h
 
 dashboard:
   enabled: true
@@ -433,6 +440,15 @@ notifications:
       from: isolate@example.org
       to:
         - devsecops@example.org
+
+command_audit:
+  enabled: false
+  require_connection_id: true
+  max_command_length: 4096
+
+replay:
+  max_bytes: 10485760
+  default_speed: 1
 
 policy:
   default_allowed_actions:
@@ -1103,7 +1119,8 @@ isolate access request \
   --host 10042 \
   --remote-user dba \
   --sudo-mode none \
-  --reason DEMO-INC-1001
+  --reason "Need production diagnostics" \
+  --ticket INC-1001
 ```
 
 Arguments:
@@ -1113,6 +1130,19 @@ Arguments:
 - `--remote-user`: requested target Linux user.
 - `--sudo-mode`: requested sudo mode.
 - `--reason`: required business reason or incident id.
+- `--ticket`: optional ticket id. If `access.ticket_required: true`, it must match `access.ticket_pattern`.
+- `--template`: optional request template from `access.request_templates`.
+
+Template example:
+
+```bash
+isolate access request \
+  --project payments-prod \
+  --host 10042 \
+  --template dba-prod \
+  --reason "Check database replication lag" \
+  --ticket INC-1002
+```
 
 ### Admin Lists Pending Requests
 
@@ -1124,6 +1154,8 @@ Other filters:
 
 ```bash
 isolate access list --user demo.alex
+isolate access list --project payments-prod
+isolate access list --ticket INC-1001
 isolate access list --status approved
 isolate access list --status denied
 isolate access list --json
@@ -1138,7 +1170,7 @@ isolate access show --id 12
 ### Admin Approves
 
 ```bash
-isolate access approve --id 12 --ttl 2h
+isolate access approve --id 12 --ttl 2h --comment "Approved for incident window"
 ```
 
 Override requested remote user:
@@ -1160,7 +1192,35 @@ TTL examples:
 ### Admin Denies
 
 ```bash
-isolate access deny --id 12 --reason "Use staging environment first"
+isolate access deny --id 12 --reason "Use staging environment first" --comment "No production impact confirmed"
+```
+
+### Comments And Repeat Requests
+
+Add operational context without changing request status:
+
+```bash
+isolate access comment --id 12 --text "Waiting for service owner confirmation"
+```
+
+Create a new pending request from a previous one:
+
+```bash
+isolate access repeat --id 12 --reason "Follow-up check after deploy" --ticket INC-1003
+```
+
+Access records preserve comments as an append-only timeline:
+
+```json
+{
+  "comments": [
+    {
+      "username": "demo.admin",
+      "action": "approve",
+      "text": "Approved for incident window"
+    }
+  ]
+}
 ```
 
 ### Access Notifications
@@ -1234,6 +1294,13 @@ access:
   admin_groups:
     - Demo-DevOps
     - Demo-Security
+  ticket_required: false
+  ticket_pattern: "^(INC|CHG)-[0-9]+$"
+  request_templates:
+    dba-prod:
+      remote_user: dba
+      sudo_mode: none
+      ttl: 2h
 ```
 
 ## Connection History
@@ -1315,6 +1382,7 @@ Important event types:
 - `policy_denied`
 - `ssh_start`
 - `ssh_end`
+- `command`
 - `ssh_argument_denied`
 
 Example event:
@@ -1354,7 +1422,78 @@ Replay MVP:
 /replay/<connection_id>.json
 ```
 
-Replay uses the existing raw `.log` chunks and does not attempt reliable command extraction. Structured command audit remains a separate future feature.
+Replay uses the existing raw `.log` chunks and does not attempt reliable command extraction.
+
+Replay v2 includes:
+
+- play, pause, reset;
+- seek bar;
+- current time and total duration;
+- speed selector;
+- `replay.json` download;
+- plain transcript toggle;
+- safe HTML escaping with a minimal ANSI-friendly fallback.
+
+Configure payload limits:
+
+```yaml
+replay:
+  max_bytes: 10485760
+  default_speed: 1
+```
+
+### Structured Command Audit
+
+Structured command audit is opt-in and is intentionally separate from raw PTY replay. Isolate does not try to infer commands from terminal control sequences. Instead, target hosts can install shell hooks that submit completed commands back to the bastion.
+
+Enable it:
+
+```yaml
+command_audit:
+  enabled: true
+  require_connection_id: true
+  max_command_length: 4096
+```
+
+Append a command event:
+
+```bash
+isolate command-log append \
+  --connection-id 22222222-2222-2222-2222-222222222222 \
+  --host-id 10042 \
+  --project payments-prod \
+  --cwd /var/www \
+  --exit-code 0 \
+  --shell bash \
+  --source target-shell-hook \
+  --command "systemctl status nginx"
+```
+
+The resulting event is written to the matching `session.jsonl`:
+
+```json
+{
+  "event": "command",
+  "connection_id": "22222222-2222-2222-2222-222222222222",
+  "username": "demo.alex",
+  "project": "payments-prod",
+  "host_id": "10042",
+  "cwd": "/var/www",
+  "command": "systemctl status nginx",
+  "exit_code": 0,
+  "shell": "bash",
+  "source": "target-shell-hook"
+}
+```
+
+Hook templates are provided for target hosts:
+
+```text
+/opt/auth/scripts/target-command-audit.bash
+/opt/auth/scripts/target-command-audit.zsh
+```
+
+The templates expect deployment-specific context, usually environment variables such as `ISOLATE_CONNECTION_ID`, `ISOLATE_HOST_ID`, `ISOLATE_PROJECT`, and `ISOLATE_AUDIT_BASTION`. Install them only on hosts where command audit is required.
 
 ## Admin Dashboard
 
@@ -1405,7 +1544,7 @@ Routes:
 - `/session/<connection_id>`: session details and timeline.
 - `/session/<connection_id>/events.json`: session JSONL events.
 - `/inventory`: read-only host inventory with service/note search.
-- `/access`: access requests with approve and deny forms.
+- `/access`: access requests with filters, comments, repeat, approve, and deny forms.
 - `/grants`: grants and project sets.
 - `/replay/<connection_id>`: raw transcript replay MVP.
 - `/replay/<connection_id>.json`: parsed replay chunks.
@@ -1420,6 +1559,10 @@ Access approval from the dashboard supports:
 - TTL, for example `30m`, `2h`, or `1d`;
 - optional remote user override;
 - optional sudo mode override;
+- ticket/user/project filters;
+- approve and deny comments;
+- repeat request action;
+- notification warnings;
 - denial reason.
 
 Dashboard POST actions use a per-session CSRF token.

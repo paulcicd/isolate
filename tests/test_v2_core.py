@@ -29,17 +29,20 @@ from isolate_inventory import format_hosts_table, get_host, list_hosts, update_h
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_replay import find_session, parse_raw_replay
+from isolate_command_audit import CommandAuditError, append_command_event
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 import isolate
 import isolate_web
 from isolate_access import (
     AccessDenied,
     approve_access_request,
+    comment_access_request,
     create_access_request,
     deny_access_request,
     is_access_admin,
     list_access_requests,
     parse_duration,
+    repeat_access_request,
 )
 from isolate import list_grant_records, load_project_sets, update_grant_record
 from isolate_sessions import list_active_sessions, mark_session_end, mark_session_start
@@ -195,6 +198,7 @@ class AccessRequestTest(unittest.TestCase):
             remote_user="dba",
             sudo_mode="none",
             reason="INC-1",
+            ticket="INC-1",
         )
         self.assertEqual(record["status"], "pending")
         self.assertEqual(len(list_access_requests(redis, status="pending")), 1)
@@ -216,6 +220,20 @@ class AccessRequestTest(unittest.TestCase):
         self.assertFalse(is_access_admin({"groups": ["DBA"]}, ["DevOps"]))
         with self.assertRaises(AccessDenied):
             approve_access_request(redis, record["id"], {"username": "admin"}, parse_duration("25h"), max_ttl=parse_duration("24h"))
+
+    def test_ticket_validation_comments_and_repeat(self):
+        redis = FakeRedis()
+        config = {"access": {"ticket_required": True, "ticket_pattern": r"^(INC|CHG)-[0-9]+$"}}
+        with self.assertRaises(AccessDenied):
+            create_access_request(redis, {"username": "alice"}, project="prod", reason="test", config=config)
+        record = create_access_request(redis, {"username": "alice"}, project="prod", reason="test", ticket="INC-123", config=config)
+        commented = comment_access_request(redis, record["id"], {"username": "alice"}, "extra context")
+        self.assertEqual(commented["comments"][0]["text"], "extra context")
+        approved, _ = approve_access_request(redis, record["id"], {"username": "admin"}, 60, comment="approved")
+        self.assertEqual(approved["comments"][-1]["action"], "approve")
+        repeated = repeat_access_request(redis, record["id"], {"username": "alice"}, reason="again", ticket="CHG-1", config=config)
+        self.assertEqual(repeated["status"], "pending")
+        self.assertEqual(repeated["ticket"], "CHG-1")
 
 
 class ActiveSessionRegistryTest(unittest.TestCase):
@@ -754,10 +772,55 @@ class SessionReplayTest(unittest.TestCase):
 
             replay = parse_raw_replay(raw_path)
             self.assertIsNone(replay["error"])
+            self.assertEqual(replay["duration"], 0.5)
             self.assertEqual(replay["chunks"][0]["t"], 0.0)
             self.assertIn("whoami", replay["plain"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_command_audit_append_writes_command_event(self):
+        tmpdir = os.path.join(ROOT, ".tmp-command-audit-{}".format(uuid.uuid4().hex))
+        try:
+            self._write_session(
+                tmpdir,
+                "alice",
+                "session-1",
+                [
+                    {
+                        "event": "policy_selected",
+                        "ts": 10.0,
+                        "username": "alice",
+                        "groups": ["DevOps"],
+                        "project": "prod",
+                        "host_id": "10001",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                    }
+                ],
+            )
+            config = {"command_audit": {"enabled": True, "require_connection_id": True, "max_command_length": 4}}
+            event = append_command_event(
+                tmpdir,
+                "conn-1",
+                "systemctl status nginx",
+                cwd="/root",
+                exit_code=0,
+                shell="bash",
+                config=config,
+            )
+            self.assertEqual(event["event"], "command")
+            self.assertEqual(event["command"], "syst")
+            self.assertTrue(event["command_truncated"])
+            details = find_session(tmpdir, "conn-1")
+            self.assertEqual(details["events"][-1]["event"], "command")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_command_audit_rejects_disabled_or_unknown_session(self):
+        with self.assertRaises(CommandAuditError):
+            append_command_event("/tmp/no-such-dir", "missing", "whoami", config={"command_audit": {"enabled": False}})
+        with self.assertRaises(CommandAuditError):
+            append_command_event("/tmp/no-such-dir", "missing", "whoami", config={"command_audit": {"enabled": True}})
 
     def test_malformed_replay_falls_back_to_plain_text(self):
         tmpdir = os.path.join(ROOT, ".tmp-replay-{}".format(uuid.uuid4().hex))
@@ -819,12 +882,14 @@ class DashboardTest(unittest.TestCase):
             with client.session_transaction() as sess:
                 sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
                 sess["csrf_token"] = "csrf"
-            response = client.get("/access")
+            response = client.get("/access?ticket=INC-1")
 
         self.assertEqual(response.status_code, 200)
         text = response.get_data(as_text=True)
         self.assertIn('http-equiv="refresh" content="15"', text)
         self.assertIn('name="csrf_token" value="csrf"', text)
+        self.assertIn("INC-1", text)
+        self.assertIn('name="comment"', text)
         self.assertIn("Approve", text)
         self.assertIn("Deny", text)
 
@@ -935,6 +1000,17 @@ class DashboardTest(unittest.TestCase):
                         "exit_code": 0,
                         "raw_log_path": raw_path,
                     },
+                    {
+                        "event": "command",
+                        "ts": 12.0,
+                        "username": "admin",
+                        "connection_id": "conn-1",
+                        "session_id": "session-1",
+                        "cwd": "/root",
+                        "command": "whoami",
+                        "exit_code": 0,
+                        "shell": "bash",
+                    },
                 ]:
                     session_f.write("{}\n".format(json.dumps(event, sort_keys=True)))
             with open(raw_path, "w", encoding="utf-8") as raw_f:
@@ -947,8 +1023,11 @@ class DashboardTest(unittest.TestCase):
 
             details = client.get("/session/conn-1")
             self.assertEqual(details.status_code, 200)
-            self.assertIn("Session Details", details.get_data(as_text=True))
-            self.assertIn("/replay/conn-1", details.get_data(as_text=True))
+            details_text = details.get_data(as_text=True)
+            self.assertIn("Session Details", details_text)
+            self.assertIn("/replay/conn-1", details_text)
+            self.assertIn("Commands", details_text)
+            self.assertIn("whoami", details_text)
 
             events = client.get("/session/conn-1/events.json")
             self.assertEqual(events.status_code, 200)
@@ -957,6 +1036,12 @@ class DashboardTest(unittest.TestCase):
             replay = client.get("/replay/conn-1.json")
             self.assertEqual(replay.status_code, 200)
             self.assertIn("hello", replay.get_data(as_text=True))
+
+            replay_page = client.get("/replay/conn-1")
+            replay_text = replay_page.get_data(as_text=True)
+            self.assertIn('id="scrubber"', replay_text)
+            self.assertIn("Plain transcript", replay_text)
+            self.assertIn("replay.json", replay_text)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -1072,7 +1157,7 @@ class NotificationTest(unittest.TestCase):
 class AccessNotificationCliTest(unittest.TestCase):
     def test_access_request_calls_notifier(self):
         redis = FakeRedis()
-        args = SimpleNamespace(project="prod", host="10001", remote_user="dba", sudo_mode="none", reason="INC-1")
+        args = SimpleNamespace(project="prod", host="10001", remote_user="dba", sudo_mode="none", reason="INC-1", ticket=None, template=None)
         with mock.patch.object(isolate, "_load_cli_identity", return_value={"username": "alice", "groups": ["DBA"]}), \
                 mock.patch.object(isolate, "redis_client", return_value=redis), \
                 mock.patch.object(isolate, "notify_access_event", return_value={"sent": [], "errors": []}) as notifier, \
@@ -1096,10 +1181,10 @@ class AccessNotificationCliTest(unittest.TestCase):
                 mock.patch.object(isolate, "notify_access_event", return_value={"sent": [], "errors": []}) as notifier, \
                 redirect_stdout(StringIO()):
             approve_code = isolate.cmd_access_approve(
-                SimpleNamespace(id=first["id"], ttl="2h", remote_user=None, sudo_mode=None),
+                SimpleNamespace(id=first["id"], ttl="2h", remote_user=None, sudo_mode=None, comment=None),
                 config,
             )
-            deny_code = isolate.cmd_access_deny(SimpleNamespace(id=second["id"], reason="not needed"), config)
+            deny_code = isolate.cmd_access_deny(SimpleNamespace(id=second["id"], reason="not needed", comment=None), config)
 
         self.assertIsNone(approve_code)
         self.assertIsNone(deny_code)

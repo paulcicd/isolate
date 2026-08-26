@@ -8,7 +8,7 @@ import os
 import secrets
 
 from isolate import list_grant_records, load_project_sets, redis_client
-from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration
+from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, set_notification_status
 from isolate_config import load_config
 from isolate_history import read_history
 from isolate_identity import decode_jwt_payload, normalize_claims
@@ -122,11 +122,13 @@ def create_app(config=None):
         if request.form.get("csrf_token") != session.get("csrf_token"):
             abort(403)
 
-    def notify_dashboard(event_name, record, admin, extra=None):
+    def notify_dashboard(redis, event_name, record, admin, extra=None):
         try:
             result = notify_access_event(config, event_name, record, actor=admin, extra=extra)
         except NotificationError as exc:
+            set_notification_status(redis, record.get("id"), {"ok": False, "errors": [str(exc)], "sent": []})
             return {"level": "error", "text": "Action completed, but notification failed: {}".format(exc)}
+        set_notification_status(redis, record.get("id"), {"ok": not bool(result.get("errors")), "errors": result.get("errors") or [], "sent": result.get("sent") or []})
         if result.get("errors"):
             return {"level": "warning", "text": "Action completed with notification warning: {}".format("; ".join(result["errors"]))}
         return None
@@ -143,8 +145,8 @@ def create_app(config=None):
     def access_table(rows, token, access_cfg):
         default_ttl = html.escape(str(access_cfg.get("default_ttl", "2h")))
         header = (
-            "<th>id</th><th>status</th><th>user</th><th>project</th><th>host</th>"
-            "<th>remote_user</th><th>sudo</th><th>reason</th><th>decision</th><th>actions</th>"
+            "<th>id</th><th>status</th><th>user</th><th>project</th><th>host</th><th>ticket</th>"
+            "<th>remote_user</th><th>sudo</th><th>reason</th><th>decision</th><th>expires</th><th>grant</th><th>comments</th><th>notify</th><th>actions</th>"
         )
         body = ""
         for row in rows:
@@ -154,10 +156,15 @@ def create_app(config=None):
                 html.escape(str(row.get("requester") or "")),
                 html.escape(str(row.get("project") or "")),
                 html.escape(str(row.get("host") or "")),
+                html.escape(str(row.get("ticket") or "")),
                 html.escape(str(row.get("remote_user") or "")),
                 html.escape(str(row.get("sudo_mode") or "")),
                 html.escape(str(row.get("reason") or "")),
                 html.escape(str(row.get("decision_reason") or "")),
+                html.escape(str(row.get("expires_at") or "")),
+                html.escape(str(row.get("grant_id") or "")),
+                html.escape("; ".join("{}: {}".format(c.get("username") or "", c.get("text") or "") for c in row.get("comments") or [])),
+                html.escape(str((row.get("notification_status") or {}).get("ok", ""))),
             ]
             actions = ""
             if row.get("status") == "pending":
@@ -172,6 +179,7 @@ def create_app(config=None):
   <input name="ttl" value="{default_ttl}" size="5" title="TTL">
   <input name="remote_user" value="{remote_user}" placeholder="remote_user" size="10">
   <input name="sudo_mode" value="{sudo_mode}" placeholder="sudo_mode" size="8">
+  <input name="comment" placeholder="comment" size="12">
   <button type="submit">Approve</button>
 </form>
 <form class="inline" method="post">
@@ -179,6 +187,7 @@ def create_app(config=None):
   <input type="hidden" name="id" value="{request_id}">
   <input type="hidden" name="action" value="deny">
   <input name="reason" placeholder="reason" size="12">
+  <input name="comment" placeholder="comment" size="12">
   <button type="submit">Deny</button>
 </form>""".format(
                     token=html.escape(token),
@@ -187,6 +196,17 @@ def create_app(config=None):
                     remote_user=remote_user,
                     sudo_mode=sudo_mode,
                 )
+            else:
+                request_id = html.escape(str(row.get("id") or ""))
+                actions = """
+<form class="inline" method="post">
+  <input type="hidden" name="csrf_token" value="{token}">
+  <input type="hidden" name="id" value="{request_id}">
+  <input type="hidden" name="action" value="repeat">
+  <input name="reason" placeholder="reason" size="14">
+  <input name="ticket" placeholder="ticket" size="10">
+  <button type="submit">Request again</button>
+</form>""".format(token=html.escape(token), request_id=request_id)
             body += "<tr>{}<td>{}</td></tr>".format("".join("<td>{}</td>".format(cell) for cell in cells), actions)
         return "<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>".format(header, body)
 
@@ -293,22 +313,45 @@ def create_app(config=None):
                         remote_user=remote_user,
                         sudo_mode=sudo_mode,
                         max_ttl=max_ttl,
+                        comment=request.form.get("comment") or None,
                     )
-                    notice = notify_dashboard("access_request_approved", record, admin, extra={"grant": grant})
+                    notice = notify_dashboard(redis, "access_request_approved", record, admin, extra={"grant": grant})
                     notice = notice or {"level": "info", "text": "Access request approved"}
                 elif action == "deny":
-                    record = deny_access_request(redis, request_id, admin, reason=request.form.get("reason"))
-                    notice = notify_dashboard("access_request_denied", record, admin)
+                    record = deny_access_request(redis, request_id, admin, reason=request.form.get("reason"), comment=request.form.get("comment") or None)
+                    notice = notify_dashboard(redis, "access_request_denied", record, admin)
                     notice = notice or {"level": "info", "text": "Access request denied"}
+                elif action == "repeat":
+                    record = repeat_access_request(redis, request_id, admin, reason=request.form.get("reason") or None, ticket=request.form.get("ticket") or None, config=config)
+                    notice = notify_dashboard(redis, "access_request_created", record, admin)
+                    notice = notice or {"level": "info", "text": "Access request repeated"}
             except Exception as exc:
                 notice = {"level": "error", "text": str(exc)}
         status = request.args.get("status")
         if status == "all":
             status = None
-        rows = list_access_requests(redis, status=status)
-        body = "<h1>Access Requests</h1><p>{}</p>{}".format(
-            status_filter_links(status),
-            access_table(rows, csrf_token(), config.get("access", {})),
+        rows = list_access_requests(
+            redis,
+            status=status,
+            user=request.args.get("user") or None,
+            project=request.args.get("project") or None,
+            ticket=request.args.get("ticket") or None,
+        )
+        body = """
+<h1>Access Requests</h1>
+<form method="get">
+  <input name="user" value="{user}" placeholder="user">
+  <input name="project" value="{project}" placeholder="project">
+  <input name="ticket" value="{ticket}" placeholder="ticket">
+  <button type="submit">Filter</button>
+</form>
+<p>{links}</p>{table}
+""".format(
+            user=html.escape(request.args.get("user") or ""),
+            project=html.escape(request.args.get("project") or ""),
+            ticket=html.escape(request.args.get("ticket") or ""),
+            links=status_filter_links(status),
+            table=access_table(rows, csrf_token(), config.get("access", {})),
         )
         return _html("Access Requests", body, config=config, notice=notice)
 
@@ -356,18 +399,32 @@ def create_app(config=None):
         summary = details.get("summary") or {}
         raw_link = ""
         replay_link = ""
+        replay_json_link = ""
         if summary.get("raw_log_path"):
             raw_link = '<a href="/raw/{}/{}">raw transcript</a>'.format(
                 html.escape(str(summary.get("username") or "")),
                 html.escape(str(connection_id)),
             )
             replay_link = '<a href="/replay/{}">replay</a>'.format(html.escape(str(connection_id)))
+            replay_json_link = '<a href="/replay/{}.json">replay.json</a>'.format(html.escape(str(connection_id)))
         summary_rows = [
             {"key": key, "value": summary.get(key)}
             for key in ("time", "username", "project", "host_id", "target", "remote_user", "result", "connection_id", "session_id")
         ]
         event_rows = []
+        command_rows = []
         for event in details.get("events") or []:
+            if event.get("event") == "command":
+                command_rows.append(
+                    {
+                        "ts": event.get("ts"),
+                        "cwd": event.get("cwd"),
+                        "command": event.get("command"),
+                        "exit_code": event.get("exit_code"),
+                        "shell": event.get("shell"),
+                    }
+                )
+                continue
             event_rows.append(
                 {
                     "ts": event.get("ts"),
@@ -379,8 +436,12 @@ def create_app(config=None):
                 }
             )
         body = "<h1>Session Details</h1>"
-        body += "<p>{} {} <a href=\"/session/{}/events.json\">events.json</a></p>".format(raw_link, replay_link, html.escape(str(connection_id)))
+        body += "<p>{} {} {} <a href=\"/session/{}/events.json\">events.json</a></p>".format(raw_link, replay_link, replay_json_link, html.escape(str(connection_id)))
         body += "<h2>Summary</h2>" + _table(summary_rows, [("key", "field"), ("value", "value")])
+        if command_rows:
+            body += "<h2>Commands</h2>" + _table(command_rows, [
+                ("ts", "ts"), ("cwd", "cwd"), ("command", "command"), ("exit_code", "exit"), ("shell", "shell")
+            ])
         body += "<h2>Timeline</h2>" + _table(event_rows, [
             ("ts", "ts"), ("event", "event"), ("project", "project"), ("host_id", "host"),
             ("remote_user", "remote_user"), ("exit_code", "exit")
@@ -409,7 +470,7 @@ def create_app(config=None):
         details = find_session(config["logging"]["base_path"], connection_id)
         if details is None:
             abort(404)
-        replay = parse_raw_replay(details.get("raw_log_path"))
+        replay = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         return app.response_class(
             response=json.dumps(replay, indent=2, sort_keys=True),
             status=200,
@@ -424,28 +485,42 @@ def create_app(config=None):
         details = find_session(config["logging"]["base_path"], connection_id)
         if details is None:
             abort(404)
-        replay_data = parse_raw_replay(details.get("raw_log_path"))
+        replay_data = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         plain = html.escape(replay_data.get("plain") or "")
         error = replay_data.get("error")
+        default_speed = html.escape(str(config.get("replay", {}).get("default_speed", 1)))
         body = """
 <h1>Session Replay</h1>
-<p><a href="/session/{connection_id}">details</a> <a href="/replay/{connection_id}.json">chunks.json</a></p>
+<p><a href="/session/{connection_id}">details</a> <a href="/replay/{connection_id}.json" download>replay.json</a></p>
 <p>
   <button id="play">Play</button>
   <button id="pause">Pause</button>
   <button id="reset">Reset</button>
-  <select id="speed"><option value="0.5">0.5x</option><option value="1" selected>1x</option><option value="2">2x</option><option value="5">5x</option></select>
+  <select id="speed"><option value="0.5">0.5x</option><option value="1">1x</option><option value="2">2x</option><option value="5">5x</option></select>
+  <label><input type="checkbox" id="plainToggle"> Plain transcript</label>
+  <span id="clock">0.00 / 0.00</span>
 </p>
+<input id="scrubber" type="range" min="0" max="0" step="0.01" value="0" style="width:100%;">
 <pre id="terminal" style="background:#111;color:#eee;padding:12px;min-height:360px;white-space:pre-wrap;"></pre>
 <pre id="fallback" style="display:none;">{plain}</pre>
 <script>
 let chunks = [];
 let timers = [];
-let speed = 1;
+let speed = {default_speed};
 let cursor = 0;
+let duration = 0;
 const terminal = document.getElementById("terminal");
+const scrubber = document.getElementById("scrubber");
+const clock = document.getElementById("clock");
+document.getElementById("speed").value = String(speed);
 function clearTimers() {{ timers.forEach(clearTimeout); timers = []; }}
-function renderUntil(index) {{ terminal.textContent = chunks.slice(0, index).map(c => c.data).join(""); }}
+function renderUntil(index) {{
+  cursor = Math.max(0, Math.min(index, chunks.length));
+  terminal.textContent = chunks.slice(0, cursor).map(c => c.data).join("");
+  const t = chunks[cursor - 1] ? chunks[cursor - 1].t : 0;
+  scrubber.value = t;
+  clock.textContent = t.toFixed(2) + " / " + duration.toFixed(2);
+}}
 function play() {{
   clearTimers();
   speed = parseFloat(document.getElementById("speed").value || "1");
@@ -454,18 +529,34 @@ function play() {{
     timers.push(setTimeout(() => {{
       terminal.textContent += chunks[i].data;
       cursor = i + 1;
+      scrubber.value = chunks[i].t;
+      clock.textContent = chunks[i].t.toFixed(2) + " / " + duration.toFixed(2);
     }}, Math.max(0, (chunks[i].t - base) * 1000 / speed)));
   }}
 }}
 document.getElementById("play").onclick = play;
 document.getElementById("pause").onclick = clearTimers;
-document.getElementById("reset").onclick = () => {{ clearTimers(); cursor = 0; terminal.textContent = ""; }};
+document.getElementById("reset").onclick = () => {{ clearTimers(); renderUntil(0); }};
+document.getElementById("plainToggle").onchange = (event) => {{
+  clearTimers();
+  terminal.textContent = event.target.checked ? document.getElementById("fallback").textContent : chunks.slice(0, cursor).map(c => c.data).join("");
+}};
+scrubber.oninput = () => {{
+  clearTimers();
+  const t = parseFloat(scrubber.value || "0");
+  let index = chunks.findIndex(c => c.t > t);
+  if (index < 0) index = chunks.length;
+  renderUntil(index);
+}};
 fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
   chunks = data.chunks || [];
+  duration = data.duration || (chunks.length ? chunks[chunks.length - 1].t : 0);
+  scrubber.max = duration;
+  clock.textContent = "0.00 / " + duration.toFixed(2);
   if (!chunks.length) {{ terminal.textContent = document.getElementById("fallback").textContent; }}
 }});
 </script>
-""".format(connection_id=html.escape(str(connection_id)), plain=plain)
+""".format(connection_id=html.escape(str(connection_id)), plain=plain, default_speed=default_speed)
         if error:
             body = '<div class="notice warning">{}</div>'.format(html.escape(str(error))) + body
         return _html("Session Replay", body)

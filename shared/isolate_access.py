@@ -3,6 +3,7 @@
 """Break-glass access request helpers."""
 
 import json
+import re
 import time
 
 
@@ -42,6 +43,35 @@ def is_access_admin(identity, admin_groups=None):
     return bool(set(identity.get("groups") or []) & set(admin_groups or []))
 
 
+def _comment(identity, action, text=None):
+    if not text:
+        return None
+    return {
+        "ts": now_ts(),
+        "username": (identity or {}).get("username"),
+        "action": action,
+        "text": text,
+    }
+
+
+def _append_comment(record, identity, action, text=None):
+    comment = _comment(identity, action, text)
+    if comment:
+        record.setdefault("comments", [])
+        record["comments"].append(comment)
+
+
+def validate_ticket(ticket, config=None):
+    access_cfg = (config or {}).get("access", {})
+    ticket = (ticket or "").strip()
+    if access_cfg.get("ticket_required") and not ticket:
+        raise AccessDenied("ticket is required")
+    pattern = access_cfg.get("ticket_pattern")
+    if ticket and pattern and re.match(pattern, ticket) is None:
+        raise AccessDenied("ticket does not match configured pattern")
+    return ticket or None
+
+
 def _request_key(request_id):
     return "access_request_{}".format(request_id)
 
@@ -53,7 +83,11 @@ def _load(redis, key):
     return json.loads(decode(raw))
 
 
-def create_access_request(redis, identity, project, host=None, remote_user=None, sudo_mode=None, reason=None):
+def create_access_request(redis, identity, project, host=None, remote_user=None, sudo_mode=None, reason=None, ticket=None, template=None, config=None):
+    ticket = validate_ticket(ticket, config=config)
+    template_data = ((config or {}).get("access", {}).get("request_templates") or {}).get(template or "") or {}
+    remote_user = remote_user if remote_user is not None else template_data.get("remote_user")
+    sudo_mode = sudo_mode if sudo_mode is not None else template_data.get("sudo_mode")
     request_id = redis.incr("offset_access_request_id")
     record = {
         "schema_version": 2,
@@ -67,6 +101,10 @@ def create_access_request(redis, identity, project, host=None, remote_user=None,
         "remote_user": remote_user,
         "sudo_mode": sudo_mode,
         "reason": reason,
+        "ticket": ticket,
+        "template": template,
+        "comments": [],
+        "notification_status": None,
         "created_at": now_ts(),
         "decided_by": None,
         "decided_at": None,
@@ -82,7 +120,7 @@ def get_access_request(redis, request_id):
     return _load(redis, _request_key(request_id))
 
 
-def list_access_requests(redis, status=None, user=None):
+def list_access_requests(redis, status=None, user=None, project=None, ticket=None):
     records = []
     for key in redis.keys("access_request_*"):
         record = json.loads(decode(redis.get(key)))
@@ -90,11 +128,15 @@ def list_access_requests(redis, status=None, user=None):
             continue
         if user and record.get("requester") != user:
             continue
+        if project and record.get("project") != project:
+            continue
+        if ticket and record.get("ticket") != ticket:
+            continue
         records.append(record)
     return sorted(records, key=lambda item: int(item.get("id", 0)), reverse=True)
 
 
-def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user=None, sudo_mode=None, max_ttl=None):
+def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user=None, sudo_mode=None, max_ttl=None, comment=None):
     record = get_access_request(redis, request_id)
     if record is None:
         return None, None
@@ -133,11 +175,12 @@ def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user
             "sudo_mode": grant["sudo_mode"],
         }
     )
+    _append_comment(record, approver, "approve", comment)
     redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
     return record, grant
 
 
-def deny_access_request(redis, request_id, approver, reason=None):
+def deny_access_request(redis, request_id, approver, reason=None, comment=None):
     record = get_access_request(redis, request_id)
     if record is None:
         return None
@@ -151,5 +194,42 @@ def deny_access_request(redis, request_id, approver, reason=None):
             "decision_reason": reason,
         }
     )
+    _append_comment(record, approver, "deny", comment)
     redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
     return record
+
+
+def comment_access_request(redis, request_id, identity, text):
+    record = get_access_request(redis, request_id)
+    if record is None:
+        return None
+    _append_comment(record, identity, "comment", text)
+    redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
+    return record
+
+
+def set_notification_status(redis, request_id, status):
+    record = get_access_request(redis, request_id)
+    if record is None:
+        return None
+    record["notification_status"] = status
+    redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
+    return record
+
+
+def repeat_access_request(redis, request_id, identity, reason=None, ticket=None, config=None):
+    old = get_access_request(redis, request_id)
+    if old is None:
+        return None
+    return create_access_request(
+        redis,
+        identity,
+        project=old.get("project"),
+        host=old.get("host"),
+        remote_user=old.get("remote_user"),
+        sudo_mode=old.get("sudo_mode"),
+        reason=reason or old.get("reason"),
+        ticket=ticket or old.get("ticket"),
+        template=old.get("template"),
+        config=config,
+    )
