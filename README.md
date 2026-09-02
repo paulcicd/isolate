@@ -1597,7 +1597,7 @@ Dashboard POST actions use a per-session CSRF token.
 
 ## MCP Server
 
-Isolate includes an opt-in MCP v2 resource server for AI clients and automation. It uses the official Python MCP SDK, stateless Streamable HTTP, Keycloak bearer tokens, and the same Redis inventory and grant resolver as `s` and `g`. It does not trust `~/.isolate/identity.json` and does not expose arbitrary SSH or shell execution.
+Isolate includes an opt-in MCP v2 resource server for AI clients and automation. It uses the official Python MCP SDK, stateless Streamable HTTP, Keycloak bearer tokens, and the same Redis inventory and grant resolver as `s` and `g`. It does not trust `~/.isolate/identity.json`. Remote command execution is disabled by default and runs through a separate asynchronous worker when explicitly enabled.
 
 The read and self-service surface exposes:
 
@@ -1617,6 +1617,19 @@ The phase-two approval surface additionally exposes:
 
 - `access_request_approve`: creates an expiring user grant from a pending request;
 - `access_request_deny`: closes a pending request with a decision reason.
+
+The phase-three administration and jobs surface exposes:
+
+- `inventory_host_add`: dry-run or add a validated host;
+- `inventory_host_update`: dry-run or update selected fields with optimistic revision protection;
+- `grant_list` and `grant_show`: read grants for policy administrators;
+- `project_set_list` and `project_set_show`: read named project sets;
+- `policy_preview`: simulate `ssh` or `command` decisions without changing policy;
+- `command_job_create`: queue an authorized non-interactive command;
+- `command_job_list`, `command_job_show`, and `command_job_output`: inspect own jobs or all jobs as an execution admin;
+- `command_job_cancel`: cancel a queued or running job.
+
+Inventory mutations use `dry_run=true` by default. Applying an update requires `dry_run=false`, `confirm=true`, and the `current_revision` returned by the latest preview as `expected_revision`. This prevents a stale MCP client from overwriting a newer inventory change.
 
 Approval and denial require all of the following:
 
@@ -1645,6 +1658,9 @@ Configure Keycloak so access tokens presented to Isolate contain:
 - `scope` containing `isolate.read`;
 - `scope` containing `isolate.self-service` for users allowed to create temporary access requests.
 - `scope` containing `isolate.approve` only for MCP clients and administrators allowed to approve or deny requests.
+- `scope` containing `isolate.inventory.write` for inventory administrators;
+- `scope` containing `isolate.policy.read` for grant, project-set, and policy-preview access;
+- `scope` containing `isolate.execute` for users allowed to submit remote command jobs.
 
 `access.admin_groups` remains the source of truth for access administrators. The `isolate.approve` scope is an additional requirement, not a replacement for the group check. Assign the approval client scope narrowly and do not include it in every user's default token.
 
@@ -1669,6 +1685,15 @@ mcp:
     - isolate.read
   self_service_scope: isolate.self-service
   approval_scope: isolate.approve
+  inventory_write_scope: isolate.inventory.write
+  policy_read_scope: isolate.policy.read
+  execute_scope: isolate.execute
+  inventory_admin_groups:
+    - Demo-Platform-Admins
+  policy_admin_groups:
+    - Demo-DevSecOps
+  execution_admin_groups:
+    - Demo-DevSecOps
   prevent_self_approval: true
   require_mutation_confirmation: true
   allowed_hosts:
@@ -1696,6 +1721,76 @@ access:
 
 An MCP approval token must contain both one of these verified groups and `scope: isolate.approve`. Keeping `prevent_self_approval` and `require_mutation_confirmation` enabled is strongly recommended.
 
+### Remote Command Jobs
+
+Command execution has four independent gates:
+
+1. `command_execution.enabled` is true;
+2. the verified token contains `isolate.execute`;
+3. the verified user belongs to `command_execution.allowed_groups`;
+4. the effective host grant contains `command` in `allowed_actions`.
+
+Existing grants contain only `ssh`, so enabling the worker does not grant command execution automatically. Add the action only to selected grants:
+
+```bash
+isolate grant update --id 7 \
+  --allowed-action ssh \
+  --allowed-action command
+```
+
+Start with constrained, near-arbitrary patterns:
+
+```yaml
+command_execution:
+  enabled: true
+  allowed_groups:
+    - Demo-Technical-Support
+    - Demo-DevOps
+    - Demo-Integration-Support
+  allow_arbitrary_commands: false
+  allowed_command_patterns:
+    - '^uptime$'
+    - '^whoami$'
+    - '^systemctl (status|is-active) [a-zA-Z0-9_.@-]+$'
+    - '^journalctl -u [a-zA-Z0-9_.@-]+ -n [0-9]{1,4}$'
+  allow_sudo: false
+  require_confirmation: true
+  default_timeout: 60
+  max_timeout: 900
+  max_command_length: 4096
+  max_output_bytes: 1048576
+  max_return_bytes: 262144
+  jobs_path: /opt/auth/jobs
+  signing_key_file: /opt/auth/keys/job_hmac.key
+  remote_shell: /bin/sh
+```
+
+For teams that genuinely require shell operators, the explicit high-risk mode is:
+
+```yaml
+command_execution:
+  enabled: true
+  allowed_groups:
+    - Demo-DevOps
+  allow_arbitrary_commands: true
+  allow_sudo: false
+```
+
+This mode permits shell syntax such as pipes and redirects on hosts where the caller has a `command` grant. It still requires `confirm=true`, a verified Keycloak token, an allowed group, a matching project/host grant, and the `isolate.execute` scope. It is intentionally non-interactive: no PTY, password prompts, editors, or full-screen programs. The worker uses the `auth` user's SSH key and the `remote_user` resolved by policy.
+
+Set `allow_sudo: true` only when selected grants use `sudo_mode: sudo-i` and the remote account has the intended passwordless sudo policy. Command jobs invoke sudo non-interactively, so a password prompt fails rather than hanging.
+
+Job metadata is stored as `job_*` in Redis. Output is stored under `/opt/auth/jobs` with mode `0600`; central audit records contain the command SHA-256 rather than the complete command text. The job record itself contains the command and must be treated as sensitive operational data.
+
+Each job's immutable authorization envelope is HMAC-signed. The worker also creates an auth-owned one-time claim file before starting SSH, so a user with accidental Redis write access cannot forge or replay command jobs. Generate the signing key before enabling execution:
+
+```bash
+sudo install -d -o auth -g auth -m 0700 /opt/auth/keys
+openssl rand -hex 32 | sudo tee /opt/auth/keys/job_hmac.key >/dev/null
+sudo chown auth:auth /opt/auth/keys/job_hmac.key
+sudo chmod 0600 /opt/auth/keys/job_hmac.key
+```
+
 ### MCP Deployment
 
 Install or update dependencies:
@@ -1708,9 +1803,12 @@ Install the service and environment file:
 
 ```bash
 sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-mcp.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-job-worker.service /etc/systemd/system/
 sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-mcp.env /etc/default/isolate-mcp
+sudo bash /opt/auth/scripts/fix-perms.sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now isolate-mcp.service
+sudo systemctl enable --now isolate-job-worker.service
 ```
 
 The service runs as `auth`, binds only to `127.0.0.1:8090`, uses two stateless Uvicorn workers, and can write only the trusted JWKS cache and configured audit spool. Put nginx or another HTTPS reverse proxy in front of it. A starting configuration is available at `/opt/auth/deploy/nginx/isolate-mcp.conf`.
@@ -1718,7 +1816,9 @@ The service runs as `auth`, binds only to `127.0.0.1:8090`, uses two stateless U
 Ansible installation is disabled by default. Enable it explicitly after configuring Keycloak and `mcp`:
 
 ```bash
-ansible-playbook -i ansible/hosts.ini ansible/main.yml -e isolate_enable_mcp_server=true
+ansible-playbook -i ansible/hosts.ini ansible/main.yml \
+  -e isolate_enable_mcp_server=true \
+  -e isolate_enable_job_worker=true
 ```
 
 ### MCP Verification
@@ -1730,11 +1830,12 @@ sudo -u auth /opt/auth/shared/isolate.py config validate --check-paths
 curl -i http://127.0.0.1:8090/health
 curl -i -X POST http://127.0.0.1:8090/mcp -H 'Host: 127.0.0.1:8090' -H 'Content-Type: application/json' -d '{}'
 journalctl -u isolate-mcp.service
+journalctl -u isolate-job-worker.service
 ```
 
 The unauthenticated MCP request must return `401` with a `WWW-Authenticate` header containing `resource_metadata`. Use the MCP Inspector or another OAuth-capable MCP client for a complete login and tool-call test.
 
-MCP intentionally excludes arbitrary grant mutations, host updates, policy apply, backup restore, direct SSH, and arbitrary commands. Access approval is the only privileged mutation exposed in this phase, and it can create only expiring grants tied to an existing pending request.
+MCP intentionally excludes arbitrary grant mutations, project-set mutations, policy apply, host deletion, backup restore, and interactive SSH. Host add/update and asynchronous commands are explicit, separately scoped operations; command execution remains disabled until configured and its worker is enabled.
 
 ## Production Operations
 
@@ -1952,7 +2053,7 @@ redis:
 A representative Redis ACL is:
 
 ```text
-user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
+user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~inventory_lock_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~job_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
 ```
 
 Test ACL/TLS with `isolate health` before disabling the old Redis user. Client certificate fields are optional and are only needed for mutual TLS.

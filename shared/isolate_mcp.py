@@ -8,7 +8,7 @@ import time
 import uuid
 from typing import Any
 
-from isolate import load_grants, load_project_sets
+from isolate import get_grant_record, list_grant_records, load_grants, load_project_sets
 from isolate_access import (
     AccessDenied,
     approve_access_request,
@@ -25,7 +25,8 @@ from isolate_audit import prepare_and_dispatch
 from isolate_config import load_config
 from isolate_history import read_history
 from isolate_identity import IdentityError, normalize_claims, verify_jwt_claims
-from isolate_inventory import get_host, list_hosts
+from isolate_inventory import HostValidationError, create_host, get_host, host_revision, list_hosts, validate_host_updates, update_host
+from isolate_jobs import JobError, create_command_job, get_job, list_jobs, read_job_output, request_job_cancel
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 from isolate_redis import create_redis_client
@@ -132,10 +133,24 @@ class IsolateMCPService(object):
     def _has_scope(self, scopes, name):
         return bool(name and name in set(scopes or []))
 
+    def _admin_groups(self, config_name):
+        return self.mcp_config.get(config_name) or self.config.get("access", {}).get("admin_groups") or []
+
+    def _is_scoped_admin(self, identity, scopes, scope_name, groups_name):
+        return self._has_scope(scopes, self.mcp_config.get(scope_name)) and is_access_admin(
+            identity, self._admin_groups(groups_name)
+        )
+
+    def _require_scoped_admin(self, identity, scopes, scope_name, groups_name, operation):
+        if not self._is_scoped_admin(identity, scopes, scope_name, groups_name):
+            raise MCPAccessDenied("{} requires both a configured admin group and scope {}".format(
+                operation, self.mcp_config.get(scope_name)
+            ))
+
     def _is_access_admin(self, identity, scopes):
-        approval_scope = self.mcp_config.get("approval_scope", "isolate.approve")
-        admin_groups = self.config.get("access", {}).get("admin_groups") or []
-        return self._has_scope(scopes, approval_scope) and is_access_admin(identity, admin_groups)
+        return self._has_scope(scopes, self.mcp_config.get("approval_scope", "isolate.approve")) and is_access_admin(
+            identity, self.config.get("access", {}).get("admin_groups") or []
+        )
 
     def _require_access_admin(self, identity, scopes):
         if not self._is_access_admin(identity, scopes):
@@ -188,6 +203,19 @@ class IsolateMCPService(object):
             raise AccessDenied("Redis client does not support atomic access decision locks") from exc
         if not acquired:
             raise AccessDenied("another decision for this request is already in progress")
+
+    def _acquire_lock(self, key, ttl=30):
+        token = str(uuid.uuid4())
+        if not self.redis.set(key, token, nx=True, ex=int(ttl)):
+            raise MCPAccessDenied("another mutation is already in progress")
+        return token
+
+    def _release_lock(self, key, token):
+        current = self.redis.get(key)
+        if isinstance(current, bytes):
+            current = current.decode("utf-8")
+        if current == token:
+            self.redis.delete(key)
 
     @staticmethod
     def _is_self_approval(identity, record):
@@ -276,6 +304,179 @@ class IsolateMCPService(object):
         except Exception:
             self._audit("host_get", identity, "error", started, {"host_id": server_id})
             raise
+
+    def inventory_host_add(self, identity, scopes, values, dry_run=True, confirm=False):
+        started = time.monotonic()
+        try:
+            self._require_scoped_admin(
+                identity, scopes, "inventory_write_scope", "inventory_admin_groups", "inventory host add"
+            )
+            normalized = validate_host_updates(self.redis, values)
+            required = ("project_name", "server_name", "server_ip", "server_user")
+            missing = [name for name in required if not normalized.get(name)]
+            if missing:
+                raise HostValidationError("missing required host fields: {}".format(", ".join(missing)))
+            preview = dict(normalized)
+            preview.setdefault("server_port", 22)
+            collisions = [
+                host for host in list_hosts(self.redis)
+                if host.get("server_ip") == preview.get("server_ip") or (
+                    host.get("project_name") == preview.get("project_name")
+                    and host.get("server_name") == preview.get("server_name")
+                )
+            ]
+            if dry_run:
+                result = {"applied": False, "preview": preview, "collisions": collisions}
+                self._audit("inventory_host_add", identity, "preview", started, {"project": preview.get("project_name")})
+                return result
+            self._require_confirmation(confirm)
+            host = create_host(self.redis, normalized, updated_by=identity.get("username"))
+            self._audit("inventory_host_add", identity, "created", started, {
+                "host_id": host.get("server_id"), "project": host.get("project_name"), "revision": host.get("_revision")
+            })
+            return {"applied": True, "host": host, "collisions": collisions}
+        except (HostValidationError, MCPAccessDenied, ValueError):
+            self._audit("inventory_host_add", identity, "denied", started)
+            raise
+        except Exception:
+            self._audit("inventory_host_add", identity, "error", started)
+            raise
+
+    def inventory_host_update(self, identity, scopes, server_id, updates, expected_revision=None, dry_run=True, confirm=False):
+        started = time.monotonic()
+        server_id = _required_id(server_id, "server_id")
+        try:
+            self._require_scoped_admin(
+                identity, scopes, "inventory_write_scope", "inventory_admin_groups", "inventory host update"
+            )
+            current = get_host(self.redis, server_id)
+            if current is None:
+                raise MCPAccessDenied("host was not found")
+            normalized = validate_host_updates(self.redis, updates)
+            if not normalized:
+                raise HostValidationError("at least one host field must be provided")
+            preview = dict(current)
+            preview.update(normalized)
+            preview.pop("_revision", None)
+            preview_revision = host_revision(preview)
+            if dry_run:
+                result = {
+                    "applied": False,
+                    "host_id": server_id,
+                    "current_revision": current.get("_revision"),
+                    "preview_revision": preview_revision,
+                    "changed_fields": sorted(normalized),
+                    "preview": preview,
+                }
+                self._audit("inventory_host_update", identity, "preview", started, {"host_id": server_id})
+                return result
+            self._require_confirmation(confirm)
+            expected_revision = _required_text(expected_revision, "expected_revision", 128)
+            lock_key = "inventory_lock_{}".format(server_id)
+            lock_token = self._acquire_lock(lock_key)
+            try:
+                latest = get_host(self.redis, server_id)
+                if latest is None:
+                    raise MCPAccessDenied("host was not found")
+                if latest.get("_revision") != expected_revision:
+                    raise MCPAccessDenied("host revision changed; run a new dry-run before applying")
+                host = update_host(self.redis, server_id, normalized, updated_by=identity.get("username"))
+            finally:
+                self._release_lock(lock_key, lock_token)
+            self._audit("inventory_host_update", identity, "updated", started, {
+                "host_id": server_id,
+                "project": host.get("project_name"),
+                "before_revision": expected_revision,
+                "revision": host.get("_revision"),
+                "changed_fields": sorted(normalized),
+            })
+            return {"applied": True, "host": host}
+        except (HostValidationError, MCPAccessDenied, ValueError):
+            self._audit("inventory_host_update", identity, "denied", started, {"host_id": server_id})
+            raise
+        except Exception:
+            self._audit("inventory_host_update", identity, "error", started, {"host_id": server_id})
+            raise
+
+    def grant_list(self, identity, scopes, user=None, group=None, project=None, project_set=None, project_glob=None, limit=None):
+        started = time.monotonic()
+        self._require_scoped_admin(identity, scopes, "policy_read_scope", "policy_admin_groups", "grant list")
+        maximum = int(self.mcp_config.get("max_results", 100))
+        limit = min(max(int(limit or 50), 1), maximum)
+        rows = list_grant_records(
+            self.redis,
+            user=_optional_text(user, "user", 128),
+            group=_optional_text(group, "group", 128),
+            project=_optional_text(project, "project", 128),
+            project_set=_optional_text(project_set, "project_set", 128),
+            project_glob=_optional_text(project_glob, "project_glob", 128),
+        )[:limit]
+        self._audit("grant_list", identity, "allowed", started, {"result_count": len(rows)})
+        return {"grants": rows, "count": len(rows), "limit": limit}
+
+    def grant_show(self, identity, scopes, grant_id):
+        started = time.monotonic()
+        self._require_scoped_admin(identity, scopes, "policy_read_scope", "policy_admin_groups", "grant show")
+        grant_id = _required_text(grant_id, "grant_id", 64)
+        grant = get_grant_record(self.redis, grant_id)
+        if grant is None:
+            self._audit("grant_show", identity, "denied", started, {"grant_id": grant_id})
+            raise MCPAccessDenied("grant was not found")
+        self._audit("grant_show", identity, "allowed", started, {"grant_id": grant_id})
+        return {"grant": grant}
+
+    def project_set_list(self, identity, scopes):
+        started = time.monotonic()
+        self._require_scoped_admin(identity, scopes, "policy_read_scope", "policy_admin_groups", "project-set list")
+        rows = sorted(load_project_sets(self.redis).values(), key=lambda row: row.get("name") or "")
+        self._audit("project_set_list", identity, "allowed", started, {"result_count": len(rows)})
+        return {"project_sets": rows, "count": len(rows)}
+
+    def project_set_show(self, identity, scopes, name):
+        started = time.monotonic()
+        self._require_scoped_admin(identity, scopes, "policy_read_scope", "policy_admin_groups", "project-set show")
+        name = _required_text(name, "name", 128)
+        project_set = load_project_sets(self.redis).get(name)
+        if project_set is None:
+            self._audit("project_set_show", identity, "denied", started, {"project_set": name})
+            raise MCPAccessDenied("project set was not found")
+        self._audit("project_set_show", identity, "allowed", started, {"project_set": name})
+        return {"project_set": project_set}
+
+    def policy_preview(self, identity, scopes, project=None, host_id=None, action="ssh", user=None, groups=None, roles=None):
+        started = time.monotonic()
+        self._require_scoped_admin(identity, scopes, "policy_read_scope", "policy_admin_groups", "policy preview")
+        project = _optional_text(project, "project", 128)
+        host_id = _optional_text(host_id, "host_id", 64)
+        action = _required_text(action, "action", 32)
+        host = get_host(self.redis, host_id) if host_id else None
+        if host_id and host is None:
+            raise MCPAccessDenied("host was not found")
+        project = project or (host or {}).get("project_name")
+        simulated = dict(identity)
+        if user:
+            simulated["username"] = _required_text(user, "user", 128)
+            simulated["keycloak_sub"] = None
+        if groups is not None:
+            simulated["groups"] = [_required_text(group, "group", 128) for group in groups]
+        if roles is not None:
+            simulated["roles"] = [_required_text(role, "role", 128) for role in roles]
+        try:
+            decision = resolve_grant(
+                simulated,
+                project=project,
+                host=host,
+                grants=load_grants(self.redis),
+                project_sets=load_project_sets(self.redis),
+                defaults=self._policy_defaults(),
+                action=action,
+            )
+            result = {"allowed": True, "identity": simulated, "project": project, "host": host, "action": action, "decision": decision}
+            self._audit("policy_preview", identity, "allowed", started, {"host_id": host_id, "project": project, "action": action})
+            return result
+        except PolicyDenied as exc:
+            self._audit("policy_preview", identity, "denied", started, {"host_id": host_id, "project": project, "action": action})
+            return {"allowed": False, "identity": simulated, "project": project, "host_id": host_id, "action": action, "reason": str(exc)}
 
     def grant_explain(self, identity, project=None, host_id=None):
         started = time.monotonic()
@@ -553,6 +754,121 @@ class IsolateMCPService(object):
             self._audit("access_request_deny", identity, "error", started, {"access_request_id": request_id})
             raise
 
+    def _is_execution_admin(self, identity, scopes):
+        return self._is_scoped_admin(identity, scopes, "execute_scope", "execution_admin_groups")
+
+    def _require_command_submitter(self, identity, scopes):
+        execution = self.config.get("command_execution", {}) or {}
+        if not execution.get("enabled", False):
+            raise MCPAccessDenied("remote command execution is disabled")
+        scope = self.mcp_config.get("execute_scope", "isolate.execute")
+        if not self._has_scope(scopes, scope):
+            raise MCPAccessDenied("required scope is missing: {}".format(scope))
+        if not (set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
+            raise MCPAccessDenied("identity is not in a command execution group")
+
+    def _can_view_job(self, identity, scopes, record):
+        return bool(record and (
+            record.get("username") == identity.get("username") or self._is_execution_admin(identity, scopes)
+        ))
+
+    def command_job_create(self, identity, scopes, host_id, command, timeout=None, confirm=False):
+        started = time.monotonic()
+        host_id = _required_id(host_id, "host_id")
+        try:
+            self._require_command_submitter(identity, scopes)
+            execution = self.config.get("command_execution", {}) or {}
+            if execution.get("require_confirmation", True) and confirm is not True:
+                raise MCPAccessDenied("explicit confirm=true is required to queue a remote command")
+            host = get_host(self.redis, host_id)
+            if host is None:
+                raise MCPAccessDenied("host was not found or is not allowed")
+            decision = resolve_grant(
+                identity,
+                project=host.get("project_name"),
+                host=host,
+                grants=load_grants(self.redis),
+                project_sets=load_project_sets(self.redis),
+                defaults=self._policy_defaults(),
+                action="command",
+            )
+            if decision.get("sudo_mode") == "sudo-i" and not execution.get("allow_sudo", False):
+                raise MCPAccessDenied("sudo command execution is disabled")
+            job = create_command_job(self.redis, self.config, identity, host, decision, command, timeout=timeout)
+            self._audit("command_job_create", identity, "queued", started, {
+                "job_id": job.get("id"),
+                "host_id": host_id,
+                "project": host.get("project_name"),
+                "command_sha256": job.get("command_sha256"),
+            })
+            return {"job": job}
+        except (JobError, MCPAccessDenied, PolicyDenied, ValueError):
+            self._audit("command_job_create", identity, "denied", started, {"host_id": host_id})
+            raise
+        except Exception:
+            self._audit("command_job_create", identity, "error", started, {"host_id": host_id})
+            raise
+
+    def command_job_list(self, identity, scopes, status=None, user=None, limit=None):
+        started = time.monotonic()
+        status = _optional_text(status, "status", 32)
+        user = _optional_text(user, "user", 128)
+        valid_statuses = ("queued", "running", "completed", "failed", "cancelled", "timed_out")
+        if status and status not in valid_statuses:
+            raise ValueError("invalid job status")
+        admin = self._is_execution_admin(identity, scopes)
+        if not admin:
+            self._require_command_submitter(identity, scopes)
+            if user and user != identity.get("username"):
+                raise MCPAccessDenied("other users' jobs are visible only to execution admins")
+            user = identity.get("username")
+        maximum = int(self.mcp_config.get("max_results", 100))
+        limit = min(max(int(limit or 20), 1), maximum)
+        rows = list_jobs(self.redis, user=user, status=status, limit=limit)
+        self._audit("command_job_list", identity, "allowed", started, {"result_count": len(rows), "admin_view": admin})
+        return {"jobs": rows, "count": len(rows), "limit": limit, "admin_view": admin}
+
+    def command_job_show(self, identity, scopes, job_id):
+        started = time.monotonic()
+        job_id = _required_id(job_id, "job_id")
+        record = get_job(self.redis, job_id)
+        if not self._can_view_job(identity, scopes, record):
+            self._audit("command_job_show", identity, "denied", started, {"job_id": job_id})
+            raise MCPAccessDenied("job was not found or is not visible")
+        self._audit("command_job_show", identity, "allowed", started, {"job_id": job_id})
+        return {"job": record}
+
+    def command_job_output(self, identity, scopes, job_id):
+        started = time.monotonic()
+        job_id = _required_id(job_id, "job_id")
+        record = get_job(self.redis, job_id)
+        if not self._can_view_job(identity, scopes, record):
+            self._audit("command_job_output", identity, "denied", started, {"job_id": job_id})
+            raise MCPAccessDenied("job was not found or is not visible")
+        maximum = int(self.config.get("command_execution", {}).get("max_return_bytes", 262144))
+        output = read_job_output(
+            record,
+            max_bytes=maximum,
+            jobs_path=self.config.get("command_execution", {}).get("jobs_path", "/opt/auth/jobs"),
+            job_id=job_id,
+        )
+        self._audit("command_job_output", identity, "allowed", started, {"job_id": job_id, "returned_bytes": len(output.encode("utf-8"))})
+        return {"job_id": job_id, "status": record.get("status"), "output": output, "output_truncated": bool(record.get("output_bytes", 0) > maximum)}
+
+    def command_job_cancel(self, identity, scopes, job_id, confirm=False):
+        started = time.monotonic()
+        job_id = _required_id(job_id, "job_id")
+        record = get_job(self.redis, job_id)
+        if not self._can_view_job(identity, scopes, record):
+            self._audit("command_job_cancel", identity, "denied", started, {"job_id": job_id})
+            raise MCPAccessDenied("job was not found or is not visible")
+        if self.config.get("command_execution", {}).get("require_confirmation", True) and confirm is not True:
+            self._audit("command_job_cancel", identity, "denied", started, {"job_id": job_id})
+            raise MCPAccessDenied("explicit confirm=true is required to cancel a job")
+        record = request_job_cancel(self.redis, job_id, identity)
+        self._audit("command_job_cancel", identity, "cancelled", started, {"job_id": job_id})
+        return {"job": record}
+
 
 def _required_text(value, name, maximum):
     result = str(value or "").strip()
@@ -571,6 +887,13 @@ def _optional_text(value, name, maximum):
         return None
     if len(result) > maximum:
         raise ValueError("{} is too long".format(name))
+    return result
+
+
+def _required_id(value, name):
+    result = _required_text(value, name, 64)
+    if re.fullmatch(r"[0-9]+", result) is None:
+        raise ValueError("{} must contain only digits".format(name))
     return result
 
 
@@ -629,9 +952,117 @@ def create_mcp_server(config=None, redis=None):
         return service.host_get(_request_identity(), server_id)
 
     @server.tool(structured_output=True)
+    def inventory_host_add(
+        project: str,
+        name: str,
+        ip: str,
+        user: str,
+        port: int = 22,
+        nosudo: bool | None = None,
+        services: str | None = None,
+        note: str | None = None,
+        vip: bool | None = None,
+        proxy_id: str | None = None,
+        privileged_provider: str | None = None,
+        privileged_url: str | None = None,
+        privileged_hint: str | None = None,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Preview or add a host. Applying requires inventory admin scope/group and confirm=true."""
+        token = _request_token()
+        values = {
+            "project_name": project, "server_name": name, "server_ip": ip, "server_user": user,
+            "server_port": port, "server_nosudo": nosudo, "server_services": services, "server_note": note,
+            "server_vip": vip, "proxy_id": proxy_id, "privileged_access_provider": privileged_provider,
+            "privileged_access_url": privileged_url, "privileged_access_hint": privileged_hint,
+        }
+        return service.inventory_host_add(normalize_claims(token.claims), token.scopes, values, dry_run=dry_run, confirm=confirm)
+
+    @server.tool(structured_output=True)
+    def inventory_host_update(
+        server_id: str,
+        expected_revision: str | None = None,
+        project: str | None = None,
+        name: str | None = None,
+        ip: str | None = None,
+        user: str | None = None,
+        port: int | None = None,
+        nosudo: bool | None = None,
+        services: str | None = None,
+        note: str | None = None,
+        vip: bool | None = None,
+        proxy_id: str | None = None,
+        privileged_provider: str | None = None,
+        privileged_url: str | None = None,
+        privileged_hint: str | None = None,
+        dry_run: bool = True,
+        confirm: bool = False,
+    ) -> dict[str, Any]:
+        """Preview or update selected host fields with optimistic revision protection."""
+        token = _request_token()
+        updates = {
+            "project_name": project, "server_name": name, "server_ip": ip, "server_user": user,
+            "server_port": port, "server_nosudo": nosudo, "server_services": services, "server_note": note,
+            "server_vip": vip, "proxy_id": proxy_id, "privileged_access_provider": privileged_provider,
+            "privileged_access_url": privileged_url, "privileged_access_hint": privileged_hint,
+        }
+        return service.inventory_host_update(
+            normalize_claims(token.claims), token.scopes, server_id, updates,
+            expected_revision=expected_revision, dry_run=dry_run, confirm=confirm,
+        )
+
+    @server.tool(structured_output=True)
     def grant_explain(project: str | None = None, host_id: str | None = None) -> dict[str, Any]:
         """Explain the current user's effective grant for a project or host."""
         return service.grant_explain(_request_identity(), project=project, host_id=host_id)
+
+    @server.tool(structured_output=True)
+    def grant_list(
+        user: str | None = None,
+        group: str | None = None,
+        project: str | None = None,
+        project_set: str | None = None,
+        project_glob: str | None = None,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """List grants for policy administrators with the configured policy-read scope."""
+        token = _request_token()
+        return service.grant_list(normalize_claims(token.claims), token.scopes, user, group, project, project_set, project_glob, limit)
+
+    @server.tool(structured_output=True)
+    def grant_show(grant_id: str) -> dict[str, Any]:
+        """Read one grant for a policy administrator."""
+        token = _request_token()
+        return service.grant_show(normalize_claims(token.claims), token.scopes, grant_id)
+
+    @server.tool(structured_output=True)
+    def project_set_list() -> dict[str, Any]:
+        """List named project sets for a policy administrator."""
+        token = _request_token()
+        return service.project_set_list(normalize_claims(token.claims), token.scopes)
+
+    @server.tool(structured_output=True)
+    def project_set_show(name: str) -> dict[str, Any]:
+        """Read one named project set for a policy administrator."""
+        token = _request_token()
+        return service.project_set_show(normalize_claims(token.claims), token.scopes, name)
+
+    @server.tool(structured_output=True)
+    def policy_preview(
+        project: str | None = None,
+        host_id: str | None = None,
+        action: str = "ssh",
+        user: str | None = None,
+        groups: list[str] | None = None,
+        roles: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Simulate an SSH or command policy decision without changing policy."""
+        token = _request_token()
+        return service.policy_preview(
+            normalize_claims(token.claims), token.scopes, project=project, host_id=host_id,
+            action=action, user=user, groups=groups, roles=roles,
+        )
 
     @server.tool(structured_output=True)
     def history_search(query: str | None = None, project: str | None = None, host: str | None = None, limit: int = 10) -> dict[str, Any]:
@@ -739,6 +1170,38 @@ def create_mcp_server(config=None, redis=None):
             comment=comment,
             confirm=confirm,
         )
+
+    @server.tool(structured_output=True)
+    def command_job_create(host_id: str, command: str, confirm: bool = False, timeout: int | None = None) -> dict[str, Any]:
+        """Queue a non-interactive remote command after scope, group, grant-action, and confirmation checks."""
+        token = _request_token()
+        return service.command_job_create(
+            normalize_claims(token.claims), token.scopes, host_id, command, timeout=timeout, confirm=confirm
+        )
+
+    @server.tool(structured_output=True)
+    def command_job_list(status: str | None = None, user: str | None = None, limit: int = 20) -> dict[str, Any]:
+        """List own command jobs, or all jobs for execution administrators."""
+        token = _request_token()
+        return service.command_job_list(normalize_claims(token.claims), token.scopes, status=status, user=user, limit=limit)
+
+    @server.tool(structured_output=True)
+    def command_job_show(job_id: str) -> dict[str, Any]:
+        """Read one command job visible to the caller."""
+        token = _request_token()
+        return service.command_job_show(normalize_claims(token.claims), token.scopes, job_id)
+
+    @server.tool(structured_output=True)
+    def command_job_output(job_id: str) -> dict[str, Any]:
+        """Read capped output for one command job visible to the caller."""
+        token = _request_token()
+        return service.command_job_output(normalize_claims(token.claims), token.scopes, job_id)
+
+    @server.tool(structured_output=True)
+    def command_job_cancel(job_id: str, confirm: bool = False) -> dict[str, Any]:
+        """Request cancellation of a queued or running command job; confirm=true is required."""
+        token = _request_token()
+        return service.command_job_cancel(normalize_claims(token.claims), token.scopes, job_id, confirm=confirm)
 
     @server.resource("isolate://inventory/projects", mime_type="application/json")
     def inventory_projects_resource() -> str:

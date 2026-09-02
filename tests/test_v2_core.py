@@ -27,7 +27,7 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, read_history
-from isolate_inventory import format_hosts_table, get_host, list_hosts, update_host
+from isolate_inventory import create_host, format_hosts_table, get_host, list_hosts, update_host
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_replay import find_session, parse_raw_replay
@@ -64,6 +64,7 @@ from isolate_mcp import (
     create_mcp_server,
     token_scopes,
 )
+from isolate_jobs import JobError, execute_job, get_job, list_jobs
 
 
 def has_mcp_v2():
@@ -300,6 +301,10 @@ class ServiceBackupTest(unittest.TestCase):
 
 class MCPServiceTest(unittest.TestCase):
     def _config(self, log_path):
+        signing_key = os.path.join(log_path, "job_hmac.key")
+        if os.path.isdir(log_path) and not os.path.exists(signing_key):
+            with open(signing_key, "wb") as key_f:
+                key_f.write(b"test-only-command-job-signing-key-32-bytes")
         return {
             "keycloak": {"issuer": "https://id.example.org/realms/demo", "client_id": "isolate-bastion"},
             "mcp": {
@@ -309,6 +314,12 @@ class MCPServiceTest(unittest.TestCase):
                 "required_scopes": ["isolate.read"],
                 "self_service_scope": "isolate.self-service",
                 "approval_scope": "isolate.approve",
+                "inventory_write_scope": "isolate.inventory.write",
+                "policy_read_scope": "isolate.policy.read",
+                "execute_scope": "isolate.execute",
+                "inventory_admin_groups": ["Demo-Security"],
+                "policy_admin_groups": ["Demo-Security"],
+                "execution_admin_groups": ["Demo-Security"],
                 "prevent_self_approval": True,
                 "require_mutation_confirmation": True,
                 "allowed_hosts": ["mcp.example.org"],
@@ -325,6 +336,22 @@ class MCPServiceTest(unittest.TestCase):
             },
             "history": {"default_limit": 10, "max_limit": 100},
             "notifications": {"enabled": False, "sinks": []},
+            "command_execution": {
+                "enabled": False,
+                "allowed_groups": ["Demo-DevOps"],
+                "allow_arbitrary_commands": False,
+                "allowed_command_patterns": [r"^(uptime|whoami)$"],
+                "allow_sudo": False,
+                "require_confirmation": True,
+                "default_timeout": 60,
+                "max_timeout": 900,
+                "max_command_length": 4096,
+                "max_output_bytes": 1048576,
+                "max_return_bytes": 262144,
+                "jobs_path": log_path,
+                "signing_key_file": signing_key,
+                "remote_shell": "/bin/sh",
+            },
             "access": {
                 "admin_groups": ["Demo-Security"],
                 "default_ttl": "2h",
@@ -598,6 +625,215 @@ class MCPServiceTest(unittest.TestCase):
             self.assertEqual(get_access_request(redis, request_record["id"])["status"], "pending")
             self.assertIsNone(redis.get("grant_2"))
 
+    def test_inventory_mutations_require_admin_scope_dry_run_and_revision(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-inventory-") as logs:
+            redis = self._redis()
+            service = IsolateMCPService(self._config(logs), redis)
+            values = {
+                "project_name": "payments-prod",
+                "server_name": "api-2",
+                "server_ip": "10.0.0.3",
+                "server_user": "support",
+                "server_port": 22,
+                "server_services": "nginx",
+            }
+            with self.assertRaises(MCPAccessDenied):
+                service.inventory_host_add(self._identity(), ["isolate.inventory.write"], values)
+
+            preview = service.inventory_host_add(
+                self._admin_identity(), ["isolate.inventory.write"], values
+            )
+            self.assertFalse(preview["applied"])
+            self.assertIsNone(redis.get("server_10001"))
+            with self.assertRaises(MCPAccessDenied):
+                service.inventory_host_add(
+                    self._admin_identity(), ["isolate.inventory.write"], values, dry_run=False, confirm=False
+                )
+            created = service.inventory_host_add(
+                self._admin_identity(), ["isolate.inventory.write"], values, dry_run=False, confirm=True
+            )["host"]
+            self.assertEqual(created["server_id"], "10001")
+            self.assertTrue(created["_revision"])
+
+            update_preview = service.inventory_host_update(
+                self._admin_identity(), ["isolate.inventory.write"], created["server_id"], {"server_note": "new note"}
+            )
+            self.assertFalse(update_preview["applied"])
+            updated = service.inventory_host_update(
+                self._admin_identity(),
+                ["isolate.inventory.write"],
+                created["server_id"],
+                {"server_note": "new note"},
+                expected_revision=update_preview["current_revision"],
+                dry_run=False,
+                confirm=True,
+            )["host"]
+            self.assertEqual(updated["server_note"], "new note")
+            with self.assertRaisesRegex(MCPAccessDenied, "revision changed"):
+                service.inventory_host_update(
+                    self._admin_identity(),
+                    ["isolate.inventory.write"],
+                    created["server_id"],
+                    {"server_note": "stale"},
+                    expected_revision=update_preview["current_revision"],
+                    dry_run=False,
+                    confirm=True,
+                )
+
+    def test_policy_admin_reads_and_previews_command_action(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-policy-") as logs:
+            redis = self._redis()
+            service = IsolateMCPService(self._config(logs), redis)
+            with self.assertRaises(MCPAccessDenied):
+                service.grant_list(self._identity(), ["isolate.policy.read"])
+
+            grants = service.grant_list(self._admin_identity(), ["isolate.policy.read"])
+            self.assertEqual(grants["count"], 1)
+            self.assertEqual(service.grant_show(self._admin_identity(), ["isolate.policy.read"], "1")["grant"]["name"], "Demo-DevOps")
+            self.assertEqual(service.project_set_list(self._admin_identity(), ["isolate.policy.read"])["count"], 1)
+            self.assertEqual(
+                service.project_set_show(self._admin_identity(), ["isolate.policy.read"], "payments")["project_set"]["name"],
+                "payments",
+            )
+            denied = service.policy_preview(
+                self._admin_identity(),
+                ["isolate.policy.read"],
+                host_id="1",
+                action="command",
+                user="demo.alex",
+                groups=["Demo-DevOps"],
+            )
+            self.assertFalse(denied["allowed"])
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "command"]
+            redis.set("grant_1", json.dumps(grant))
+            allowed = service.policy_preview(
+                self._admin_identity(),
+                ["isolate.policy.read"],
+                host_id="1",
+                action="command",
+                user="demo.alex",
+                groups=["Demo-DevOps"],
+            )
+            self.assertTrue(allowed["allowed"])
+            self.assertEqual(allowed["decision"]["remote_user"], "support")
+
+    def test_command_job_authorization_lifecycle_and_output(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["command_execution"]["enabled"] = True
+            redis = self._redis()
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "command"]
+            redis.set("grant_1", json.dumps(grant))
+            service = IsolateMCPService(config, redis)
+
+            with self.assertRaises(MCPAccessDenied):
+                service.command_job_create(self._identity(), ["isolate.execute"], "1", "uptime", confirm=False)
+            with self.assertRaises(JobError):
+                service.command_job_create(self._identity(), ["isolate.execute"], "1", "rm -rf /", confirm=True)
+            queued = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "uptime", confirm=True
+            )["job"]
+            self.assertEqual(queued["status"], "queued")
+            self.assertEqual(service.command_job_list(self._identity(), ["isolate.execute"])["count"], 1)
+            with self.assertRaises(MCPAccessDenied):
+                service.command_job_show({"username": "demo.bailey", "groups": []}, ["isolate.read"], queued["id"])
+
+            with mock.patch(
+                "isolate_jobs.build_ssh_argv",
+                return_value=[sys.executable, "-c", "print('up 10 days')"],
+            ):
+                completed = execute_job(redis, config, queued)
+            self.assertEqual(completed["status"], "completed")
+            output = service.command_job_output(self._identity(), ["isolate.execute"], queued["id"])
+            self.assertIn("up 10 days", output["output"])
+            tampered_output_record = get_job(redis, queued["id"])
+            tampered_output_record["output_path"] = config["command_execution"]["signing_key_file"]
+            redis.set("job_{}".format(queued["id"]), json.dumps(tampered_output_record))
+            safe_output = service.command_job_output(self._identity(), ["isolate.execute"], queued["id"])
+            self.assertIn("up 10 days", safe_output["output"])
+            self.assertNotIn("test-only-command-job-signing", safe_output["output"])
+
+            config["command_execution"]["max_output_bytes"] = 5
+            limited = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "uptime", confirm=True
+            )["job"]
+            with mock.patch(
+                "isolate_jobs.build_ssh_argv",
+                return_value=[sys.executable, "-c", "print('x' * 1000)"],
+            ):
+                limited_result = execute_job(redis, config, limited)
+            self.assertEqual(limited_result["status"], "failed")
+            self.assertTrue(limited_result["output_truncated"])
+            self.assertLessEqual(limited_result["output_bytes"], 5)
+
+            second = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "whoami", confirm=True
+            )["job"]
+            cancelled = service.command_job_cancel(
+                self._identity(), ["isolate.execute"], second["id"], confirm=True
+            )["job"]
+            self.assertEqual(cancelled["status"], "cancelled")
+
+    def test_arbitrary_command_mode_still_requires_command_grant(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["command_execution"].update({"enabled": True, "allow_arbitrary_commands": True})
+            redis = self._redis()
+            service = IsolateMCPService(config, redis)
+            with self.assertRaises(PolicyDenied):
+                service.command_job_create(
+                    self._identity(), ["isolate.execute"], "1", "journalctl -u nginx | tail", confirm=True
+                )
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "command"]
+            redis.set("grant_1", json.dumps(grant))
+            job = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "journalctl -u nginx | tail", confirm=True
+            )["job"]
+            self.assertEqual(job["status"], "queued")
+
+    def test_worker_revalidates_command_grant_before_ssh(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["command_execution"]["enabled"] = True
+            redis = self._redis()
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "command"]
+            redis.set("grant_1", json.dumps(grant))
+            service = IsolateMCPService(config, redis)
+            job = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "uptime", confirm=True
+            )["job"]
+            grant["allowed_actions"] = ["ssh"]
+            redis.set("grant_1", json.dumps(grant))
+            with mock.patch("isolate_jobs.subprocess.Popen") as popen:
+                failed = execute_job(redis, config, job)
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("authorization changed", failed["error"])
+            popen.assert_not_called()
+
+    def test_worker_rejects_tampered_job_signature(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["command_execution"]["enabled"] = True
+            redis = self._redis()
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "command"]
+            redis.set("grant_1", json.dumps(grant))
+            service = IsolateMCPService(config, redis)
+            job = service.command_job_create(
+                self._identity(), ["isolate.execute"], "1", "uptime", confirm=True
+            )["job"]
+            job["command"] = "whoami"
+            redis.set("job_{}".format(job["id"]), json.dumps(job))
+            with mock.patch("isolate_jobs.subprocess.Popen") as popen:
+                failed = execute_job(redis, config, job)
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("signature is invalid", failed["error"])
+            popen.assert_not_called()
+
     def test_mcp_operations_emit_redacted_audit_records(self):
         with tempfile.TemporaryDirectory(prefix="isolate-mcp-audit-") as root:
             config = self._config(os.path.join(root, "logs"))
@@ -642,13 +878,26 @@ class MCPServiceTest(unittest.TestCase):
         config["mcp"]["public_url"] = "http://mcp.example.org/mcp"
         self.assertFalse(validate_config(config)["valid"])
 
+    def test_command_execution_config_is_fail_closed(self):
+        config = self._config(os.path.abspath("unused"))
+        config["command_execution"].update({
+            "enabled": True,
+            "allow_arbitrary_commands": True,
+        })
+        validation = validate_config(config)
+        self.assertTrue(validation["valid"], validation["errors"])
+        self.assertIn("arbitrary remote command execution is enabled", validation["warnings"])
+        config["command_execution"]["allowed_groups"] = []
+        self.assertFalse(validate_config(config)["valid"])
+
     @unittest.skipUnless(has_mcp_v2(), "MCP SDK v2 is not installed")
-    def test_official_sdk_server_registers_phase_two_surface(self):
+    def test_official_sdk_server_registers_phase_three_surface(self):
         from mcp.server.transport_security import TransportSecuritySettings
         from starlette.testclient import TestClient
 
         with tempfile.TemporaryDirectory(prefix="isolate-mcp-sdk-") as logs:
-            server = create_mcp_server(self._config(logs), self._redis())
+            redis = self._redis()
+            server = create_mcp_server(self._config(logs), redis)
             app = server.streamable_http_app(
                 stateless_http=True,
                 json_response=True,
@@ -668,10 +917,10 @@ class MCPServiceTest(unittest.TestCase):
                     "iss": "https://id.example.org/realms/demo",
                     "sub": "sub-1",
                     "preferred_username": "demo.alex",
-                    "groups": ["Demo-DevOps"],
+                    "groups": ["Demo-DevOps", "Demo-Security"],
                     "aud": ["isolate-mcp"],
                     "azp": "test-client",
-                    "scope": "isolate.read isolate.self-service",
+                    "scope": "isolate.read isolate.self-service isolate.inventory.write isolate.policy.read isolate.execute",
                     "exp": 2000000000,
                 }
                 meta = {
@@ -690,6 +939,21 @@ class MCPServiceTest(unittest.TestCase):
                     "id": 3,
                     "method": "tools/list",
                     "params": {"_meta": meta},
+                }
+                preview_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 4,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "inventory_host_add",
+                        "arguments": {
+                            "project": "payments-prod",
+                            "name": "api-2",
+                            "ip": "10.0.0.3",
+                            "user": "support",
+                        },
+                        "_meta": meta,
+                    },
                 }
                 with mock.patch("isolate_mcp.verify_jwt_claims", return_value=claims):
                     authorized = client.post(
@@ -711,6 +975,16 @@ class MCPServiceTest(unittest.TestCase):
                             "Mcp-Method": "tools/list",
                         },
                     )
+                    previewed = client.post(
+                        "/mcp",
+                        json=preview_payload,
+                        headers={
+                            "Authorization": "Bearer signed-token",
+                            "MCP-Protocol-Version": "2026-07-28",
+                            "Mcp-Method": "tools/call",
+                            "Mcp-Name": "inventory_host_add",
+                        },
+                    )
             self.assertEqual(response.status_code, 401)
             self.assertIn("resource_metadata=", response.headers.get("www-authenticate", ""))
             self.assertEqual(authorized.status_code, 200)
@@ -724,7 +998,22 @@ class MCPServiceTest(unittest.TestCase):
                 "access_request_comment",
                 "access_request_approve",
                 "access_request_deny",
+                "inventory_host_add",
+                "inventory_host_update",
+                "grant_list",
+                "grant_show",
+                "project_set_list",
+                "project_set_show",
+                "policy_preview",
+                "command_job_create",
+                "command_job_list",
+                "command_job_show",
+                "command_job_output",
+                "command_job_cancel",
             }.issubset(tool_names))
+            self.assertEqual(previewed.status_code, 200)
+            self.assertFalse(previewed.json()["result"]["structuredContent"]["applied"])
+            self.assertIsNone(redis.get("server_10001"))
 
     def test_log_retention_selects_only_expired_session_directories(self):
         tmpdir = os.path.join(ROOT, ".tmp-retention-{}".format(uuid.uuid4().hex))

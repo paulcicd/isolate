@@ -41,6 +41,13 @@ mcp:
     - isolate.read
   self_service_scope: isolate.self-service
   approval_scope: isolate.approve
+  inventory_write_scope: isolate.inventory.write
+  policy_read_scope: isolate.policy.read
+  execute_scope: isolate.execute
+  # Empty lists inherit access.admin_groups.
+  inventory_admin_groups: []
+  policy_admin_groups: []
+  execution_admin_groups: []
   prevent_self_approval: true
   require_mutation_confirmation: true
   allowed_hosts:
@@ -53,6 +60,23 @@ mcp:
     - "http://[::1]:*"
   max_results: 100
   max_request_body_size: 1048576
+
+command_execution:
+  enabled: false
+  allowed_groups: []
+  allow_arbitrary_commands: false
+  allowed_command_patterns: []
+  allow_sudo: false
+  require_confirmation: true
+  default_timeout: 60
+  max_timeout: 900
+  max_command_length: 4096
+  max_output_bytes: 1048576
+  max_return_bytes: 262144
+  jobs_path: /opt/auth/jobs
+  signing_key_file: /opt/auth/keys/job_hmac.key
+  remote_shell: /bin/sh
+  poll_interval: 1
 
 ssh:
   binary: /usr/bin/ssh
@@ -110,6 +134,7 @@ backup:
     - project_set_*
     - access_request_*
     - active_session_*
+    - job_*
     - ssh_config_*
     - complete_hosts_*
     - offset_*
@@ -141,6 +166,8 @@ backup:
     - path: /etc/systemd/system/isolate-backup.timer
       required: false
     - path: /etc/systemd/system/isolate-mcp.service
+      required: false
+    - path: /etc/systemd/system/isolate-job-worker.service
       required: false
     - path: /etc/default/isolate-mcp
       required: false

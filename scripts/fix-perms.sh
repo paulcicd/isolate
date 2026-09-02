@@ -22,7 +22,7 @@ if ! getent group auth >/dev/null 2>&1; then
 fi
 
 cd "${AUTH_DATA_ROOT}";
-mkdir -p keys logs cache backups backups/service spool
+mkdir -p keys logs cache backups backups/service spool jobs
 
 chown -R auth:auth "${AUTH_DATA_ROOT}"
 
@@ -67,6 +67,10 @@ find "${AUTH_DATA_ROOT}/backups" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0
 # Central audit spool is readable by the auth group for shipping agents.
 chmod 0750 "${AUTH_DATA_ROOT}/spool"
 find "${AUTH_DATA_ROOT}/spool" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
+
+# Command job output can contain production data and is private to the worker.
+chmod 0700 "${AUTH_DATA_ROOT}/jobs"
+find "${AUTH_DATA_ROOT}/jobs" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0600
 
 if [ -d "${AUTH_DATA_ROOT}/.githooks" ]; then
     chmod 0750 "${AUTH_DATA_ROOT}/.githooks"

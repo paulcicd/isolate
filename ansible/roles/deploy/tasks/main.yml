@@ -48,6 +48,7 @@
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service", dest: "/etc/systemd/system/isolate-job-worker.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
     - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
@@ -82,6 +83,45 @@
   when:
     - isolate_enable_mcp_server | bool
     - not (isolate_install_runtime_units | bool)
+
+- name: Installing Isolate command job worker unit...
+  copy:
+    src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service"
+    dest: "/etc/systemd/system/isolate-job-worker.service"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Checking Isolate command job signing key...
+  stat:
+    path: "{{ deploy_path }}/keys/job_hmac.key"
+  register: isolate_job_signing_key
+  when: isolate_enable_job_worker | bool
+
+- name: Generating Isolate command job signing key...
+  command: openssl rand -hex 32
+  register: isolate_job_signing_key_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_job_signing_key.stat.exists | default(false))
+
+- name: Installing Isolate command job signing key...
+  copy:
+    content: "{{ isolate_job_signing_key_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/job_hmac.key"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_enable_job_worker | bool
+    - not (isolate_job_signing_key.stat.exists | default(false))
 
 - name: Checking Isolate dashboard secret...
   stat:
@@ -136,6 +176,14 @@
     state: started
     daemon_reload: yes
   when: isolate_enable_mcp_server | bool
+
+- name: Enabling Isolate command job worker...
+  systemd:
+    name: isolate-job-worker.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_job_worker | bool
 
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"

@@ -27,6 +27,7 @@ def validate_config(config, check_paths=False):
     logging_cfg = section("logging")
     dashboard = section("dashboard")
     mcp = section("mcp")
+    command_execution = section("command_execution")
     backup = section("backup")
 
     try:
@@ -109,6 +110,9 @@ def validate_config(config, check_paths=False):
             errors.append("mcp.self_service_scope is required when MCP is enabled")
         if not mcp.get("approval_scope"):
             errors.append("mcp.approval_scope is required when MCP is enabled")
+        for scope_name in ("inventory_write_scope", "policy_read_scope", "execute_scope"):
+            if not mcp.get(scope_name):
+                errors.append("mcp.{} is required when MCP is enabled".format(scope_name))
         if not isinstance(mcp.get("prevent_self_approval", True), bool):
             errors.append("mcp.prevent_self_approval must be a boolean")
         if not isinstance(mcp.get("require_mutation_confirmation", True), bool):
@@ -127,6 +131,51 @@ def validate_config(config, check_paths=False):
                 errors.append("mcp.max_results must be greater than zero")
         except (TypeError, ValueError):
             errors.append("mcp.max_results must be an integer")
+
+    if command_execution.get("enabled"):
+        if not mcp.get("enabled"):
+            errors.append("mcp.enabled must be true when command execution is enabled")
+        if not command_execution.get("allowed_groups") or not isinstance(command_execution.get("allowed_groups"), list):
+            errors.append("command_execution.allowed_groups must be a non-empty list")
+        if not command_execution.get("allow_arbitrary_commands") and not command_execution.get("allowed_command_patterns"):
+            errors.append("command_execution.allowed_command_patterns is required unless arbitrary commands are enabled")
+        if command_execution.get("allow_arbitrary_commands"):
+            warnings.append("arbitrary remote command execution is enabled")
+        for name, default in (
+            ("default_timeout", 60),
+            ("max_timeout", 900),
+            ("max_command_length", 4096),
+            ("max_output_bytes", 1048576),
+            ("max_return_bytes", 262144),
+        ):
+            try:
+                if int(command_execution.get(name, default)) < 1:
+                    errors.append("command_execution.{} must be greater than zero".format(name))
+            except (TypeError, ValueError):
+                errors.append("command_execution.{} must be an integer".format(name))
+        try:
+            if int(command_execution.get("default_timeout", 60)) > int(command_execution.get("max_timeout", 900)):
+                errors.append("command_execution.default_timeout cannot exceed max_timeout")
+            if int(command_execution.get("max_return_bytes", 262144)) > int(command_execution.get("max_output_bytes", 1048576)):
+                errors.append("command_execution.max_return_bytes cannot exceed max_output_bytes")
+        except (TypeError, ValueError):
+            pass
+        jobs_path = command_execution.get("jobs_path")
+        if not jobs_path or not os.path.isabs(str(jobs_path)):
+            errors.append("command_execution.jobs_path must be an absolute path")
+        elif check_paths and not (os.path.isdir(jobs_path) and os.access(jobs_path, os.W_OK | os.X_OK)):
+            errors.append("command execution jobs path is missing or not writable: {}".format(jobs_path))
+        remote_shell = command_execution.get("remote_shell", "/bin/sh")
+        if not os.path.isabs(str(remote_shell)):
+            errors.append("command_execution.remote_shell must be an absolute path")
+        signing_key = command_execution.get("signing_key_file")
+        if not signing_key or not os.path.isabs(str(signing_key)):
+            errors.append("command_execution.signing_key_file must be an absolute path")
+        elif check_paths:
+            if not os.path.isfile(signing_key):
+                errors.append("command execution signing key does not exist: {}".format(signing_key))
+            elif os.name == "posix" and os.stat(signing_key).st_mode & 0o077:
+                errors.append("command execution signing key must be owner-only (0600 or stricter)")
 
     try:
         if int(backup.get("retention_count", 14)) < 1:

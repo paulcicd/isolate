@@ -1,0 +1,24 @@
+[Unit]
+Description=Isolate v2 asynchronous command job worker
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+WorkingDirectory=/opt/auth/shared
+ExecStartPre=/usr/bin/python3 /opt/auth/shared/isolate.py config validate --check-paths
+ExecStart=/usr/bin/python3 /opt/auth/scripts/isolate-job-worker.py
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/auth/jobs /opt/auth/spool /opt/auth/cache
+
+[Install]
+WantedBy=multi-user.target

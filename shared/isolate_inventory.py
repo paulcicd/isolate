@@ -3,6 +3,7 @@
 """Inventory helpers for Redis-backed Isolate hosts."""
 
 import json
+import hashlib
 import re
 import time
 
@@ -43,13 +44,23 @@ def normalize_host(host):
     return row
 
 
+def host_revision(host):
+    payload = dict(host or {})
+    payload.pop("_revision", None)
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def list_hosts(redis, project=None, query=None):
     rows = []
     for key in redis.keys("server_*"):
+        if re.match(r"^server_[0-9]+$", decode(key)) is None:
+            continue
         raw = redis.get(key)
         if raw is None:
             continue
         host = normalize_host(json.loads(decode(raw)))
+        host["_revision"] = host_revision(host)
         if project and host.get("project_name") != project:
             continue
         if query and not host_matches_query(host, query):
@@ -62,7 +73,9 @@ def get_host(redis, server_id):
     raw = redis.get("server_{}".format(server_id))
     if raw is None:
         return None
-    return normalize_host(json.loads(decode(raw)))
+    host = normalize_host(json.loads(decode(raw)))
+    host["_revision"] = host_revision(host)
+    return host
 
 
 def host_matches_query(host, query):
@@ -153,7 +166,44 @@ def update_host(redis, server_id, updates, updated_by=None):
     host["updated_by"] = updated_by or "unknown"
     host["updated_at"] = int(time.time())
     redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
-    return normalize_host(host)
+    normalized = normalize_host(host)
+    normalized["_revision"] = host_revision(normalized)
+    return normalized
+
+
+def create_host(redis, values, updated_by=None):
+    required = ("project_name", "server_name", "server_ip", "server_user")
+    missing = [name for name in required if values.get(name) in (None, "")]
+    if missing:
+        raise HostValidationError("missing required host fields: {}".format(", ".join(missing)))
+    candidate = dict(values)
+    candidate.setdefault("server_port", 22)
+    normalized = validate_host_updates(redis, candidate)
+    redis.set("offset_server_id", 10000, nx=True)
+    server_id = redis.incr("offset_server_id")
+    host = {
+        "server_id": int(server_id),
+        "project_name": normalized.get("project_name"),
+        "server_name": normalized.get("server_name"),
+        "server_ip": normalized.get("server_ip"),
+        "server_port": normalized.get("server_port", 22),
+        "server_user": normalized.get("server_user"),
+        "server_nosudo": normalized.get("server_nosudo"),
+        "server_services": normalized.get("server_services", ""),
+        "server_note": normalized.get("server_note", ""),
+        "server_vip": normalized.get("server_vip", False),
+        "privileged_access_provider": normalized.get("privileged_access_provider", ""),
+        "privileged_access_url": normalized.get("privileged_access_url", ""),
+        "privileged_access_hint": normalized.get("privileged_access_hint", ""),
+        "proxy_id": normalized.get("proxy_id"),
+        "geoip_asn": None,
+        "updated_by": updated_by or "unknown",
+        "updated_at": int(time.time()),
+    }
+    redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+    result = normalize_host(host)
+    result["_revision"] = host_revision(result)
+    return result
 
 
 def format_hosts_table(rows):
