@@ -1,0 +1,25 @@
+[Unit]
+Description=Isolate v2 MCP resource server
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+WorkingDirectory=/opt/auth/shared
+EnvironmentFile=-/etc/default/isolate-mcp
+ExecStartPre=/usr/bin/python3 /opt/auth/shared/isolate.py config validate --check-paths
+ExecStart=/usr/bin/python3 -m uvicorn --workers 2 --factory --host ${ISOLATE_MCP_HOST} --port ${ISOLATE_MCP_PORT} isolate_mcp:create_app
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/auth/cache /opt/auth/spool
+
+[Install]
+WantedBy=multi-user.target

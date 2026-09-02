@@ -47,7 +47,9 @@
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-log-retention.timer", dest: "/etc/systemd/system/isolate-log-retention.timer" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
     - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
   when: isolate_install_runtime_units | bool
 
@@ -64,6 +66,21 @@
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
   when:
     - isolate_enable_backup_timer | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Installing Isolate MCP systemd unit...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
+  when:
+    - isolate_enable_mcp_server | bool
     - not (isolate_install_runtime_units | bool)
 
 - name: Checking Isolate dashboard secret...
@@ -111,6 +128,14 @@
     state: started
     daemon_reload: yes
   when: isolate_enable_backup_timer | bool
+
+- name: Enabling Isolate MCP server...
+  systemd:
+    name: isolate-mcp.service
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_mcp_server | bool
 
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"

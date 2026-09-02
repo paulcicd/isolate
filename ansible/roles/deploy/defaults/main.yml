@@ -1,3 +1,4 @@
 ---
 isolate_install_runtime_units: false
 isolate_enable_backup_timer: false
+isolate_enable_mcp_server: false

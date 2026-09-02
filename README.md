@@ -33,6 +33,7 @@ All examples in this document use fictional users, groups, domains, projects, an
 - Safer SSH argv construction through `subprocess` arguments.
 - Permission repair workflow for Git deploys.
 - Verifiable service backups for configuration, credentials, host keys, and Redis state.
+- Keycloak-protected MCP interface for policy-aware AI and automation clients.
 
 ## Concepts
 
@@ -143,6 +144,8 @@ Dependencies are declared in `requirements.txt`:
 - `PyYAML`
 - `Flask`
 - `Authlib`
+- `gunicorn`
+- official `mcp` Python SDK v2
 
 ## Repository Layout
 
@@ -168,6 +171,7 @@ Typical runtime checkout:
 │   ├── isolate_history.py
 │   ├── isolate_identity.py
 │   ├── isolate_logging.py
+│   ├── isolate_mcp.py
 │   ├── isolate_policy.py
 │   ├── isolate_sessions.py
 │   ├── isolate_ssh.py
@@ -1591,6 +1595,147 @@ Access approval from the dashboard supports:
 
 Dashboard POST actions use a per-session CSRF token.
 
+## MCP Server
+
+Isolate includes an opt-in MCP v2 resource server for AI clients and automation. It uses the official Python MCP SDK, stateless Streamable HTTP, Keycloak bearer tokens, and the same Redis inventory and grant resolver as `s` and `g`. It does not trust `~/.isolate/identity.json` and does not expose arbitrary SSH or shell execution.
+
+The read and self-service surface exposes:
+
+- `identity_whoami`: verified Keycloak identity and granted MCP scopes;
+- `inventory_search`: only hosts allowed by the caller's existing Isolate grants;
+- `host_get`: one policy-filtered host record;
+- `grant_explain`: the caller's own effective access decision;
+- `history_search`: only the caller's own connection history;
+- `access_request_create`: creates a pending break-glass request but never approves it;
+- `access_request_list`: own requests by default; all matching requests only for access admins;
+- `access_request_show`: one own request or any request for an access admin;
+- `access_request_comment`: appends an attributed comment to a visible request;
+- `isolate://inventory/projects`: projects visible to the caller;
+- `isolate://inventory/hosts/<server_id>`: policy-filtered host resource.
+
+The phase-two approval surface additionally exposes:
+
+- `access_request_approve`: creates an expiring user grant from a pending request;
+- `access_request_deny`: closes a pending request with a decision reason.
+
+Approval and denial require all of the following:
+
+- the verified Keycloak identity belongs to one of `access.admin_groups`;
+- the access token contains the configured `mcp.approval_scope`;
+- the tool call explicitly passes `confirm=true`;
+- the requester is not the approver when `prevent_self_approval` is enabled;
+- the request is still pending, its project/host still exists, and its TTL does not exceed `access.max_ttl`.
+
+This two-factor authorization prevents an ordinary member of an admin group from approving through an MCP client that was not granted the privileged scope. Read tools never trigger approval as a side effect.
+
+Approval and denial also take a short atomic Redis decision lock under `access_request_lock_*`. This prevents two MCP workers from deciding the same pending request concurrently; lock records expire automatically and are ignored by access-request listings.
+
+Every domain operation emits an `mcp_tool_call` audit event through the configured audit sinks. Tokens, client secrets, and complete tool arguments are not written to audit records.
+
+### Keycloak Configuration For MCP
+
+Use a separate audience for MCP access tokens, for example `isolate-mcp`. Do not reuse an ID token or the CLI identity cache as an MCP bearer credential.
+
+Configure Keycloak so access tokens presented to Isolate contain:
+
+- issuer equal to the configured realm issuer;
+- `aud` containing `isolate-mcp` through an audience mapper;
+- `groups` through a group membership mapper;
+- realm roles when role-based grants are required;
+- `scope` containing `isolate.read`;
+- `scope` containing `isolate.self-service` for users allowed to create temporary access requests.
+- `scope` containing `isolate.approve` only for MCP clients and administrators allowed to approve or deny requests.
+
+`access.admin_groups` remains the source of truth for access administrators. The `isolate.approve` scope is an additional requirement, not a replacement for the group check. Assign the approval client scope narrowly and do not include it in every user's default token.
+
+For a manually registered public MCP client, enable Standard Flow, disable Client Authentication, require PKCE `S256`, and register only the exact redirect URIs used by the MCP client. Automatic OAuth onboarding additionally depends on the client's and Keycloak deployment's support for the current MCP OAuth registration mechanism. The Isolate MCP endpoint always publishes RFC 9728 protected-resource metadata and can also accept a correctly obtained Keycloak bearer token directly.
+
+### MCP Configuration
+
+Production example:
+
+```yaml
+mcp:
+  enabled: true
+  listen_host: 127.0.0.1
+  listen_port: 8090
+  public_url: https://mcp-bastion.example.org/mcp
+  issuer: https://id.example.org/realms/demo-infra
+  expected_audience: isolate-mcp
+  jwks_cache_path: /opt/auth/cache/keycloak_mcp_jwks.json
+  jwks_cache_ttl: 3600
+  tls_verify: true
+  required_scopes:
+    - isolate.read
+  self_service_scope: isolate.self-service
+  approval_scope: isolate.approve
+  prevent_self_approval: true
+  require_mutation_confirmation: true
+  allowed_hosts:
+    - mcp-bastion.example.org
+  allowed_origins:
+    - https://mcp-bastion.example.org
+  max_results: 100
+  max_request_body_size: 1048576
+```
+
+`public_url` is the canonical MCP resource identifier and must include `/mcp`. `allowed_hosts` contains exact HTTP `Host` values accepted by the MCP transport's DNS-rebinding protection. Add both `host` and `host:*` only when clients legitimately use both forms. `allowed_origins` is required only for browser clients that send an `Origin` header.
+
+The MCP verifier validates the JWT signature through the auth-owned JWKS cache and checks `iss`, strict `aud`, `exp`, and `nbf` on every HTTP request. Unlike CLI ID-token compatibility, `azp` alone is not accepted as the MCP audience.
+
+Example access-admin configuration shared by CLI, dashboard, and MCP:
+
+```yaml
+access:
+  admin_groups:
+    - Demo-DevSecOps
+    - Demo-Platform-Admins
+  default_ttl: 2h
+  max_ttl: 24h
+```
+
+An MCP approval token must contain both one of these verified groups and `scope: isolate.approve`. Keeping `prevent_self_approval` and `require_mutation_confirmation` enabled is strongly recommended.
+
+### MCP Deployment
+
+Install or update dependencies:
+
+```bash
+sudo python3 -m pip install --break-system-packages -r /opt/auth/requirements.txt
+```
+
+Install the service and environment file:
+
+```bash
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-mcp.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-mcp.env /etc/default/isolate-mcp
+sudo systemctl daemon-reload
+sudo systemctl enable --now isolate-mcp.service
+```
+
+The service runs as `auth`, binds only to `127.0.0.1:8090`, uses two stateless Uvicorn workers, and can write only the trusted JWKS cache and configured audit spool. Put nginx or another HTTPS reverse proxy in front of it. A starting configuration is available at `/opt/auth/deploy/nginx/isolate-mcp.conf`.
+
+Ansible installation is disabled by default. Enable it explicitly after configuring Keycloak and `mcp`:
+
+```bash
+ansible-playbook -i ansible/hosts.ini ansible/main.yml -e isolate_enable_mcp_server=true
+```
+
+### MCP Verification
+
+Validate the configuration and service:
+
+```bash
+sudo -u auth /opt/auth/shared/isolate.py config validate --check-paths
+curl -i http://127.0.0.1:8090/health
+curl -i -X POST http://127.0.0.1:8090/mcp -H 'Host: 127.0.0.1:8090' -H 'Content-Type: application/json' -d '{}'
+journalctl -u isolate-mcp.service
+```
+
+The unauthenticated MCP request must return `401` with a `WWW-Authenticate` header containing `resource_metadata`. Use the MCP Inspector or another OAuth-capable MCP client for a complete login and tool-call test.
+
+MCP intentionally excludes arbitrary grant mutations, host updates, policy apply, backup restore, direct SSH, and arbitrary commands. Access approval is the only privileged mutation exposed in this phase, and it can create only expiring grants tied to an existing pending request.
+
 ## Production Operations
 
 The hardening features in this section are opt-in. Existing installations continue to use the local Redis connection, Flask development command, and per-session JSONL logs until the corresponding settings or units are enabled.
@@ -2387,6 +2532,7 @@ keys active_session_*
 - Enable the local audit spool and asynchronous Vector/Filebeat shipping when central search is required.
 - Store the audit HMAC key as `auth:auth 0600` and periodically verify shipped JSONL signatures.
 - Enable the backup timer explicitly, copy verified archives off-host, and test staged recovery regularly.
+- Keep MCP disabled until its dedicated Keycloak audience, scopes, HTTPS proxy, and Host allowlist are configured.
 - Verify `/opt/auth/scripts/fix-perms.sh` after deploy.
 - Verify `/home/auth/.ssh/id_rsa.pub` is installed for required remote users.
 - Alert in the SIEM on VIP, sudo/root, break-glass, denied policy, and unusual source-IP events.

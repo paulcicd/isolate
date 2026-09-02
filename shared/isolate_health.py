@@ -26,6 +26,7 @@ def validate_config(config, check_paths=False):
     keycloak = section("keycloak")
     logging_cfg = section("logging")
     dashboard = section("dashboard")
+    mcp = section("mcp")
     backup = section("backup")
 
     try:
@@ -88,6 +89,44 @@ def validate_config(config, check_paths=False):
             errors.append("dashboard secret key file does not exist: {}".format(secret_path or "<unset>"))
         if not dashboard.get("admin_groups"):
             warnings.append("dashboard is enabled without dashboard.admin_groups")
+
+    if mcp.get("enabled"):
+        mcp_issuer = mcp.get("issuer") or keycloak.get("issuer")
+        if not mcp_issuer:
+            errors.append("mcp.issuer or keycloak.issuer is required when MCP is enabled")
+        elif not re.match(r"^https://", str(mcp_issuer), re.I):
+            warnings.append("MCP issuer does not use HTTPS")
+        public_url = str(mcp.get("public_url") or "")
+        if not public_url:
+            errors.append("mcp.public_url is required when MCP is enabled")
+        elif not re.match(r"^https://", public_url, re.I) and not re.match(r"^http://(127\.0\.0\.1|localhost|\[::1\])", public_url, re.I):
+            errors.append("mcp.public_url must use HTTPS outside localhost")
+        if not mcp.get("expected_audience"):
+            errors.append("mcp.expected_audience is required when MCP is enabled")
+        if not mcp.get("required_scopes") or not isinstance(mcp.get("required_scopes"), list):
+            errors.append("mcp.required_scopes must be a non-empty list")
+        if not mcp.get("self_service_scope"):
+            errors.append("mcp.self_service_scope is required when MCP is enabled")
+        if not mcp.get("approval_scope"):
+            errors.append("mcp.approval_scope is required when MCP is enabled")
+        if not isinstance(mcp.get("prevent_self_approval", True), bool):
+            errors.append("mcp.prevent_self_approval must be a boolean")
+        if not isinstance(mcp.get("require_mutation_confirmation", True), bool):
+            errors.append("mcp.require_mutation_confirmation must be a boolean")
+        if not isinstance(mcp.get("allowed_hosts"), list) or not mcp.get("allowed_hosts"):
+            errors.append("mcp.allowed_hosts must be a non-empty list")
+        if not isinstance(mcp.get("allowed_origins"), list):
+            errors.append("mcp.allowed_origins must be a list")
+        try:
+            if not 1 <= int(mcp.get("listen_port", 8090)) <= 65535:
+                errors.append("mcp.listen_port must be between 1 and 65535")
+        except (TypeError, ValueError):
+            errors.append("mcp.listen_port must be an integer")
+        try:
+            if int(mcp.get("max_results", 100)) < 1:
+                errors.append("mcp.max_results must be greater than zero")
+        except (TypeError, ValueError):
+            errors.append("mcp.max_results must be an integer")
 
     try:
         if int(backup.get("retention_count", 14)) < 1:

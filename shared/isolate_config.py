@@ -102,6 +102,27 @@ DEFAULT_CONFIG = {
         "admin_groups": [],
         "refresh_seconds": 15,
     },
+    "mcp": {
+        "enabled": False,
+        "listen_host": "127.0.0.1",
+        "listen_port": 8090,
+        "public_url": "http://127.0.0.1:8090/mcp",
+        "issuer": None,
+        "expected_audience": "isolate-mcp",
+        "jwks_uri": None,
+        "jwks_cache_path": "/opt/auth/cache/keycloak_mcp_jwks.json",
+        "jwks_cache_ttl": 3600,
+        "tls_verify": True,
+        "required_scopes": ["isolate.read"],
+        "self_service_scope": "isolate.self-service",
+        "approval_scope": "isolate.approve",
+        "prevent_self_approval": True,
+        "require_mutation_confirmation": True,
+        "allowed_hosts": ["127.0.0.1:*", "localhost:*", "[::1]:*"],
+        "allowed_origins": ["http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"],
+        "max_results": 100,
+        "max_request_body_size": 1048576,
+    },
     "notifications": {
         "enabled": False,
         "timeout_seconds": 5,
@@ -202,6 +223,8 @@ def load_config(path=None):
             {"path": "/etc/systemd/system/isolate-log-retention.timer", "required": False},
             {"path": "/etc/systemd/system/isolate-backup.service", "required": False},
             {"path": "/etc/systemd/system/isolate-backup.timer", "required": False},
+            {"path": "/etc/systemd/system/isolate-mcp.service", "required": False},
+            {"path": "/etc/default/isolate-mcp", "required": False},
         ]
     return config
 

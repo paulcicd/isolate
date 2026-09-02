@@ -123,6 +123,9 @@ def get_access_request(redis, request_id):
 def list_access_requests(redis, status=None, user=None, project=None, ticket=None):
     records = []
     for key in redis.keys("access_request_*"):
+        decoded_key = decode(key)
+        if re.match(r"^access_request_[0-9]+$", decoded_key) is None:
+            continue
         record = json.loads(decode(redis.get(key)))
         if status and record.get("status") != status:
             continue

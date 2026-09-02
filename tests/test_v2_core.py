@@ -41,6 +41,7 @@ from isolate_access import (
     comment_access_request,
     create_access_request,
     deny_access_request,
+    get_access_request,
     is_access_admin,
     list_access_requests,
     parse_duration,
@@ -56,6 +57,21 @@ from isolate_health import run_health_checks, validate_config
 from isolate_policy_bundle import PolicyBundleError, apply_bundle, export_bundle, plan_bundle, validate_bundle
 from isolate_redis import redis_options
 from isolate_retention import expired_session_dirs
+from isolate_mcp import (
+    IsolateMCPService,
+    KeycloakMCPTokenVerifier,
+    MCPAccessDenied,
+    create_mcp_server,
+    token_scopes,
+)
+
+
+def has_mcp_v2():
+    try:
+        from mcp.server import MCPServer  # noqa: F401
+        return True
+    except ImportError:
+        return False
 
 
 class FakeRedis(object):
@@ -69,8 +85,13 @@ class FakeRedis(object):
     def get(self, key):
         return self.store.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return False
         self.store[key] = value
+        if ex is not None:
+            self.ttls[key] = int(ex) * 1000
+        return True
 
     def delete(self, key):
         if key in self.store:
@@ -275,6 +296,435 @@ class ServiceBackupTest(unittest.TestCase):
                 if name.endswith(".tar.gz")
             ]
             self.assertEqual(len(archives), 2)
+
+
+class MCPServiceTest(unittest.TestCase):
+    def _config(self, log_path):
+        return {
+            "keycloak": {"issuer": "https://id.example.org/realms/demo", "client_id": "isolate-bastion"},
+            "mcp": {
+                "enabled": True,
+                "public_url": "https://mcp.example.org/mcp",
+                "expected_audience": "isolate-mcp",
+                "required_scopes": ["isolate.read"],
+                "self_service_scope": "isolate.self-service",
+                "approval_scope": "isolate.approve",
+                "prevent_self_approval": True,
+                "require_mutation_confirmation": True,
+                "allowed_hosts": ["mcp.example.org"],
+                "allowed_origins": [],
+                "max_results": 100,
+            },
+            "ssh": {"default_sudo_mode": "none"},
+            "policy": {"fallback_remote_user": None},
+            "logging": {
+                "base_path": log_path,
+                "sinks": [],
+                "fail_closed": False,
+                "integrity": {"enabled": False},
+            },
+            "history": {"default_limit": 10, "max_limit": 100},
+            "notifications": {"enabled": False, "sinks": []},
+            "access": {
+                "admin_groups": ["Demo-Security"],
+                "default_ttl": "2h",
+                "max_ttl": "24h",
+                "ticket_required": False,
+                "request_templates": {},
+            },
+        }
+
+    def _redis(self):
+        redis = FakeRedis()
+        redis.set("server_1", json.dumps({
+            "server_id": 1,
+            "project_name": "payments-prod",
+            "server_name": "api-1",
+            "server_ip": "10.0.0.1",
+            "server_user": "support",
+        }))
+        redis.set("server_2", json.dumps({
+            "server_id": 2,
+            "project_name": "secret-prod",
+            "server_name": "db-1",
+            "server_ip": "10.0.0.2",
+            "server_user": "dba",
+        }))
+        redis.set("project_set_payments", json.dumps({
+            "schema_version": 2,
+            "name": "payments",
+            "projects": ["payments-prod"],
+            "project_globs": [],
+        }))
+        redis.set("grant_1", json.dumps({
+            "schema_version": 2,
+            "subject": "group",
+            "name": "Demo-DevOps",
+            "project_set": "payments",
+            "remote_user": "support",
+            "sudo_mode": "none",
+            "allowed_actions": ["ssh"],
+        }))
+        redis.set("offset_grant_id", "1")
+        return redis
+
+    def _identity(self):
+        return {
+            "username": "demo.alex",
+            "email": "demo.alex@example.org",
+            "keycloak_sub": "sub-1",
+            "groups": ["Demo-DevOps"],
+            "roles": [],
+        }
+
+    def _admin_identity(self):
+        return {
+            "username": "demo.admin",
+            "email": "demo.admin@example.org",
+            "keycloak_sub": "sub-admin",
+            "groups": ["Demo-Security"],
+            "roles": [],
+        }
+
+    def test_inventory_and_host_get_follow_existing_grants(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-") as logs:
+            service = IsolateMCPService(self._config(logs), self._redis())
+            result = service.inventory_search(self._identity())
+            self.assertEqual([host["server_id"] for host in result["hosts"]], ["1"])
+            self.assertEqual(service.inventory_projects(self._identity())["projects"], ["payments-prod"])
+            self.assertEqual(service.host_get(self._identity(), "1")["server_name"], "api-1")
+            with self.assertRaises(MCPAccessDenied):
+                service.host_get(self._identity(), "2")
+
+    def test_grant_explain_and_pending_access_request(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-") as logs:
+            redis = self._redis()
+            service = IsolateMCPService(self._config(logs), redis)
+            explained = service.grant_explain(self._identity(), host_id="1")
+            self.assertTrue(explained["allowed"])
+            self.assertEqual(explained["remote_user"], "support")
+            denied = service.grant_explain(self._identity(), host_id="2")
+            self.assertFalse(denied["allowed"])
+
+            created = service.access_request_create(
+                self._identity(),
+                project="secret-prod",
+                host="2",
+                remote_user="dba",
+                sudo_mode="none",
+                reason="INC-1001 diagnostics",
+                ticket="INC-1001",
+            )
+            self.assertEqual(created["request"]["status"], "pending")
+            self.assertEqual(json.loads(redis.get("access_request_1"))["requester"], "demo.alex")
+            self.assertIsNone(redis.get("grant_2"))
+
+    def test_history_is_scoped_to_authenticated_user(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-history-") as logs:
+            session_dir = os.path.join(logs, "demo.alex", "session-1")
+            other_dir = os.path.join(logs, "demo.bailey", "session-2")
+            os.makedirs(session_dir)
+            os.makedirs(other_dir)
+            own = {"event": "ssh_start", "ts": 10, "username": "demo.alex", "project": "payments-prod", "host_id": "1", "target_host": "10.0.0.1", "remote_user": "support"}
+            other = {"event": "ssh_start", "ts": 20, "username": "demo.bailey", "project": "secret-prod", "host_id": "2", "target_host": "10.0.0.2", "remote_user": "dba"}
+            with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as session_f:
+                session_f.write(json.dumps(own) + "\n")
+            with open(os.path.join(other_dir, "session.jsonl"), "w", encoding="utf-8") as session_f:
+                session_f.write(json.dumps(other) + "\n")
+            service = IsolateMCPService(self._config(logs), self._redis())
+            rows = service.history_search(self._identity())["connections"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["username"], "demo.alex")
+
+    def test_access_request_visibility_requires_scope_and_admin_group(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-access-") as logs:
+            redis = self._redis()
+            own = create_access_request(redis, self._identity(), project="payments-prod", host="1", reason="own")
+            other_identity = {"username": "demo.bailey", "keycloak_sub": "sub-2", "groups": []}
+            other = create_access_request(redis, other_identity, project="secret-prod", host="2", reason="other")
+            service = IsolateMCPService(self._config(logs), redis)
+
+            own_list = service.access_request_list(
+                self._identity(),
+                ["isolate.read", "isolate.self-service"],
+            )
+            self.assertEqual([row["id"] for row in own_list["requests"]], [own["id"]])
+            self.assertFalse(own_list["admin_view"])
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_show(self._identity(), ["isolate.read", "isolate.self-service"], other["id"])
+
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_list(
+                    self._admin_identity(),
+                    ["isolate.read"],
+                    user="demo.bailey",
+                )
+
+            admin_list = service.access_request_list(
+                self._admin_identity(),
+                ["isolate.read", "isolate.approve"],
+            )
+            self.assertEqual({row["id"] for row in admin_list["requests"]}, {own["id"], other["id"]})
+            self.assertTrue(admin_list["admin_view"])
+            self.assertEqual(
+                service.access_request_show(self._admin_identity(), ["isolate.approve"], other["id"])["request"]["requester"],
+                "demo.bailey",
+            )
+
+            redis.set("access_request_lock_999", "transient", ex=30)
+            locked_list = service.access_request_list(
+                self._admin_identity(),
+                ["isolate.read", "isolate.approve"],
+            )
+            self.assertEqual({row["id"] for row in locked_list["requests"]}, {own["id"], other["id"]})
+
+    def test_access_request_comment_is_attributed_and_scoped(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-access-") as logs:
+            redis = self._redis()
+            request_record = create_access_request(redis, self._identity(), project="payments-prod", host="1", reason="review")
+            service = IsolateMCPService(self._config(logs), redis)
+
+            result = service.access_request_comment(
+                self._identity(),
+                ["isolate.self-service"],
+                request_record["id"],
+                "Additional context",
+            )
+            comment = result["request"]["comments"][0]
+            self.assertEqual(comment["username"], "demo.alex")
+            self.assertEqual(comment["text"], "Additional context")
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_comment(
+                    {"username": "demo.bailey", "groups": []},
+                    ["isolate.self-service"],
+                    request_record["id"],
+                    "not allowed",
+                )
+
+    def test_access_approval_requires_two_factors_confirmation_and_no_self_approval(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-access-") as logs:
+            redis = self._redis()
+            requester = {"username": "demo.bailey", "keycloak_sub": "sub-2", "groups": ["Demo-Security"]}
+            request_record = create_access_request(
+                redis,
+                requester,
+                project="secret-prod",
+                host="2",
+                remote_user="dba",
+                sudo_mode="none",
+                reason="INC-2001",
+            )
+            service = IsolateMCPService(self._config(logs), redis)
+
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_approve(
+                    self._admin_identity(), ["isolate.approve"], request_record["id"], confirm=False
+                )
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_approve(
+                    self._admin_identity(), ["isolate.read"], request_record["id"], confirm=True
+                )
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_approve(
+                    requester, ["isolate.approve"], request_record["id"], confirm=True
+                )
+            with self.assertRaises(AccessDenied):
+                service.access_request_approve(
+                    self._admin_identity(), ["isolate.approve"], request_record["id"], ttl="25h", confirm=True
+                )
+
+            approved = service.access_request_approve(
+                self._admin_identity(),
+                ["isolate.approve"],
+                request_record["id"],
+                ttl="2h",
+                comment="Approved for incident window",
+                confirm=True,
+            )
+            self.assertEqual(approved["request"]["status"], "approved")
+            self.assertEqual(approved["request"]["decided_by"], "demo.admin")
+            self.assertEqual(approved["grant"]["remote_user"], "dba")
+            self.assertTrue(approved["grant"]["temporary"])
+            self.assertEqual(json.loads(redis.get("grant_2"))["request_id"], request_record["id"])
+            with self.assertRaises(AccessDenied):
+                service.access_request_approve(
+                    self._admin_identity(), ["isolate.approve"], request_record["id"], confirm=True
+                )
+
+    def test_access_deny_requires_confirmation_and_records_reason(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-access-") as logs:
+            redis = self._redis()
+            requester = {"username": "demo.bailey", "keycloak_sub": "sub-2", "groups": []}
+            request_record = create_access_request(redis, requester, project="secret-prod", host="2", reason="request")
+            service = IsolateMCPService(self._config(logs), redis)
+
+            with self.assertRaises(MCPAccessDenied):
+                service.access_request_deny(
+                    self._admin_identity(), ["isolate.approve"], request_record["id"], reason="No change", confirm=False
+                )
+            denied = service.access_request_deny(
+                self._admin_identity(),
+                ["isolate.approve"],
+                request_record["id"],
+                reason="Use staging",
+                comment="Production access is unnecessary",
+                confirm=True,
+            )
+            self.assertEqual(denied["request"]["status"], "denied")
+            self.assertEqual(denied["request"]["decision_reason"], "Use staging")
+            self.assertEqual(denied["request"]["comments"][0]["action"], "deny")
+
+    def test_access_decision_lock_rejects_concurrent_mcp_mutation(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-access-") as logs:
+            redis = self._redis()
+            requester = {"username": "demo.bailey", "keycloak_sub": "sub-2", "groups": []}
+            request_record = create_access_request(
+                redis,
+                requester,
+                project="secret-prod",
+                host="2",
+                remote_user="dba",
+                reason="request",
+            )
+            redis.set("access_request_lock_{}".format(request_record["id"]), "another-worker", ex=30)
+            service = IsolateMCPService(self._config(logs), redis)
+            with self.assertRaisesRegex(AccessDenied, "already in progress"):
+                service.access_request_approve(
+                    self._admin_identity(),
+                    ["isolate.approve"],
+                    request_record["id"],
+                    confirm=True,
+                )
+            self.assertEqual(get_access_request(redis, request_record["id"])["status"], "pending")
+            self.assertIsNone(redis.get("grant_2"))
+
+    def test_mcp_operations_emit_redacted_audit_records(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-audit-") as root:
+            config = self._config(os.path.join(root, "logs"))
+            audit_path = os.path.join(root, "audit.jsonl")
+            config["logging"]["sinks"] = [{"type": "jsonl", "path": audit_path}]
+            service = IsolateMCPService(config, self._redis())
+            service.inventory_search(self._identity(), query="api")
+            with open(audit_path, "r", encoding="utf-8") as audit_f:
+                record = json.loads(audit_f.readline())
+            self.assertEqual(record["event"], "mcp_tool_call")
+            self.assertEqual(record["tool"], "inventory_search")
+            self.assertEqual(record["username"], "demo.alex")
+            self.assertNotIn("token", record)
+            self.assertNotIn("query", record)
+
+    def test_token_scopes_and_strict_mcp_audience(self):
+        self.assertEqual(token_scopes({"scope": "openid isolate.read isolate.read"}), ["isolate.read", "openid"])
+        config = self._config("unused")
+        verifier = KeycloakMCPTokenVerifier(config)
+        claims = {
+            "sub": "sub-1",
+            "azp": "desktop-client",
+            "aud": ["isolate-mcp"],
+            "exp": 2000000000,
+            "scope": "isolate.read isolate.self-service",
+        }
+        with mock.patch("isolate_mcp.verify_jwt_claims", return_value=claims):
+            data = verifier.verified_token_data("signed-token")
+        self.assertEqual(data["subject"], "sub-1")
+        self.assertIn("isolate.read", data["scopes"])
+        claims["aud"] = ["another-api"]
+        claims["azp"] = "isolate-mcp"
+        with mock.patch("isolate_mcp.verify_jwt_claims", return_value=claims):
+            self.assertIsNone(verifier.verified_token_data("wrong-audience"))
+
+    def test_mcp_config_validation_fails_closed(self):
+        config = self._config("unused")
+        self.assertTrue(validate_config(config)["valid"])
+        config["mcp"]["expected_audience"] = None
+        self.assertFalse(validate_config(config)["valid"])
+        config["mcp"]["expected_audience"] = "isolate-mcp"
+        config["mcp"]["public_url"] = "http://mcp.example.org/mcp"
+        self.assertFalse(validate_config(config)["valid"])
+
+    @unittest.skipUnless(has_mcp_v2(), "MCP SDK v2 is not installed")
+    def test_official_sdk_server_registers_phase_two_surface(self):
+        from mcp.server.transport_security import TransportSecuritySettings
+        from starlette.testclient import TestClient
+
+        with tempfile.TemporaryDirectory(prefix="isolate-mcp-sdk-") as logs:
+            server = create_mcp_server(self._config(logs), self._redis())
+            app = server.streamable_http_app(
+                stateless_http=True,
+                json_response=True,
+                transport_security=TransportSecuritySettings(
+                    allowed_hosts=["testserver"],
+                    allowed_origins=[],
+                ),
+            )
+            paths = {getattr(route, "path", None) for route in app.routes}
+            self.assertIn("/mcp", paths)
+            self.assertIn("/health", paths)
+            self.assertIn("/.well-known/oauth-protected-resource/mcp", paths)
+            with TestClient(app) as client:
+                self.assertEqual(client.get("/health").status_code, 200)
+                response = client.post("/mcp", json={})
+                claims = {
+                    "iss": "https://id.example.org/realms/demo",
+                    "sub": "sub-1",
+                    "preferred_username": "demo.alex",
+                    "groups": ["Demo-DevOps"],
+                    "aud": ["isolate-mcp"],
+                    "azp": "test-client",
+                    "scope": "isolate.read isolate.self-service",
+                    "exp": 2000000000,
+                }
+                meta = {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientCapabilities": {},
+                    "io.modelcontextprotocol/clientInfo": {"name": "test", "version": "1"},
+                }
+                payload = {
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "inventory_search", "arguments": {}, "_meta": meta},
+                }
+                list_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 3,
+                    "method": "tools/list",
+                    "params": {"_meta": meta},
+                }
+                with mock.patch("isolate_mcp.verify_jwt_claims", return_value=claims):
+                    authorized = client.post(
+                        "/mcp",
+                        json=payload,
+                        headers={
+                            "Authorization": "Bearer signed-token",
+                            "MCP-Protocol-Version": "2026-07-28",
+                            "Mcp-Method": "tools/call",
+                            "Mcp-Name": "inventory_search",
+                        },
+                    )
+                    listed = client.post(
+                        "/mcp",
+                        json=list_payload,
+                        headers={
+                            "Authorization": "Bearer signed-token",
+                            "MCP-Protocol-Version": "2026-07-28",
+                            "Mcp-Method": "tools/list",
+                        },
+                    )
+            self.assertEqual(response.status_code, 401)
+            self.assertIn("resource_metadata=", response.headers.get("www-authenticate", ""))
+            self.assertEqual(authorized.status_code, 200)
+            hosts = authorized.json()["result"]["structuredContent"]["hosts"]
+            self.assertEqual([host["server_id"] for host in hosts], ["1"])
+            self.assertEqual(listed.status_code, 200)
+            tool_names = {tool["name"] for tool in listed.json()["result"]["tools"]}
+            self.assertTrue({
+                "access_request_list",
+                "access_request_show",
+                "access_request_comment",
+                "access_request_approve",
+                "access_request_deny",
+            }.issubset(tool_names))
 
     def test_log_retention_selects_only_expired_session_directories(self):
         tmpdir = os.path.join(ROOT, ".tmp-retention-{}".format(uuid.uuid4().hex))
