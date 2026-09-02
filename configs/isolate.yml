@@ -5,7 +5,14 @@ redis:
   host: 127.0.0.1
   port: 6379
   db: 0
+  username: null
   password: null
+  ssl: false
+  ssl_ca_certs: null
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_check_hostname: true
+  socket_timeout: 3
 
 keycloak:
   issuer: null
@@ -40,8 +47,67 @@ logging:
   base_path: /opt/auth/logs
   jsonl_name: session.jsonl
   sink: local
+  fail_closed: false
+  retention_days: 90
+  sinks: []
+  integrity:
+    enabled: false
+    key_file: /opt/auth/keys/audit_hmac.key
+    key_id: isolate-audit-v1
 
 policy:
   default_allowed_actions:
     - ssh
   fallback_remote_user: null
+
+policy_as_code:
+  bundle_path: /opt/auth/configs/policy.yml
+  backup_dir: /opt/auth/backups
+  require_confirmation: true
+
+backup:
+  base_path: /opt/auth/backups/service
+  retention_count: 14
+  include_logs: false
+  owner: auth
+  group: auth
+  # Optional Redis credential override for backup/restore jobs. A dedicated
+  # ACL user can be granted DUMP/PTTL for create and RESTORE for recovery.
+  redis: {}
+  redis_patterns:
+    - server_*
+    - grant_*
+    - policy_*
+    - project_set_*
+    - access_request_*
+    - active_session_*
+    - ssh_config_*
+    - complete_hosts_*
+    - offset_*
+    - projects_list
+    - schema_version
+  paths:
+    - path: /opt/auth/configs
+      required: true
+    - path: /opt/auth/keys
+      required: true
+    - path: /opt/auth/known_hosts
+      required: true
+    - path: /home/auth/.ssh
+      required: false
+    - path: /etc/isolate
+      required: false
+    - path: /etc/sudoers.d/isolate
+      required: false
+    - path: /etc/default/isolate-dashboard
+      required: false
+    - path: /etc/systemd/system/isolate-dashboard.service
+      required: false
+    - path: /etc/systemd/system/isolate-log-retention.service
+      required: false
+    - path: /etc/systemd/system/isolate-log-retention.timer
+      required: false
+    - path: /etc/systemd/system/isolate-backup.service
+      required: false
+    - path: /etc/systemd/system/isolate-backup.timer
+      required: false

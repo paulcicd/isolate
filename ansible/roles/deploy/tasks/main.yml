@@ -33,6 +33,85 @@
   become: yes
   become_user: root
 
+- name: Installing Isolate systemd units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.service", dest: "/etc/systemd/system/isolate-dashboard.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-log-retention.service", dest: "/etc/systemd/system/isolate-log-retention.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-log-retention.timer", dest: "/etc/systemd/system/isolate-log-retention.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
+    - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
+  when: isolate_install_runtime_units | bool
+
+- name: Installing Isolate backup systemd units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.service", dest: "/etc/systemd/system/isolate-backup.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
+  when:
+    - isolate_enable_backup_timer | bool
+    - not (isolate_install_runtime_units | bool)
+
+- name: Checking Isolate dashboard secret...
+  stat:
+    path: "{{ deploy_path }}/keys/dashboard_secret"
+  register: isolate_dashboard_secret
+  when: isolate_install_runtime_units | bool
+
+- name: Generating Isolate dashboard secret...
+  command: openssl rand -hex 32
+  register: isolate_dashboard_secret_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_install_runtime_units | bool
+    - not (isolate_dashboard_secret.stat.exists | default(false))
+
+- name: Installing Isolate dashboard secret...
+  copy:
+    content: "{{ isolate_dashboard_secret_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/dashboard_secret"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_install_runtime_units | bool
+    - not (isolate_dashboard_secret.stat.exists | default(false))
+
+- name: Enabling Isolate runtime services...
+  systemd:
+    name: "{{ item }}"
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  loop:
+    - isolate-dashboard.service
+    - isolate-log-retention.timer
+  when: isolate_install_runtime_units | bool
+
+- name: Enabling Isolate backup timer...
+  systemd:
+    name: isolate-backup.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_backup_timer | bool
+
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"
   register: pub_key

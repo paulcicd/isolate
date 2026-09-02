@@ -32,6 +32,7 @@ All examples in this document use fictional users, groups, domains, projects, an
 - Lightweight Flask admin dashboard.
 - Safer SSH argv construction through `subprocess` arguments.
 - Permission repair workflow for Git deploys.
+- Verifiable service backups for configuration, credentials, host keys, and Redis state.
 
 ## Concepts
 
@@ -346,7 +347,14 @@ redis:
   host: 127.0.0.1
   port: 6379
   db: 0
+  username: null
   password: CHANGE_ME_STRONG_PASSWORD
+  ssl: false
+  ssl_ca_certs: null
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_check_hostname: true
+  socket_timeout: 3
 
 keycloak:
   issuer: https://keycloak.example.org/realms/demo-infra
@@ -385,6 +393,13 @@ logging:
   base_path: /opt/auth/logs
   jsonl_name: session.jsonl
   sink: local
+  fail_closed: false
+  retention_days: 90
+  sinks: []
+  integrity:
+    enabled: false
+    key_file: /opt/auth/keys/audit_hmac.key
+    key_id: isolate-audit-v1
 
 history:
   admin_groups:
@@ -454,6 +469,11 @@ policy:
   default_allowed_actions:
     - ssh
   fallback_remote_user: null
+
+policy_as_code:
+  bundle_path: /opt/auth/configs/policy.yml
+  backup_dir: /opt/auth/backups
+  require_confirmation: true
 ```
 
 ### Environment Overrides
@@ -467,6 +487,10 @@ export ISOLATE_REDIS_HOST=127.0.0.1
 export ISOLATE_REDIS_PORT=6379
 export ISOLATE_REDIS_DB=0
 export ISOLATE_REDIS_PASS='CHANGE_ME_STRONG_PASSWORD'
+# Optional when Redis ACL/TLS is configured:
+# export ISOLATE_REDIS_USER='isolate'
+# export ISOLATE_REDIS_SSL=true
+# export ISOLATE_REDIS_CA_CERT='/etc/isolate/redis-ca.pem'
 export ISOLATE_KEYCLOAK_ISSUER='https://keycloak.example.org/realms/demo-infra'
 export ISOLATE_KEYCLOAK_CLIENT_ID='isolate-bastion'
 export ISOLATE_KEYCLOAK_CLIENT_SECRET='CHANGE_ME_CLIENT_SECRET'
@@ -1567,6 +1591,341 @@ Access approval from the dashboard supports:
 
 Dashboard POST actions use a per-session CSRF token.
 
+## Production Operations
+
+The hardening features in this section are opt-in. Existing installations continue to use the local Redis connection, Flask development command, and per-session JSONL logs until the corresponding settings or units are enabled.
+
+### Validate Configuration And Health
+
+Validate the merged configuration without contacting external services:
+
+```bash
+sudo -u auth /opt/auth/shared/isolate.py config validate
+```
+
+Also validate runtime files such as the dashboard secret and audit signing key:
+
+```bash
+sudo -u auth /opt/auth/shared/isolate.py config validate --check-paths
+```
+
+Check Redis connectivity and log directory write access:
+
+```bash
+sudo -u auth /opt/auth/shared/isolate.py health
+sudo -u auth /opt/auth/shared/isolate.py health --json
+```
+
+The dashboard exposes an unauthenticated, minimal `GET /health` endpoint for a load balancer or monitoring system. It returns `200` when configuration, Redis, and logging checks pass, otherwise `503`. It does not return credentials or tokens.
+
+### Run Dashboard With Systemd And Gunicorn
+
+Install the production Python dependencies and generate the Flask session secret:
+
+```bash
+python3 -m pip install -r /opt/auth/requirements.txt --break-system-packages
+sudo install -d -o auth -g auth -m 0700 /opt/auth/keys
+openssl rand -hex 32 | sudo tee /opt/auth/keys/dashboard_secret >/dev/null
+sudo chown auth:auth /opt/auth/keys/dashboard_secret
+sudo chmod 0600 /opt/auth/keys/dashboard_secret
+```
+
+Install the supplied systemd units and logrotate policy:
+
+```bash
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-dashboard.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-dashboard.env /etc/default/isolate-dashboard
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-log-retention.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-log-retention.timer /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/logrotate/isolate /etc/logrotate.d/isolate
+sudo systemctl daemon-reload
+sudo systemctl enable --now isolate-dashboard.service isolate-log-retention.timer
+```
+
+The service listens on `127.0.0.1:8080` by default. Change `ISOLATE_DASHBOARD_BIND` in `/etc/default/isolate-dashboard` when required. Put nginx or another trusted reverse proxy in front of Gunicorn; an example is available at `/opt/auth/deploy/nginx/isolate-dashboard.conf`.
+
+Ansible keeps runtime unit installation disabled for existing deployments. Enable it explicitly:
+
+```bash
+ansible-playbook -i ansible/hosts.ini ansible/main.yml -e isolate_install_runtime_units=true
+```
+
+### Log Retention
+
+`logging.retention_days` controls how long complete per-session directories are retained. Preview deletion first:
+
+```bash
+sudo -u auth python3 /opt/auth/scripts/prune-logs.py
+```
+
+Apply it manually:
+
+```bash
+sudo -u auth python3 /opt/auth/scripts/prune-logs.py --apply
+```
+
+The supplied systemd timer runs the apply mode daily. Legacy raw `.log/.meta` files and the central audit spool are rotated separately by logrotate.
+
+### Service Backup And Recovery
+
+Service backups are opt-in and do not change the existing `s`, `g`, login, dashboard, or Redis workflows. A backup contains:
+
+- configured runtime paths such as `/opt/auth/configs`, `/opt/auth/keys`, and `/opt/auth/known_hosts`;
+- optional `/home/auth/.ssh`, sudoers, dashboard environment, and systemd units when present;
+- a logical Redis snapshot limited to the configured Isolate key patterns;
+- `manifest.json` with source paths, modes, timestamps, file hashes, Redis metadata, and the current Git revision;
+- an archive SHA-256 sidecar.
+
+Session JSONL and raw terminal logs are excluded by default because they may be large and should normally have their own retention and off-host archival policy. Include them only when required:
+
+```bash
+sudo /opt/auth/shared/isolate.py backup create --include-logs
+```
+
+Create, list, and verify a normal service backup:
+
+```bash
+sudo /opt/auth/shared/isolate.py backup create
+sudo /opt/auth/shared/isolate.py backup list
+sudo /opt/auth/shared/isolate.py backup verify \
+  --archive /opt/auth/backups/service/isolate-backup-20260902T021500000000Z.tar.gz
+```
+
+The default destination is `/opt/auth/backups/service`, retention is 14 archives, and files are normalized to mode `0600`. Configure both in `/opt/auth/configs/isolate.yml`:
+
+```yaml
+backup:
+  base_path: /opt/auth/backups/service
+  retention_count: 14
+  include_logs: false
+  redis_patterns:
+    - server_*
+    - grant_*
+    - policy_*
+    - project_set_*
+    - access_request_*
+    - active_session_*
+    - ssh_config_*
+    - complete_hosts_*
+    - offset_*
+    - projects_list
+    - schema_version
+  paths:
+    - path: /opt/auth/configs
+      required: true
+    - path: /opt/auth/keys
+      required: true
+    - path: /opt/auth/known_hosts
+      required: true
+    - path: /home/auth/.ssh
+      required: false
+    - path: /etc/isolate
+      required: false
+```
+
+Restore into a staging root first. The original absolute paths are recreated underneath that directory, so this command does not overwrite the running bastion:
+
+```bash
+sudo /opt/auth/shared/isolate.py backup restore \
+  --archive /opt/auth/backups/service/isolate-backup-20260902T021500000000Z.tar.gz \
+  --target-root /srv/isolate-restore-test \
+  --restore-redis \
+  --redis-conflict abort \
+  --yes
+```
+
+Review the staged files and use a disposable Redis database or container for a recovery drill. Redis conflict modes are:
+
+- `abort`: default; restore nothing when a target key already exists;
+- `skip`: keep existing keys and restore only missing keys;
+- `replace`: replace matching keys with backup values.
+
+Live filesystem recovery is deliberately harder and should be performed during a maintenance window after stopping the dashboard and interactive access:
+
+```bash
+sudo systemctl stop isolate-dashboard.service
+sudo /opt/auth/shared/isolate.py backup verify --archive /secure/path/isolate-backup.tar.gz
+sudo /opt/auth/shared/isolate.py backup restore \
+  --archive /secure/path/isolate-backup.tar.gz \
+  --target-root / \
+  --restore-redis \
+  --redis-conflict replace \
+  --preserve-owner \
+  --live \
+  --yes
+sudo bash /opt/auth/scripts/fix-perms.sh
+sudo systemctl start isolate-dashboard.service
+```
+
+The daily systemd timer is disabled for existing Ansible deployments. Enable it explicitly:
+
+```bash
+ansible-playbook -i ansible/hosts.ini ansible/main.yml -e isolate_enable_backup_timer=true
+systemctl status isolate-backup.timer
+journalctl -u isolate-backup.service
+```
+
+For a Redis ACL deployment, `backup.redis` can override only the backup job credentials while inheriting host, port, database, and TLS settings from `redis`:
+
+```yaml
+backup:
+  redis:
+    username: isolate-backup
+    password: CHANGE_ME_BACKUP_PASSWORD
+```
+
+Creating a backup needs `KEYS`, `DUMP`, `PTTL`, and preferably `EVAL`; recovery additionally needs `EXISTS`, `RESTORE`, `MULTI`, and `EXEC`. Keep `RESTORE` out of the normal runtime ACL and grant it only to a controlled recovery credential when possible.
+
+Backups contain secrets and private SSH keys. A local archive is not disaster recovery: ship successful, verified archives to encrypted off-host object storage with versioning/immutability, restrict access, and regularly perform a staged restore drill. SHA-256 checks detect corruption but do not protect against a malicious party replacing both an archive and its checksum.
+
+Run the real-Redis recovery test from the repository root:
+
+```bash
+docker compose -f tests/integration/backup/docker-compose.yml up --build --abort-on-container-exit --exit-code-from backup-test
+docker compose -f tests/integration/backup/docker-compose.yml down -v
+```
+
+### Redis ACL And TLS
+
+Existing password-only Redis configuration remains compatible. For a hardened remote or shared Redis, configure an ACL user limited to Isolate key prefixes and commands, then set:
+
+```yaml
+redis:
+  host: redis.internal.example.org
+  port: 6380
+  db: 0
+  username: isolate
+  password: CHANGE_ME_STRONG_PASSWORD
+  ssl: true
+  ssl_ca_certs: /etc/isolate/redis-ca.pem
+  ssl_certfile: null
+  ssl_keyfile: null
+  ssl_check_hostname: true
+  socket_timeout: 3
+```
+
+A representative Redis ACL is:
+
+```text
+user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
+```
+
+Test ACL/TLS with `isolate health` before disabling the old Redis user. Client certificate fields are optional and are only needed for mutual TLS.
+
+## Policy As Code
+
+Policy bundles provide a reviewable YAML/JSON representation of `grant_*` and `project_set_*`. Legacy `policy_*` records remain readable by runtime compatibility code but are not modified by policy bundle apply.
+
+Export the current production state before creating a Git-managed bundle:
+
+```bash
+sudo -u auth isolate policy export --output /opt/auth/configs/policy.yml
+```
+
+Example bundle:
+
+```yaml
+schema_version: 2
+project_sets:
+  - schema_version: 2
+    name: production
+    projects:
+      - payments-prod
+      - reporting-prod
+    project_globs:
+      - "poker-*-prod"
+grants:
+  - schema_version: 2
+    subject: group
+    name: Demo-Support
+    project_set: production
+    remote_user: support
+    sudo_mode: none
+    allowed_actions:
+      - ssh
+```
+
+Validate selectors, project-set references, required remote users, duplicate IDs, and conflicting rules:
+
+```bash
+isolate policy validate --file /opt/auth/configs/policy.yml
+```
+
+Compare the file with Redis without changing anything:
+
+```bash
+isolate policy diff --file /opt/auth/configs/policy.yml
+isolate policy apply --file /opt/auth/configs/policy.yml --dry-run
+```
+
+Apply reviewed additions and updates:
+
+```bash
+sudo -u auth isolate policy apply --file /opt/auth/configs/policy.yml --yes
+```
+
+Apply the file as the complete source of truth and remove Redis grants/project sets absent from it:
+
+```bash
+sudo -u auth isolate policy apply --file /opt/auth/configs/policy.yml --prune --yes
+```
+
+`--prune` is never implicit. Before a real change, Isolate writes a private backup to `/opt/auth/backups/policy-<timestamp>.yml`. Existing IDs are preserved when an exported bundle is edited, and a matching natural selector updates the existing rule instead of creating a duplicate.
+
+## Central Audit Pipeline
+
+Per-session `/opt/auth/logs/<user>/<session_id>/session.jsonl` remains the local source for dashboard history and replay metadata. The safest complete feed is Vector/Filebeat tailing these files directly with read-only access. Central runtime sinks are an additional best-effort path and are disabled by default.
+
+An optional low-latency runtime sink is an append-only local spool:
+
+```yaml
+logging:
+  base_path: /opt/auth/logs
+  fail_closed: false
+  retention_days: 90
+  sinks:
+    - type: jsonl
+      path: /opt/auth/spool/audit.jsonl
+```
+
+Runtime processes that can write the spool append their structured events there. Vector or Filebeat should also tail the per-session JSONL glob so events written by individual bastion users are not missed, then ship asynchronously to OpenSearch, ClickHouse, S3, or a SIEM. Starter configurations covering both paths are available in `/opt/auth/deploy/vector/isolate.toml.example` and `/opt/auth/deploy/filebeat/isolate.yml.example`.
+
+Syslog is also supported:
+
+```yaml
+logging:
+  sinks:
+    - type: syslog
+      address: /dev/log
+      facility: authpriv
+```
+
+For tamper detection on events emitted by the auth-owned runtime, enable per-event HMAC signatures. Keep the key owner-only; interactive users must not be able to read it:
+
+```bash
+openssl rand -hex 32 | sudo tee /opt/auth/keys/audit_hmac.key >/dev/null
+sudo chown auth:auth /opt/auth/keys/audit_hmac.key
+sudo chmod 0600 /opt/auth/keys/audit_hmac.key
+```
+
+```yaml
+logging:
+  integrity:
+    enabled: true
+    key_file: /opt/auth/keys/audit_hmac.key
+    key_id: isolate-audit-v1
+```
+
+Verify a signed JSONL file:
+
+```bash
+sudo -u auth isolate audit verify --path /opt/auth/spool/audit.jsonl
+```
+
+HMAC protects signed event contents but is not a substitute for immutable remote retention. Events written directly by individual Unix users cannot use an auth-owner-only signing key; ship per-session JSONL promptly to a write-once or access-controlled destination and treat the signed auth-owned spool as the higher-trust feed.
+
+Keep `logging.fail_closed: false` for interactive SSH. A temporary syslog/spool failure then cannot block `s` or `g`; local session JSONL continues to be written. Alerting on VIP access, root/sudo, command events, unusual source IPs, and ticket-less break-glass requests should be configured in the downstream SIEM.
+
 ## Security Model
 
 ### Deny By Default
@@ -2006,6 +2365,7 @@ keys active_session_*
 
 ## Production Checklist
 
+- Run `isolate config validate --check-paths` and `isolate health`.
 - Configure Keycloak Device Authorization Grant for CLI.
 - Configure Keycloak Authorization Code callback for dashboard.
 - Ensure `groups` claim is present in tokens.
@@ -2019,6 +2379,14 @@ keys active_session_*
 - Verify deny-by-default behavior.
 - Verify break-glass request and approval flow.
 - Verify dashboard 403 for non-admin users.
+- Run the dashboard through Gunicorn/systemd behind HTTPS, not Flask's development server.
+- Keep Redis local or enable an ACL user and verified TLS before exposing it over the network.
+- Export the current policy bundle, commit it for review, and test `policy diff`/`apply --dry-run`.
+- Use `--prune` only after reviewing the complete policy bundle and automatic backup location.
+- Configure session retention and verify the prune script in dry-run mode.
+- Enable the local audit spool and asynchronous Vector/Filebeat shipping when central search is required.
+- Store the audit HMAC key as `auth:auth 0600` and periodically verify shipped JSONL signatures.
+- Enable the backup timer explicitly, copy verified archives off-host, and test staged recovery regularly.
 - Verify `/opt/auth/scripts/fix-perms.sh` after deploy.
 - Verify `/home/auth/.ssh/id_rsa.pub` is installed for required remote users.
-- Ship `/opt/auth/logs/*/session.jsonl` to the central logging stack if needed.
+- Alert in the SIEM on VIP, sudo/root, break-glass, denied policy, and unusual source-IP events.

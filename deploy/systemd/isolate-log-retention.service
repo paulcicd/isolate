@@ -1,0 +1,15 @@
+[Unit]
+Description=Prune expired Isolate session logs
+
+[Service]
+Type=oneshot
+User=auth
+Group=auth
+ExecStart=/usr/bin/python3 /opt/auth/scripts/prune-logs.py --apply
+Nice=10
+IOSchedulingClass=idle
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/auth/logs

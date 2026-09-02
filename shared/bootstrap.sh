@@ -41,8 +41,23 @@ add-support-user-helper () {
     echo "";
 }
 
+isolate-redis-cli () {
+    local redis_args=();
+    if [ -n "${ISOLATE_REDIS_HOST:-}" ]; then redis_args+=(--host "${ISOLATE_REDIS_HOST}"); fi
+    if [ -n "${ISOLATE_REDIS_PORT:-}" ]; then redis_args+=(--port "${ISOLATE_REDIS_PORT}"); fi
+    if [ -n "${ISOLATE_REDIS_DB:-}" ]; then redis_args+=(--db "${ISOLATE_REDIS_DB}"); fi
+    if [ -n "${ISOLATE_REDIS_USER:-}" ]; then redis_args+=(--user "${ISOLATE_REDIS_USER}"); fi
+    case "${ISOLATE_REDIS_SSL:-false}" in 1|true|yes|on) redis_args+=(--tls) ;; esac
+    if [ -n "${ISOLATE_REDIS_CA_CERT:-}" ]; then redis_args+=(--cacert "${ISOLATE_REDIS_CA_CERT}"); fi
+    if [ -n "${ISOLATE_REDIS_PASS:-}" ]; then
+        REDISCLI_AUTH="${ISOLATE_REDIS_PASS}" command redis-cli "${redis_args[@]}" "${@}";
+    else
+        command redis-cli "${redis_args[@]}" "${@}";
+    fi
+}
+
 redis-dev () {
-    redis-cli -a "${ISOLATE_REDIS_PASS}" "${@}";
+    isolate-redis-cli "${@}";
 }
 
 isolate () {

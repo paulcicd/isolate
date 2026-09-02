@@ -6,6 +6,7 @@ import json
 import os
 import time
 
+from isolate_audit import prepare_and_dispatch
 from isolate_replay import find_session
 
 
@@ -57,6 +58,7 @@ def append_command_event(base_path, connection_id, command, cwd=None, exit_code=
         "shell": shell or "unknown",
         "source": source or "target-shell-hook",
     }
+    record = prepare_and_dispatch(record, (config or {}).get("logging", {}))
     with open(details["session_path"], "a", encoding="utf-8") as session_f:
         session_f.write(json.dumps(record, sort_keys=True) + "\n")
     if os.name == "posix":

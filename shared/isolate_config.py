@@ -23,7 +23,14 @@ DEFAULT_CONFIG = {
         "host": "127.0.0.1",
         "port": 6379,
         "db": 0,
+        "username": None,
         "password": None,
+        "ssl": False,
+        "ssl_ca_certs": None,
+        "ssl_certfile": None,
+        "ssl_keyfile": None,
+        "ssl_check_hostname": True,
+        "socket_timeout": 3,
     },
     "keycloak": {
         "issuer": None,
@@ -55,6 +62,14 @@ DEFAULT_CONFIG = {
         "base_path": "/opt/auth/logs",
         "jsonl_name": "session.jsonl",
         "sink": "local",
+        "fail_closed": False,
+        "retention_days": 90,
+        "sinks": [],
+        "integrity": {
+            "enabled": False,
+            "key_file": "/opt/auth/keys/audit_hmac.key",
+            "key_id": "isolate-audit-v1",
+        },
     },
     "history": {
         "admin_groups": [],
@@ -96,6 +111,33 @@ DEFAULT_CONFIG = {
     "policy": {
         "default_allowed_actions": ["ssh"],
         "fallback_remote_user": None,
+    },
+    "policy_as_code": {
+        "bundle_path": "/opt/auth/configs/policy.yml",
+        "backup_dir": "/opt/auth/backups",
+        "require_confirmation": True,
+    },
+    "backup": {
+        "base_path": None,
+        "retention_count": 14,
+        "include_logs": False,
+        "owner": "auth",
+        "group": "auth",
+        "redis": {},
+        "redis_patterns": [
+            "server_*",
+            "grant_*",
+            "policy_*",
+            "project_set_*",
+            "access_request_*",
+            "active_session_*",
+            "ssh_config_*",
+            "complete_hosts_*",
+            "offset_*",
+            "projects_list",
+            "schema_version",
+        ],
+        "paths": None,
     },
 }
 
@@ -144,6 +186,23 @@ def load_config(path=None):
     config["logging"]["base_path"] = config["logging"].get("base_path") or os.path.join(
         data_root, "logs"
     )
+    backup = config.setdefault("backup", {})
+    backup["base_path"] = backup.get("base_path") or os.path.join(data_root, "backups", "service")
+    if backup.get("paths") is None:
+        backup["paths"] = [
+            {"path": os.path.join(data_root, "configs"), "required": True},
+            {"path": os.path.join(data_root, "keys"), "required": True},
+            {"path": os.path.join(data_root, "known_hosts"), "required": True},
+            {"path": "/home/auth/.ssh", "required": False},
+            {"path": "/etc/isolate", "required": False},
+            {"path": "/etc/sudoers.d/isolate", "required": False},
+            {"path": "/etc/default/isolate-dashboard", "required": False},
+            {"path": "/etc/systemd/system/isolate-dashboard.service", "required": False},
+            {"path": "/etc/systemd/system/isolate-log-retention.service", "required": False},
+            {"path": "/etc/systemd/system/isolate-log-retention.timer", "required": False},
+            {"path": "/etc/systemd/system/isolate-backup.service", "required": False},
+            {"path": "/etc/systemd/system/isolate-backup.timer", "required": False},
+        ]
     return config
 
 
@@ -159,8 +218,18 @@ def _env_overrides():
         redis["port"] = int(os.getenv("ISOLATE_REDIS_PORT"))
     if os.getenv("ISOLATE_REDIS_DB"):
         redis["db"] = int(os.getenv("ISOLATE_REDIS_DB"))
+    if os.getenv("ISOLATE_REDIS_USER"):
+        redis["username"] = os.getenv("ISOLATE_REDIS_USER")
     if os.getenv("ISOLATE_REDIS_PASS"):
         redis["password"] = os.getenv("ISOLATE_REDIS_PASS")
+    if os.getenv("ISOLATE_REDIS_SSL"):
+        redis["ssl"] = os.getenv("ISOLATE_REDIS_SSL").strip().lower() in ("1", "true", "yes", "on")
+    if os.getenv("ISOLATE_REDIS_CA_CERT"):
+        redis["ssl_ca_certs"] = os.getenv("ISOLATE_REDIS_CA_CERT")
+    if os.getenv("ISOLATE_REDIS_CLIENT_CERT"):
+        redis["ssl_certfile"] = os.getenv("ISOLATE_REDIS_CLIENT_CERT")
+    if os.getenv("ISOLATE_REDIS_CLIENT_KEY"):
+        redis["ssl_keyfile"] = os.getenv("ISOLATE_REDIS_CLIENT_KEY")
     if redis:
         overrides["redis"] = redis
 

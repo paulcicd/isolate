@@ -11,6 +11,7 @@ from isolate import list_grant_records, load_project_sets, redis_client
 from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, set_notification_status
 from isolate_config import load_config
 from isolate_history import read_history
+from isolate_health import run_health_checks
 from isolate_identity import decode_jwt_payload, normalize_claims
 from isolate_inventory import list_hosts
 from isolate_notifications import NotificationError, notify_access_event
@@ -81,7 +82,7 @@ def _table(rows, columns):
 
 def create_app(config=None):
     from authlib.integrations.flask_client import OAuth
-    from flask import Flask, abort, redirect, render_template_string, request, send_file, session, url_for
+    from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
 
     config = config or load_config()
     app = Flask(__name__)
@@ -132,6 +133,18 @@ def create_app(config=None):
         if result.get("errors"):
             return {"level": "warning", "text": "Action completed with notification warning: {}".format("; ".join(result["errors"]))}
         return None
+
+    @app.route("/health")
+    def health():
+        result = run_health_checks(config)
+        public_result = {
+            "ok": result["ok"],
+            "status": result["status"],
+            "checks": {name: {"ok": bool(check.get("ok"))} for name, check in result["checks"].items()},
+        }
+        response = jsonify(public_result)
+        response.status_code = 200 if result["ok"] else 503
+        return response
 
     def status_filter_links(current):
         statuses = [("all", None), ("pending", "pending"), ("approved", "approved"), ("denied", "denied")]

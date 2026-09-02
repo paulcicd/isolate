@@ -5,6 +5,8 @@ import uuid
 import unittest
 import fnmatch
 import json
+import tarfile
+import tempfile
 from contextlib import redirect_stderr, redirect_stdout
 from types import SimpleNamespace
 from io import BytesIO, StringIO
@@ -48,11 +50,18 @@ from isolate import list_grant_records, load_project_sets, update_grant_record
 from isolate_sessions import list_active_sessions, mark_session_end, mark_session_start
 from isolate_web import is_dashboard_admin
 from isolate_notifications import NotificationError, build_access_notification, notify_access_event
+from isolate_audit import classify_audit_record, prepare_and_dispatch, verify_audit_record, verify_jsonl_file
+from isolate_backup import BackupError, create_backup, restore_backup, restore_redis_snapshot, verify_backup
+from isolate_health import run_health_checks, validate_config
+from isolate_policy_bundle import PolicyBundleError, apply_bundle, export_bundle, plan_bundle, validate_bundle
+from isolate_redis import redis_options
+from isolate_retention import expired_session_dirs
 
 
 class FakeRedis(object):
     def __init__(self):
         self.store = {}
+        self.ttls = {}
 
     def keys(self, pattern):
         return [key for key in self.store if fnmatch.fnmatchcase(key, pattern)]
@@ -69,6 +78,33 @@ class FakeRedis(object):
             return 1
         return 0
 
+    def dump(self, key):
+        value = self.store.get(self._key(key))
+        if value is None:
+            return None
+        if isinstance(value, bytes):
+            return value
+        return str(value).encode("utf-8")
+
+    def pttl(self, key):
+        return self.ttls.get(self._key(key), -1)
+
+    def exists(self, key):
+        return self._key(key) in self.store
+
+    def restore(self, key, ttl, payload, replace=False):
+        key = self._key(key)
+        if key in self.store and not replace:
+            raise RuntimeError("BUSYKEY")
+        self.store[key] = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+        if ttl:
+            self.ttls[key] = int(ttl)
+        return True
+
+    @staticmethod
+    def _key(key):
+        return key.decode("utf-8") if isinstance(key, bytes) else key
+
     def incr(self, key):
         value = int(self.store.get(key, 0)) + 1
         self.store[key] = str(value)
@@ -76,6 +112,283 @@ class FakeRedis(object):
 
     def expire(self, key, ttl):
         return True
+
+    def ping(self):
+        return True
+
+
+class ProductionHardeningTest(unittest.TestCase):
+    def test_redis_options_preserve_plain_defaults_and_support_acl_tls(self):
+        plain = redis_options({"redis": {"host": "127.0.0.1", "port": 6379, "db": 0}})
+        self.assertNotIn("ssl", plain)
+        self.assertNotIn("username", plain)
+
+        secure = redis_options({"redis": {
+            "host": "redis.example.org",
+            "port": 6380,
+            "db": 2,
+            "username": "isolate",
+            "password": "secret",
+            "ssl": True,
+            "ssl_ca_certs": "/etc/isolate/redis-ca.pem",
+        }})
+        self.assertTrue(secure["ssl"])
+        self.assertEqual(secure["username"], "isolate")
+        self.assertEqual(secure["ssl_ca_certs"], "/etc/isolate/redis-ca.pem")
+
+    def test_config_validation_and_health(self):
+        tmpdir = os.path.join(ROOT, ".tmp-health-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        try:
+            config = {
+                "redis": {"host": "127.0.0.1", "port": 6379},
+                "keycloak": {"issuer": "https://id.example.org/realms/demo", "client_id": "isolate"},
+                "logging": {"base_path": tmpdir, "retention_days": 30, "sinks": []},
+                "dashboard": {"enabled": False},
+            }
+            self.assertTrue(validate_config(config)["valid"])
+            health = run_health_checks(config, redis_factory=lambda cfg: FakeRedis())
+            self.assertTrue(health["ok"])
+
+            config["logging"]["sinks"] = [{"type": "unknown"}]
+            self.assertFalse(validate_config(config)["valid"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class ServiceBackupTest(unittest.TestCase):
+    def _config(self, root):
+        configs = os.path.join(root, "runtime", "configs")
+        keys = os.path.join(root, "runtime", "keys")
+        os.makedirs(configs)
+        os.makedirs(keys)
+        with open(os.path.join(configs, "isolate.yml"), "w", encoding="utf-8") as config_f:
+            config_f.write("schema_version: 2\nsecret: test-only\n")
+        with open(os.path.join(keys, "id_rsa"), "w", encoding="utf-8") as key_f:
+            key_f.write("TEST PRIVATE KEY\n")
+        return {
+            "data_root": os.path.join(root, "runtime"),
+            "logging": {"base_path": os.path.join(root, "runtime", "logs")},
+            "backup": {
+                "base_path": os.path.join(root, "backups"),
+                "retention_count": 2,
+                "include_logs": False,
+                "redis_patterns": ["server_*", "grant_*", "projects_list"],
+                "paths": [
+                    {"path": configs, "required": True},
+                    {"path": keys, "required": True},
+                    {"path": os.path.join(root, "optional"), "required": False},
+                ],
+            },
+        }
+
+    def test_backup_verify_and_staged_restore_round_trip(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-backup-") as root:
+            config = self._config(root)
+            source_redis = FakeRedis()
+            source_redis.set("server_10001", '{"server_id": 10001}')
+            source_redis.set("grant_1", '{"remote_user": "support"}')
+            source_redis.set("unrelated", "must-not-be-backed-up")
+
+            created = create_backup(config, source_redis)
+            self.assertTrue(os.path.isfile(created["archive"]))
+            self.assertEqual(created["redis_key_count"], 2)
+            self.assertFalse(created["redis_consistent"])
+            verified = verify_backup(created["archive"])
+            self.assertTrue(verified["valid"], verified["errors"])
+            self.assertTrue(verified["sidecar_verified"])
+
+            with tarfile.open(created["archive"], "r:gz") as archive:
+                snapshot = json.load(archive.extractfile("redis.json"))
+            self.assertEqual({record["key"] for record in snapshot["records"]}, {"server_10001", "grant_1"})
+
+            restored_redis = FakeRedis()
+            target_root = os.path.join(root, "restore")
+            result = restore_backup(
+                created["archive"],
+                target_root,
+                redis=restored_redis,
+                restore_redis=True,
+                confirmed=True,
+            )
+            self.assertEqual(result["redis"]["restored"], 2)
+            self.assertEqual(restored_redis.get("server_10001"), '{"server_id": 10001}')
+            self.assertIsNone(restored_redis.get("unrelated"))
+            restored_configs = []
+            for current_root, _, filenames in os.walk(target_root):
+                if "isolate.yml" in filenames:
+                    restored_configs.append(os.path.join(current_root, "isolate.yml"))
+            self.assertEqual(len(restored_configs), 1)
+            with open(restored_configs[0], "r", encoding="utf-8") as restored_f:
+                self.assertIn("secret: test-only", restored_f.read())
+
+            with self.assertRaises(BackupError):
+                restore_backup(created["archive"], target_root, confirmed=False)
+            with self.assertRaises(BackupError):
+                restore_backup(
+                    created["archive"],
+                    os.path.join(root, "restore-conflict"),
+                    redis=restored_redis,
+                    restore_files=False,
+                    restore_redis=True,
+                    confirmed=True,
+                )
+
+            with open(created["archive"] + ".sha256", "w", encoding="ascii") as checksum_f:
+                checksum_f.write("{}  backup.tar.gz\n".format("0" * 64))
+            tampered = verify_backup(created["archive"])
+            self.assertFalse(tampered["valid"])
+            self.assertIn("archive checksum sidecar mismatch", tampered["errors"])
+
+    def test_redis_restore_skips_expired_and_supports_replace(self):
+        redis = FakeRedis()
+        redis.set("server_1", "old")
+        snapshot = {
+            "records": [
+                {
+                    "key": "server_1",
+                    "key_b64": "c2VydmVyXzE=",
+                    "dump_b64": "bmV3",
+                    "expire_at_ms": None,
+                },
+                {
+                    "key": "active_session_old",
+                    "key_b64": "YWN0aXZlX3Nlc3Npb25fb2xk",
+                    "dump_b64": "ZXhwaXJlZA==",
+                    "expire_at_ms": 999,
+                },
+            ],
+        }
+        result = restore_redis_snapshot(redis, snapshot, conflict="replace", now_ms=1000)
+        self.assertEqual(redis.get("server_1"), "new")
+        self.assertEqual(result["expired_skipped"], ["active_session_old"])
+
+    def test_backup_retention_keeps_configured_archive_count(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-backup-retention-") as root:
+            config = self._config(root)
+            redis = FakeRedis()
+            redis.set("server_1", "one")
+            for _ in range(3):
+                create_backup(config, redis)
+            archives = [
+                name for name in os.listdir(config["backup"]["base_path"])
+                if name.endswith(".tar.gz")
+            ]
+            self.assertEqual(len(archives), 2)
+
+    def test_log_retention_selects_only_expired_session_directories(self):
+        tmpdir = os.path.join(ROOT, ".tmp-retention-{}".format(uuid.uuid4().hex))
+        old_dir = os.path.join(tmpdir, "alice", "old-session")
+        new_dir = os.path.join(tmpdir, "alice", "new-session")
+        os.makedirs(old_dir)
+        os.makedirs(new_dir)
+        old_log = os.path.join(old_dir, "session.jsonl")
+        new_log = os.path.join(new_dir, "session.jsonl")
+        now = 2_000_000_000
+        try:
+            for path in (old_log, new_log):
+                with open(path, "w", encoding="utf-8") as log_f:
+                    log_f.write("{}\n")
+            old_time = now - (91 * 86400)
+            new_time = now - (2 * 86400)
+            os.utime(old_log, (old_time, old_time))
+            os.utime(old_dir, (old_time, old_time))
+            os.utime(new_log, (new_time, new_time))
+            os.utime(new_dir, (new_time, new_time))
+            self.assertEqual(expired_session_dirs(tmpdir, 90, now=now), [os.path.realpath(old_dir)])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class PolicyAsCodeTest(unittest.TestCase):
+    def _current_redis(self):
+        redis = FakeRedis()
+        redis.set("offset_grant_id", "2")
+        redis.set("project_set_prod", json.dumps({
+            "schema_version": 2,
+            "name": "prod",
+            "projects": ["payments-prod"],
+            "project_globs": [],
+        }))
+        redis.set("grant_1", json.dumps({
+            "schema_version": 2,
+            "subject": "group",
+            "name": "Support",
+            "project_set": "prod",
+            "remote_user": "support",
+            "sudo_mode": "none",
+            "allowed_actions": ["ssh"],
+        }))
+        redis.set("grant_2", json.dumps({
+            "schema_version": 2,
+            "subject": "group",
+            "name": "Legacy",
+            "project": "legacy",
+            "remote_user": "support",
+            "sudo_mode": "none",
+            "allowed_actions": ["ssh"],
+        }))
+        return redis
+
+    def test_bundle_diff_apply_and_explicit_prune(self):
+        redis = self._current_redis()
+        bundle = export_bundle(redis)
+        bundle["grants"] = [dict(bundle["grants"][0], remote_user="l2-support")]
+        validation = validate_bundle(bundle)
+        self.assertTrue(validation["valid"])
+
+        no_prune = plan_bundle(redis, bundle, prune=False)
+        self.assertEqual(len(no_prune["grant_update"]), 1)
+        self.assertEqual(no_prune["grant_remove"], [])
+        apply_bundle(redis, bundle, prune=False)
+        self.assertEqual(json.loads(redis.get("grant_1"))["remote_user"], "l2-support")
+        self.assertIsNotNone(redis.get("grant_2"))
+
+        prune = apply_bundle(redis, bundle, prune=True)
+        self.assertEqual(len(prune["grant_remove"]), 1)
+        self.assertIsNone(redis.get("grant_2"))
+
+    def test_bundle_rejects_conflicting_selectors(self):
+        base = {
+            "subject": "group", "name": "Support", "project": "prod",
+            "remote_user": "support", "allowed_actions": ["ssh"],
+        }
+        bundle = {"schema_version": 2, "project_sets": [], "grants": [base, dict(base, remote_user="root")]}
+        validation = validate_bundle(bundle)
+        self.assertFalse(validation["valid"])
+        with self.assertRaises(PolicyBundleError):
+            plan_bundle(FakeRedis(), bundle)
+
+
+class CentralAuditTest(unittest.TestCase):
+    def test_risk_tags_cover_privileged_vip_and_denied_events(self):
+        record = classify_audit_record({
+            "event": "policy_denied",
+            "remote_user": "root",
+            "server_vip": True,
+        })
+        self.assertEqual(record["risk_tags"], ["denied", "privileged", "vip"])
+
+    def test_signed_jsonl_sink_and_tamper_detection(self):
+        tmpdir = os.path.join(ROOT, ".tmp-audit-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        key_path = os.path.join(tmpdir, "audit.key")
+        spool_path = os.path.join(tmpdir, "audit.jsonl")
+        try:
+            with open(key_path, "wb") as key_f:
+                key_f.write(b"test-signing-key")
+            config = {
+                "integrity": {"enabled": True, "key_file": key_path, "key_id": "test"},
+                "sinks": [{"type": "jsonl", "path": spool_path}],
+                "fail_closed": True,
+            }
+            record = prepare_and_dispatch({"event": "ssh_start", "username": "alice"}, config)
+            self.assertTrue(verify_audit_record(record, b"test-signing-key"))
+            self.assertTrue(verify_jsonl_file(spool_path, key_path)["valid"])
+            record["username"] = "mallory"
+            self.assertFalse(verify_audit_record(record, b"test-signing-key"))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class PolicyResolverTest(unittest.TestCase):
@@ -644,6 +957,27 @@ class SessionLoggerTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_best_effort_sink_failure_keeps_local_session_log(self):
+        tmpdir = os.path.join(ROOT, ".tmp-session-sink-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        blocked_parent = os.path.join(tmpdir, "not-a-directory")
+        try:
+            with open(blocked_parent, "w", encoding="utf-8") as blocked_f:
+                blocked_f.write("blocked")
+            logger = SessionLogger(
+                tmpdir,
+                {"username": "alice", "groups": [], "session_id": "session-sink"},
+                logging_config={
+                    "fail_closed": False,
+                    "sinks": [{"type": "jsonl", "path": os.path.join(blocked_parent, "audit.jsonl")}],
+                },
+            )
+            logger.event("ssh_start", project="prod")
+            with open(logger.jsonl_path, "r", encoding="utf-8") as session_f:
+                self.assertIn("ssh_start", session_f.read())
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class HistoryTest(unittest.TestCase):
     def _write_session(self, base, user, session_id, events):
@@ -849,6 +1183,20 @@ class DashboardTest(unittest.TestCase):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
         self.assertTrue(is_dashboard_admin({"groups": ["DevOps"]}, config))
         self.assertFalse(is_dashboard_admin({"groups": ["DBA"]}, config))
+
+    def test_health_endpoint_does_not_require_login(self):
+        try:
+            app = isolate_web.create_app({
+                "dashboard": {"admin_groups": ["DevOps"], "public_url": "https://bastion.example.org"},
+                "keycloak": {"issuer": "https://id.example.org/realms/demo", "client_id": "isolate"},
+                "logging": {"base_path": "/tmp/isolate"},
+            })
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        with mock.patch.object(isolate_web, "run_health_checks", return_value={"ok": True, "status": "ok", "checks": {}}):
+            response = app.test_client().get("/health")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["status"], "ok")
 
     def test_access_page_renders_actions_csrf_and_refresh(self):
         try:

@@ -3,6 +3,7 @@
 """Isolate v2 administrative CLI."""
 
 import argparse
+import datetime
 import json
 import os
 import sys
@@ -20,6 +21,8 @@ from isolate_access import (
     repeat_access_request,
     set_notification_status,
 )
+from isolate_audit import AuditSinkError, verify_jsonl_file
+from isolate_backup import BackupError, create_backup, list_backups, restore_backup, verify_backup
 from isolate_command_audit import CommandAuditError, append_command_event
 from isolate_config import load_config
 from isolate_identity import (
@@ -37,18 +40,219 @@ from isolate_history import HistoryAccessDenied, format_history_table, read_hist
 from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, update_host
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
+from isolate_health import run_health_checks, validate_config
+from isolate_policy_bundle import (
+    PolicyBundleError,
+    apply_bundle,
+    change_count,
+    dump_bundle,
+    export_bundle,
+    load_bundle,
+    plan_bundle,
+    validate_bundle,
+)
+from isolate_redis import create_redis_client
 
 
 def redis_client(config):
-    from redis import Redis
+    return create_redis_client(config)
 
-    redis_cfg = config["redis"]
-    return Redis(
-        host=redis_cfg["host"],
-        port=int(redis_cfg["port"]),
-        password=redis_cfg.get("password"),
-        db=int(redis_cfg["db"]),
-    )
+
+def backup_redis_client(config):
+    backup_redis = (config.get("backup", {}) or {}).get("redis", {}) or {}
+    if not backup_redis:
+        return redis_client(config)
+    backup_config = dict(config)
+    redis_config = dict(config.get("redis", {}) or {})
+    redis_config.update(backup_redis)
+    backup_config["redis"] = redis_config
+    return create_redis_client(backup_config)
+
+
+def _write_private_file(path, content):
+    parent = os.path.dirname(os.path.abspath(path))
+    if parent and not os.path.isdir(parent):
+        os.makedirs(parent, mode=0o750, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as output_f:
+        output_f.write(content)
+    if os.name == "posix":
+        os.chmod(path, 0o640)
+
+
+def cmd_config_validate(args, config):
+    result = validate_config(config, check_paths=args.check_paths)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("Configuration: {}".format("valid" if result["valid"] else "invalid"))
+        for warning in result["warnings"]:
+            print("warning: {}".format(warning))
+        for error in result["errors"]:
+            print("error: {}".format(error), file=sys.stderr)
+    return 0 if result["valid"] else 2
+
+
+def cmd_health(args, config):
+    result = run_health_checks(config)
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+    else:
+        print("Isolate health: {}".format(result["status"]))
+        for name, check in result["checks"].items():
+            print("{:<10} {}{}".format(name, "ok" if check.get("ok") else "failed", ": {}".format(check.get("error")) if check.get("error") else ""))
+    return 0 if result["ok"] else 2
+
+
+def cmd_audit_verify(args, config):
+    integrity = config.get("logging", {}).get("integrity") or {}
+    key_file = args.key_file or integrity.get("key_file")
+    if not key_file:
+        print("audit verification failed: integrity key file is not configured", file=sys.stderr)
+        return 2
+    try:
+        result = verify_jsonl_file(args.path, key_file)
+    except (OSError, ValueError, AuditSinkError) as exc:
+        print("audit verification failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_backup_create(args, config):
+    try:
+        result = create_backup(
+            config,
+            backup_redis_client(config),
+            output_path=args.output,
+            include_logs=args.include_logs,
+        )
+    except Exception as exc:
+        print("backup create failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_backup_list(args, config):
+    try:
+        rows = list_backups(config)
+    except (OSError, ValueError, BackupError) as exc:
+        print("backup list failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("created_at                 size       files  redis  archive")
+    for row in rows:
+        print("{:<26} {:<10} {:<6} {:<6} {}".format(
+            str(row.get("created_at") or "error"),
+            str(row.get("size") or ""),
+            str(row.get("file_count") or ""),
+            str(row.get("redis_key_count") or ""),
+            row.get("archive"),
+        ))
+
+
+def cmd_backup_verify(args, config):
+    try:
+        result = verify_backup(args.archive)
+    except (OSError, ValueError, BackupError) as exc:
+        print("backup verify failed: {}".format(exc), file=sys.stderr)
+        return 2
+    display = dict(result)
+    display.pop("manifest", None)
+    print(json.dumps(display, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_backup_restore(args, config):
+    if not args.yes:
+        print("backup restore requires --yes", file=sys.stderr)
+        return 2
+    try:
+        result = restore_backup(
+            args.archive,
+            args.target_root,
+            redis=backup_redis_client(config) if args.restore_redis else None,
+            restore_files=not args.skip_files,
+            restore_redis=args.restore_redis,
+            redis_conflict=args.redis_conflict,
+            preserve_owner=args.preserve_owner,
+            confirmed=True,
+            live=args.live,
+        )
+    except Exception as exc:
+        print("backup restore failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _policy_bundle_from_args(args, config):
+    path = args.file or config.get("policy_as_code", {}).get("bundle_path")
+    if not path:
+        raise PolicyBundleError("policy bundle path is required")
+    return path, load_bundle(path)
+
+
+def cmd_policy_export(args, config):
+    bundle = export_bundle(redis_client(config))
+    rendered = dump_bundle(bundle, output_format=args.format)
+    if args.output == "-":
+        sys.stdout.write(rendered)
+    else:
+        _write_private_file(args.output, rendered)
+        print("Policy bundle exported: {}".format(args.output))
+
+
+def cmd_policy_validate(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        result = validate_bundle(bundle)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy validation failed: {}".format(exc), file=sys.stderr)
+        return 2
+    result["path"] = path
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if result["valid"] else 2
+
+
+def cmd_policy_diff(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        changes = plan_bundle(redis_client(config), bundle, prune=args.prune)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy diff failed: {}".format(exc), file=sys.stderr)
+        return 2
+    output = {"path": path, "prune": bool(args.prune), "change_count": change_count(changes), "changes": changes}
+    print(json.dumps(output, indent=2, sort_keys=True))
+
+
+def cmd_policy_apply(args, config):
+    policy_cfg = config.get("policy_as_code", {})
+    if policy_cfg.get("require_confirmation", True) and not args.dry_run and not args.yes:
+        print("policy apply requires --yes; use --dry-run to preview changes", file=sys.stderr)
+        return 2
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        redis = redis_client(config)
+        changes = plan_bundle(redis, bundle, prune=args.prune)
+        if not args.dry_run and change_count(changes):
+            backup_dir = policy_cfg.get("backup_dir") or os.path.join(config.get("data_root", "/opt/auth"), "backups")
+            stamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%S%fZ")
+            backup_path = os.path.join(backup_dir, "policy-{}.yml".format(stamp))
+            _write_private_file(backup_path, dump_bundle(export_bundle(redis), output_format="yaml"))
+        else:
+            backup_path = None
+        changes = apply_bundle(redis, bundle, prune=args.prune, dry_run=args.dry_run)
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy apply failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({
+        "applied": not args.dry_run,
+        "backup_path": backup_path,
+        "change_count": change_count(changes),
+        "changes": changes,
+        "source": path,
+    }, indent=2, sort_keys=True))
 
 
 def decode(value):
@@ -897,6 +1101,47 @@ def build_parser():
     logout = sub.add_parser("logout")
     logout.set_defaults(func=cmd_logout)
 
+    config_cmd = sub.add_parser("config")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+    config_validate = config_sub.add_parser("validate")
+    config_validate.add_argument("--check-paths", action="store_true")
+    config_validate.add_argument("--json", action="store_true")
+    config_validate.set_defaults(func=cmd_config_validate)
+
+    health = sub.add_parser("health")
+    health.add_argument("--json", action="store_true")
+    health.set_defaults(func=cmd_health)
+
+    audit = sub.add_parser("audit")
+    audit_sub = audit.add_subparsers(dest="audit_command", required=True)
+    audit_verify = audit_sub.add_parser("verify")
+    audit_verify.add_argument("--path", required=True)
+    audit_verify.add_argument("--key-file")
+    audit_verify.set_defaults(func=cmd_audit_verify)
+
+    backup = sub.add_parser("backup")
+    backup_sub = backup.add_subparsers(dest="backup_command", required=True)
+    backup_create = backup_sub.add_parser("create")
+    backup_create.add_argument("--output")
+    backup_create.add_argument("--include-logs", action="store_true", default=None)
+    backup_create.set_defaults(func=cmd_backup_create)
+    backup_list = backup_sub.add_parser("list")
+    backup_list.add_argument("--json", action="store_true")
+    backup_list.set_defaults(func=cmd_backup_list)
+    backup_verify = backup_sub.add_parser("verify")
+    backup_verify.add_argument("--archive", required=True)
+    backup_verify.set_defaults(func=cmd_backup_verify)
+    backup_restore = backup_sub.add_parser("restore")
+    backup_restore.add_argument("--archive", required=True)
+    backup_restore.add_argument("--target-root", required=True)
+    backup_restore.add_argument("--restore-redis", action="store_true")
+    backup_restore.add_argument("--skip-files", action="store_true")
+    backup_restore.add_argument("--redis-conflict", choices=["abort", "replace", "skip"], default="abort")
+    backup_restore.add_argument("--preserve-owner", action="store_true")
+    backup_restore.add_argument("--live", action="store_true")
+    backup_restore.add_argument("--yes", action="store_true")
+    backup_restore.set_defaults(func=cmd_backup_restore)
+
     policy = sub.add_parser("policy")
     policy_sub = policy.add_subparsers(dest="policy_command", required=True)
 
@@ -916,6 +1161,27 @@ def build_parser():
     test.add_argument("--project")
     test.add_argument("--host")
     test.set_defaults(func=cmd_policy_test)
+
+    policy_export = policy_sub.add_parser("export")
+    policy_export.add_argument("--output", default="-")
+    policy_export.add_argument("--format", choices=["yaml", "json"], default="yaml")
+    policy_export.set_defaults(func=cmd_policy_export)
+
+    policy_validate = policy_sub.add_parser("validate")
+    policy_validate.add_argument("--file")
+    policy_validate.set_defaults(func=cmd_policy_validate)
+
+    policy_diff = policy_sub.add_parser("diff")
+    policy_diff.add_argument("--file")
+    policy_diff.add_argument("--prune", action="store_true")
+    policy_diff.set_defaults(func=cmd_policy_diff)
+
+    policy_apply = policy_sub.add_parser("apply")
+    policy_apply.add_argument("--file")
+    policy_apply.add_argument("--prune", action="store_true")
+    policy_apply.add_argument("--dry-run", action="store_true")
+    policy_apply.add_argument("--yes", action="store_true")
+    policy_apply.set_defaults(func=cmd_policy_apply)
 
     project_set = sub.add_parser("project-set")
     project_set_sub = project_set.add_subparsers(dest="project_set_command", required=True)

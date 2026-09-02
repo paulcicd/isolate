@@ -1,0 +1,25 @@
+[Unit]
+Description=Isolate v2 admin dashboard
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+WorkingDirectory=/opt/auth/shared
+EnvironmentFile=-/etc/default/isolate-dashboard
+ExecStartPre=/usr/bin/python3 /opt/auth/shared/isolate.py config validate --check-paths
+ExecStart=/usr/local/bin/gunicorn --workers 2 --threads 4 --timeout 30 --bind ${ISOLATE_DASHBOARD_BIND} isolate_web:create_app()
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/auth/logs /opt/auth/cache /opt/auth/backups /opt/auth/spool
+
+[Install]
+WantedBy=multi-user.target

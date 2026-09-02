@@ -12,7 +12,6 @@ from uuid import uuid4
 import socket
 import re
 import shlex
-from redis import Redis
 from operator import itemgetter
 from pyzabbix import ZabbixAPI
 # from IsolateCore import __version__
@@ -127,13 +126,13 @@ class IsolateZabbixHosts(object):
 
 
 class IsolateRedisHosts(object):
-    def __init__(self):
+    def __init__(self, config=None):
         self.projects = list()
         self.hosts_dump = list()
-        self.redis = Redis(host=os.getenv('ISOLATE_REDIS_HOST', '127.0.0.1'),
-                           port=int(os.getenv('ISOLATE_REDIS_PORT', 6379)),
-                           password=os.getenv('ISOLATE_REDIS_PASS', None),
-                           db=int(os.getenv('ISOLATE_REDIS_DB', 0)))
+        if config is None:
+            config = load_config()
+        from isolate_redis import create_redis_client
+        self.redis = create_redis_client(config)
 
     def get_hosts(self):
         for server_key in self.redis.keys('server_*'):
@@ -396,6 +395,7 @@ class ServerConnection(object):
                 project=self.project_name,
                 host_id=self.server_id,
                 reason=str(exc),
+                server_vip=bool(host_meta.get('server_vip')),
                 privileged_access_provider=host_meta.get('privileged_access_provider'),
                 privileged_access_url=host_meta.get('privileged_access_url'),
             )
@@ -432,6 +432,7 @@ class ServerConnection(object):
             target_host=self.host,
             remote_user=self.user,
             connection_id=self.connection_id,
+            server_vip=bool((self.search_results[0] if len(self.search_results) == 1 else {}).get('server_vip')),
             policy=self.policy_decision,
         )
 
@@ -454,13 +455,17 @@ class AuthHelper(object):
         self.config = load_config()
         self._init_env_vars()
         self.identity = self._load_identity()
-        self.audit = SessionLogger(self.config["logging"]["base_path"], self.identity)
+        self.audit = SessionLogger(
+            self.config["logging"]["base_path"],
+            self.identity,
+            logging_config=self.config.get("logging", {}),
+        )
         self.audit.event("helper_start", argv=sys.argv)
         self.hosts_dump = []
         self.projects = []
 
         if self.ISOLATE_BACKEND == 'redis':
-            self.db = IsolateRedisHosts()
+            self.db = IsolateRedisHosts(self.config)
         elif self.ISOLATE_BACKEND == 'zabbix':
             self.db = IsolateZabbixHosts()
         else:

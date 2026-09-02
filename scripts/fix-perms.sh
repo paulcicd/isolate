@@ -22,7 +22,7 @@ if ! getent group auth >/dev/null 2>&1; then
 fi
 
 cd "${AUTH_DATA_ROOT}";
-mkdir -p keys logs cache
+mkdir -p keys logs cache backups backups/service spool
 
 chown -R auth:auth "${AUTH_DATA_ROOT}"
 
@@ -59,6 +59,14 @@ chmod 0700 "${AUTH_DATA_ROOT}/keys"
 # interactive bastion users; otherwise users could replace signing keys.
 chmod 0750 "${AUTH_DATA_ROOT}/cache"
 find "${AUTH_DATA_ROOT}/cache" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
+
+# Service backups contain configs, private keys, and Redis state.
+chmod 0700 "${AUTH_DATA_ROOT}/backups" "${AUTH_DATA_ROOT}/backups/service"
+find "${AUTH_DATA_ROOT}/backups" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0600
+
+# Central audit spool is readable by the auth group for shipping agents.
+chmod 0750 "${AUTH_DATA_ROOT}/spool"
+find "${AUTH_DATA_ROOT}/spool" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
 
 if [ -d "${AUTH_DATA_ROOT}/.githooks" ]; then
     chmod 0750 "${AUTH_DATA_ROOT}/.githooks"

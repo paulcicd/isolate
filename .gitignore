@@ -3,6 +3,9 @@
 ansible/develop-hosts.ini
 keys/*
 logs/*
+cache/*
+backups/*
+spool/*
 *~
 .DS_Store
 .idea/

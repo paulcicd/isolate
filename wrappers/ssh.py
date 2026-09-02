@@ -27,6 +27,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..',
 from isolate_config import load_config
 from isolate_identity import local_identity
 from isolate_logging import SessionLogger
+from isolate_redis import create_redis_client
 from isolate_sessions import mark_session_end, mark_session_start
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 
@@ -332,14 +333,7 @@ def _run_pty_command(argv, raw_log):
 
 
 def _redis_client(config):
-    from redis import Redis
-    redis_cfg = config["redis"]
-    return Redis(
-        host=redis_cfg["host"],
-        port=int(redis_cfg["port"]),
-        password=redis_cfg.get("password"),
-        db=int(redis_cfg["db"]),
-    )
+    return create_redis_client(config)
 
 
 def run_command(argv, raw_log_path, audit, metadata, config=None):
@@ -420,7 +414,12 @@ if __name__ == '__main__':
     identity = local_identity(args.human_user or local_sudo_user, [])
     identity["keycloak_sub"] = args.keycloak_sub
     connection_id = args.connection_id or host_meta["uuid"]
-    audit = SessionLogger(config["logging"]["base_path"], identity, session_id=connection_id)
+    audit = SessionLogger(
+        config["logging"]["base_path"],
+        identity,
+        session_id=connection_id,
+        logging_config=config.get("logging", {}),
+    )
     remote_command = None if host_meta['nosudo'] else 'sudo -i'
     proxy = None
     if args.proxy_host:

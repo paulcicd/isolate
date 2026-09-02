@@ -6,9 +6,10 @@ import re
 import json
 from time import time
 import argparse
-from redis import Redis
 import logging
 from IsolateCore import IsolateGeoIP, is_valid_ipv6_address, is_valid_ipv4_address, is_valid_fqdn
+from isolate_config import load_config
+from isolate_redis import create_redis_client
 
 
 LOGGER = logging.getLogger('auth-manager')
@@ -22,10 +23,7 @@ class AuthManager(object):
     def __init__(self, params):
         self.params = params
         self.action = self.params['action'][0]
-        self.redis = Redis(host=os.getenv('ISOLATE_REDIS_HOST', '127.0.0.1'),
-                           port=int(os.getenv('ISOLATE_REDIS_PORT', 6379)),
-                           password=os.getenv('ISOLATE_REDIS_PASS', None),
-                           db=int(os.getenv('ISOLATE_REDIS_DB', 0)))
+        self.redis = create_redis_client(load_config())
         self.validate_params()
         self.geoip = IsolateGeoIP()
 

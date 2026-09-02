@@ -1,0 +1,23 @@
+/opt/auth/spool/*.jsonl {
+    daily
+    rotate 30
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su auth auth
+    create 0640 auth auth
+}
+
+/opt/auth/logs/*/*.log /opt/auth/logs/*/*.meta /opt/auth/logs/*/*/*.log /opt/auth/logs/*/*/*.meta {
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+    su auth auth
+    create 0660 auth auth
+}
