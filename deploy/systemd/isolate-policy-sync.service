@@ -1,0 +1,15 @@
+[Unit]
+Description=Isolate signed Git policy synchronization
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=auth
+Group=auth
+ExecStart=/usr/bin/python3 /opt/auth/shared/isolate.py policy sync --yes
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=read-only
+ProtectSystem=strict
+ReadWritePaths=/opt/auth/cache /opt/auth/policy-repo /opt/auth/backups

@@ -360,6 +360,8 @@ class ServerConnection(object):
             self.ssh_wrapper_argv.extend(['--human-user', str(self.helper.identity.get('username'))])
         if self.helper.identity.get('keycloak_sub'):
             self.ssh_wrapper_argv.extend(['--keycloak-sub', str(self.helper.identity.get('keycloak_sub'))])
+        if (self.search_results[0] if self.search_results else {}).get('server_vip'):
+            self.ssh_wrapper_argv.append('--vip')
 
         if self.proxy_id:
             self.ssh_wrapper_argv.extend(['--proxy-id', str(self.proxy_id)])
@@ -425,7 +427,13 @@ class ServerConnection(object):
         self.build_cmd()
         self._write_session()
 
-        self.helper.audit.event(
+        connection_audit = SessionLogger(
+            self.helper.config["logging"]["base_path"],
+            self.helper.identity,
+            session_id=self.connection_id,
+            logging_config=self.helper.config.get("logging", {}),
+        )
+        connection_audit.event(
             "policy_selected",
             project=self.project_name,
             host_id=self.server_id,

@@ -157,11 +157,13 @@ def validate_host_updates(redis, updates):
     return normalized
 
 
-def update_host(redis, server_id, updates, updated_by=None):
+def update_host(redis, server_id, updates, updated_by=None, expected_revision=None):
     raw = redis.get("server_{}".format(server_id))
     if raw is None:
         return None
     host = json.loads(decode(raw))
+    if expected_revision and host_revision(normalize_host(host)) != str(expected_revision):
+        raise HostValidationError("host changed since this form was opened; reload before saving")
     host.update(validate_host_updates(redis, updates))
     host["updated_by"] = updated_by or "unknown"
     host["updated_at"] = int(time.time())
@@ -169,6 +171,40 @@ def update_host(redis, server_id, updates, updated_by=None):
     normalized = normalize_host(host)
     normalized["_revision"] = host_revision(normalized)
     return normalized
+
+
+def bulk_update_hosts(redis, server_ids, updates, updated_by=None):
+    ids = [str(server_id) for server_id in server_ids]
+    if not ids:
+        raise HostValidationError("at least one host id is required")
+    if len(ids) != len(set(ids)):
+        raise HostValidationError("duplicate host ids are not allowed")
+    normalized_updates = validate_host_updates(redis, updates)
+    if not normalized_updates:
+        raise HostValidationError("at least one update field is required")
+    current = []
+    for server_id in ids:
+        raw = redis.get("server_{}".format(server_id))
+        if raw is None:
+            raise HostValidationError("host not found: {}".format(server_id))
+        current.append((server_id, json.loads(decode(raw))))
+
+    updated_at = int(time.time())
+    records = []
+    for server_id, host in current:
+        host.update(normalized_updates)
+        host["updated_by"] = updated_by or "unknown"
+        host["updated_at"] = updated_at
+        records.append((server_id, host))
+    if hasattr(redis, "pipeline"):
+        pipeline = redis.pipeline(transaction=True)
+        for server_id, host in records:
+            pipeline.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+        pipeline.execute()
+    else:
+        for server_id, host in records:
+            redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+    return [normalize_host(host) for _, host in records]
 
 
 def create_host(redis, values, updated_by=None):

@@ -71,6 +71,38 @@ def build_access_notification(config, event_name, request_record, actor=None, ex
     }
 
 
+def build_session_notification(config, alert_name, session_record, extra=None):
+    extra = extra or {}
+    connection_id = session_record.get("connection_id")
+    public_url = (config.get("dashboard", {}).get("public_url") or "").rstrip("/")
+    details_url = "{}/session/{}".format(public_url, urllib.parse.quote(str(connection_id))) if public_url else None
+    payload = {
+        "event": "session_alert",
+        "alert": alert_name,
+        "session": session_record,
+        "dashboard_url": details_url,
+    }
+    payload.update(extra)
+    lines = [
+        "Session alert: {}".format(alert_name),
+        "user: {}".format(session_record.get("username") or ""),
+        "project: {}".format(session_record.get("project") or ""),
+        "host: {}".format(session_record.get("host_id") or session_record.get("target_host") or ""),
+        "remote_user: {}".format(session_record.get("remote_user") or ""),
+        "source_ip: {}".format(session_record.get("source_ip") or ""),
+        "connection_id: {}".format(connection_id or ""),
+    ]
+    if session_record.get("duration_seconds") is not None:
+        lines.append("duration_seconds: {}".format(session_record.get("duration_seconds")))
+    if details_url:
+        lines.append("dashboard: {}".format(details_url))
+    return {
+        "subject": "[Isolate] Session alert: {}".format(alert_name),
+        "text": "\n".join(lines),
+        "payload": payload,
+    }
+
+
 def _enabled_sinks(config):
     notifications = config.get("notifications", {})
     if not notifications.get("enabled", False):
@@ -157,6 +189,21 @@ def _send_sink(config, sink, notification):
 
 def notify_access_event(config, event_name, request_record, actor=None, extra=None):
     notification = build_access_notification(config, event_name, request_record, actor=actor, extra=extra)
+    results = []
+    errors = []
+    for sink in _enabled_sinks(config):
+        try:
+            results.append(_send_sink(config, sink, notification))
+        except Exception as exc:  # pragma: no cover - exact network failures vary
+            message = "{} sink failed: {}".format(sink.get("type") or "unknown", exc)
+            errors.append(message)
+            if config.get("notifications", {}).get("fail_closed", False):
+                raise NotificationError(message)
+    return {"sent": results, "errors": errors}
+
+
+def notify_session_alert(config, alert_name, session_record, extra=None):
+    notification = build_session_notification(config, alert_name, session_record, extra=extra)
     results = []
     errors = []
     for sink in _enabled_sinks(config):

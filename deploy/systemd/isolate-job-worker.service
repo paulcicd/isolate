@@ -1,5 +1,5 @@
 [Unit]
-Description=Isolate v2 asynchronous command job worker
+Description=Isolate v2 asynchronous command and runbook job worker
 After=network-online.target redis-server.service
 Wants=network-online.target
 

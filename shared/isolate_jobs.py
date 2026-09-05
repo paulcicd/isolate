@@ -15,6 +15,7 @@ import time
 from isolate_audit import prepare_and_dispatch
 from isolate_inventory import get_host
 from isolate_policy import PolicyDenied, resolve_grant
+from isolate_runbooks import RunbookError, render_runbook
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 
 
@@ -22,10 +23,15 @@ class JobError(Exception):
     pass
 
 
-SIGNED_JOB_FIELDS = (
+SIGNED_JOB_FIELDS_V1 = (
     "schema_version", "id", "type", "username", "keycloak_sub", "groups", "roles",
     "project", "host_id", "target_host", "target_port", "remote_user", "sudo_mode",
     "grant_id", "command", "command_sha256", "timeout", "created_at",
+)
+
+SIGNED_RUNBOOK_FIELDS = (
+    "runbook_id", "runbook_class", "runbook_parameters", "policy_action",
+    "runbook_definition_sha256",
 )
 
 
@@ -61,8 +67,11 @@ def _signing_key(config):
 
 
 def _signature_payload(record):
+    fields = SIGNED_JOB_FIELDS_V1
+    if int(record.get("schema_version") or 1) >= 2:
+        fields += SIGNED_RUNBOOK_FIELDS
     return json.dumps(
-        {name: record.get(name) for name in SIGNED_JOB_FIELDS},
+        {name: record.get(name) for name in fields},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=True,
@@ -159,6 +168,53 @@ def create_command_job(redis, config, identity, host, decision, command, timeout
     return _save(redis, record)
 
 
+def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None):
+    execution = config.get("command_execution", {}) or {}
+    runbook = rendered["runbook"]
+    timeout = int(timeout or runbook.get("default_timeout") or execution.get("default_timeout", 60))
+    if timeout <= 0 or timeout > int(execution.get("max_timeout", 900)):
+        raise JobError("timeout is outside the configured range")
+    command = rendered["command"]
+    job_id = redis.incr("offset_job_id")
+    matched = decision.get("matched_rule") or {}
+    record = {
+        "schema_version": 2,
+        "id": str(job_id),
+        "type": "runbook",
+        "status": "queued",
+        "username": identity.get("username"),
+        "keycloak_sub": identity.get("keycloak_sub"),
+        "groups": identity.get("groups") or [],
+        "roles": identity.get("roles") or [],
+        "project": host.get("project_name"),
+        "host_id": str(host.get("server_id")),
+        "target_host": host.get("server_ip"),
+        "target_port": int(host.get("server_port") or 22),
+        "remote_user": decision.get("remote_user"),
+        "sudo_mode": decision.get("sudo_mode") or "none",
+        "grant_id": matched.get("id"),
+        "command": command,
+        "command_sha256": hashlib.sha256(command.encode("utf-8")).hexdigest(),
+        "runbook_id": runbook["id"],
+        "runbook_class": runbook["class"],
+        "runbook_parameters": rendered["parameters"],
+        "policy_action": rendered["policy_action"],
+        "runbook_definition_sha256": runbook["definition_sha256"],
+        "timeout": timeout,
+        "created_at": now_ts(),
+        "started_at": None,
+        "finished_at": None,
+        "exit_code": None,
+        "error": None,
+        "cancel_requested": False,
+        "output_path": None,
+        "output_bytes": 0,
+        "output_truncated": False,
+    }
+    sign_job(record, config)
+    return _save(redis, record)
+
+
 def request_job_cancel(redis, job_id, actor):
     record = get_job(redis, job_id)
     if record is None:
@@ -200,6 +256,8 @@ def _audit(config, event, record, extra=None):
         "host_id": record.get("host_id"),
         "remote_user": record.get("remote_user"),
         "command_sha256": record.get("command_sha256"),
+        "runbook_id": record.get("runbook_id"),
+        "runbook_class": record.get("runbook_class"),
         "source": "isolate-job-worker",
     }
     payload.update(extra or {})
@@ -284,12 +342,37 @@ def execute_job(redis, config, record):
         or int(host.get("server_port") or 22) != int(current.get("target_port") or 22)
     ):
         return _fail_job(redis, config, current, "host routing changed after the job was queued")
-    if not execution.get("enabled", False):
-        return _fail_job(redis, config, current, "command execution was disabled after the job was queued")
-    if not (set(current.get("groups") or []) & set(execution.get("allowed_groups") or [])):
-        return _fail_job(redis, config, current, "submitter group is no longer allowed by command execution config")
+    job_type = current.get("type")
+    policy_action = "command"
+    authorization_config = execution
     try:
-        validate_command(current.get("command"), config)
+        if job_type == "remote-command":
+            if not execution.get("enabled", False):
+                raise JobError("command execution was disabled after the job was queued")
+            if not (set(current.get("groups") or []) & set(execution.get("allowed_groups") or [])):
+                raise JobError("submitter group is no longer allowed by command execution config")
+            validate_command(current.get("command"), config)
+        elif job_type == "runbook":
+            runbooks = config.get("runbooks", {}) or {}
+            if not runbooks.get("enabled", False):
+                raise JobError("runbooks were disabled after the job was queued")
+            rendered = render_runbook(config, current.get("runbook_id"), current.get("runbook_parameters"))
+            runbook = rendered["runbook"]
+            authorization_config = runbooks.get(runbook["class"], {}) or {}
+            if runbook["class"] == "operational" and not authorization_config.get("enabled", False):
+                raise JobError("operational runbooks were disabled after the job was queued")
+            if not (set(current.get("groups") or []) & set(authorization_config.get("allowed_groups") or [])):
+                raise JobError("submitter group is no longer allowed for this runbook class")
+            if (
+                rendered["command"] != current.get("command")
+                or rendered["policy_action"] != current.get("policy_action")
+                or runbook["class"] != current.get("runbook_class")
+                or runbook["definition_sha256"] != current.get("runbook_definition_sha256")
+            ):
+                raise JobError("runbook definition changed after the job was queued")
+            policy_action = rendered["policy_action"]
+        else:
+            raise JobError("unsupported job type")
         decision = resolve_grant(
             {
                 "username": current.get("username"),
@@ -302,14 +385,14 @@ def execute_job(redis, config, record):
             grants=_load_json_records(redis, "grant_*", "grant_"),
             project_sets=_load_project_sets(redis),
             defaults={**config.get("policy", {}), **config.get("ssh", {})},
-            action="command",
+            action=policy_action,
         )
-    except (JobError, PolicyDenied) as exc:
-        return _fail_job(redis, config, current, "command authorization changed: {}".format(exc))
+    except (JobError, PolicyDenied, RunbookError) as exc:
+        return _fail_job(redis, config, current, "job authorization changed: {}".format(exc))
     if decision.get("remote_user") != current.get("remote_user") or decision.get("sudo_mode") != current.get("sudo_mode"):
         return _fail_job(redis, config, current, "command remote identity changed after the job was queued")
-    if decision.get("sudo_mode") == "sudo-i" and not execution.get("allow_sudo", False):
-        return _fail_job(redis, config, current, "sudo command execution is disabled")
+    if decision.get("sudo_mode") == "sudo-i" and not authorization_config.get("allow_sudo", False):
+        return _fail_job(redis, config, current, "sudo execution is disabled for this job class")
     proxy = None
     if host.get("proxy_id"):
         proxy_host = get_host(redis, host["proxy_id"])

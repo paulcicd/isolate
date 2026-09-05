@@ -49,6 +49,8 @@
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-backup.timer", dest: "/etc/systemd/system/isolate-backup.timer" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.service", dest: "/etc/systemd/system/isolate-mcp.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service", dest: "/etc/systemd/system/isolate-job-worker.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.service", dest: "/etc/systemd/system/isolate-policy-sync.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.timer", dest: "/etc/systemd/system/isolate-policy-sync.timer" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
     - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
@@ -96,6 +98,21 @@
     - isolate_enable_job_worker | bool
     - not (isolate_install_runtime_units | bool)
 
+- name: Installing Isolate policy sync units...
+  copy:
+    src: "{{ item.src }}"
+    dest: "{{ item.dest }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.service", dest: "/etc/systemd/system/isolate-policy-sync.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.timer", dest: "/etc/systemd/system/isolate-policy-sync.timer" }
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_install_runtime_units | bool)
+
 - name: Checking Isolate command job signing key...
   stat:
     path: "{{ deploy_path }}/keys/job_hmac.key"
@@ -122,6 +139,33 @@
   when:
     - isolate_enable_job_worker | bool
     - not (isolate_job_signing_key.stat.exists | default(false))
+
+- name: Checking Isolate policy approval key...
+  stat:
+    path: "{{ deploy_path }}/keys/policy_approval_hmac.key"
+  register: isolate_policy_approval_key
+  when: isolate_enable_policy_sync_timer | bool
+
+- name: Generating Isolate policy approval key...
+  command: openssl rand -hex 32
+  register: isolate_policy_approval_key_generated
+  changed_when: true
+  no_log: true
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_policy_approval_key.stat.exists | default(false))
+
+- name: Installing Isolate policy approval key...
+  copy:
+    content: "{{ isolate_policy_approval_key_generated.stdout }}\n"
+    dest: "{{ deploy_path }}/keys/policy_approval_hmac.key"
+    owner: auth
+    group: auth
+    mode: "0600"
+  no_log: true
+  when:
+    - isolate_enable_policy_sync_timer | bool
+    - not (isolate_policy_approval_key.stat.exists | default(false))
 
 - name: Checking Isolate dashboard secret...
   stat:
@@ -184,6 +228,14 @@
     state: started
     daemon_reload: yes
   when: isolate_enable_job_worker | bool
+
+- name: Enabling Isolate policy sync timer...
+  systemd:
+    name: isolate-policy-sync.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_policy_sync_timer | bool
 
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"

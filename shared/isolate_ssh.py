@@ -11,6 +11,12 @@ class SSHArgumentError(Exception):
 
 
 SAFE_USER_RE = re.compile(r"^[A-Za-z0-9_,.-]{1,48}$")
+SAFE_ENV_NAMES = {
+    "ISOLATE_CONNECTION_ID",
+    "ISOLATE_HOST_ID",
+    "ISOLATE_PROJECT",
+    "ISOLATE_HUMAN_USER",
+}
 
 
 def is_valid_ipv4_address(address):
@@ -71,12 +77,17 @@ def filter_extra_args(extra_args, allowed):
     return result
 
 
-def build_ssh_argv(config, host, extra_args=None, proxy=None, remote_command=None):
+def build_ssh_argv(config, host, extra_args=None, proxy=None, remote_command=None, send_env=None):
     ssh = config.get("binary", "/usr/bin/ssh")
     argv = [ssh, "-e", "none", "-F", config.get("config_path", "/opt/auth/configs/defaults.conf")]
     if config.get("allocate_tty", True):
         argv.append("-tt")
     argv.extend(filter_extra_args(extra_args, config.get("allowed_extra_args")))
+    selected_env = list(send_env or [])
+    if any(name not in SAFE_ENV_NAMES for name in selected_env):
+        raise SSHArgumentError("invalid SSH environment name")
+    if selected_env:
+        argv.extend(["-o", "SendEnv={}".format(" ".join(selected_env))])
 
     proxy = proxy or {}
     if proxy.get("host"):

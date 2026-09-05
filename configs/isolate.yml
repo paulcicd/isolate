@@ -25,6 +25,42 @@ keycloak:
   poll_timeout: 300
   tls_verify: true
 
+dashboard:
+  enabled: false
+  listen_host: 127.0.0.1
+  listen_port: 8080
+  public_url: http://127.0.0.1:8080
+  secret_key_file: /opt/auth/keys/dashboard_secret
+  admin_groups: []
+  refresh_seconds: 15
+  require_mutation_confirmation: true
+
+command_audit:
+  enabled: false
+  require_connection_id: true
+  require_active_session: true
+  completion_grace_seconds: 30
+  max_command_length: 4096
+  # Requires the target-side installer and sshd AcceptEnv configuration.
+  send_env: false
+  # Only this effective Unix account may append target-shell command events.
+  ingest_user: auth
+
+session_control:
+  enabled: true
+  terminate_enabled: false
+  poll_interval: 1
+  heartbeat_interval: 15
+  active_ttl: 86400
+  live_tail_bytes: 262144
+  alerts:
+    enabled: false
+    long_session_seconds: 14400
+    vip: true
+    privileged: true
+    unusual_source: true
+    trusted_source_cidrs: []
+
 mcp:
   enabled: false
   listen_host: 127.0.0.1
@@ -44,6 +80,8 @@ mcp:
   inventory_write_scope: isolate.inventory.write
   policy_read_scope: isolate.policy.read
   execute_scope: isolate.execute
+  runbook_scope: isolate.runbook
+  operate_scope: isolate.operate
   # Empty lists inherit access.admin_groups.
   inventory_admin_groups: []
   policy_admin_groups: []
@@ -77,6 +115,21 @@ command_execution:
   signing_key_file: /opt/auth/keys/job_hmac.key
   remote_shell: /bin/sh
   poll_interval: 1
+
+runbooks:
+  enabled: false
+  # Built-ins can be removed from the MCP catalog by id without editing code.
+  disabled: []
+  read_only:
+    allowed_groups: []
+    allow_sudo: false
+    require_confirmation: true
+  # Keep operational runbooks disabled until their grants and sudo policy pass review.
+  operational:
+    enabled: false
+    allowed_groups: []
+    allow_sudo: false
+    require_confirmation: true
 
 ssh:
   binary: /usr/bin/ssh
@@ -117,6 +170,20 @@ policy_as_code:
   bundle_path: /opt/auth/configs/policy.yml
   backup_dir: /opt/auth/backups
   require_confirmation: true
+  # Git synchronization is fully opt-in. enforce_git also disables manual policy mutations.
+  enabled: false
+  enforce_git: false
+  repository: null
+  checkout_path: /opt/auth/cache/policy-repo
+  branch: main
+  git_bundle_path: policy.yml
+  git_binary: /usr/bin/git
+  git_timeout: 60
+  prune: false
+  require_pr_approval: true
+  approval_attestation_path: policy.approval.json
+  approval_key_file: /opt/auth/keys/policy_approval_hmac.key
+  minimum_approvals: 1
 
 backup:
   base_path: /opt/auth/backups/service
@@ -168,6 +235,10 @@ backup:
     - path: /etc/systemd/system/isolate-mcp.service
       required: false
     - path: /etc/systemd/system/isolate-job-worker.service
+      required: false
+    - path: /etc/systemd/system/isolate-policy-sync.service
+      required: false
+    - path: /etc/systemd/system/isolate-policy-sync.timer
       required: false
     - path: /etc/default/isolate-mcp
       required: false

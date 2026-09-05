@@ -5,6 +5,7 @@ import uuid
 import unittest
 import fnmatch
 import json
+import subprocess
 import tarfile
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
@@ -17,6 +18,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(ROOT, "shared"))
 
 import isolate_identity
+import isolate_policy_bundle
 from isolate_identity import (
     IdentityError,
     KeycloakDeviceClient,
@@ -27,7 +29,7 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, read_history
-from isolate_inventory import create_host, format_hosts_table, get_host, list_hosts, update_host
+from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, format_hosts_table, get_host, list_hosts, update_host
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
 from isolate_replay import find_session, parse_raw_replay
@@ -48,13 +50,30 @@ from isolate_access import (
     repeat_access_request,
 )
 from isolate import list_grant_records, load_project_sets, update_grant_record
-from isolate_sessions import list_active_sessions, mark_session_end, mark_session_start
+from isolate_sessions import (
+    get_session,
+    list_active_sessions,
+    mark_alert_delivery,
+    mark_session_end,
+    mark_session_start,
+    request_session_termination,
+)
+from isolate_session_alerts import initial_session_alerts, long_session_alert, source_is_unusual
 from isolate_web import is_dashboard_admin
-from isolate_notifications import NotificationError, build_access_notification, notify_access_event
+from isolate_notifications import NotificationError, build_access_notification, build_session_notification, notify_access_event
 from isolate_audit import classify_audit_record, prepare_and_dispatch, verify_audit_record, verify_jsonl_file
 from isolate_backup import BackupError, create_backup, restore_backup, restore_redis_snapshot, verify_backup
 from isolate_health import run_health_checks, validate_config
-from isolate_policy_bundle import PolicyBundleError, apply_bundle, export_bundle, plan_bundle, validate_bundle
+from isolate_policy_bundle import PolicyBundleError, apply_bundle, blast_radius, export_bundle, plan_bundle, validate_bundle
+from isolate_gitops import (
+    create_approval_attestation,
+    git_policy_status,
+    GitOpsError,
+    list_policy_snapshots,
+    rollback_policy,
+    sync_git_policy,
+    verify_approval_attestation,
+)
 from isolate_redis import redis_options
 from isolate_retention import expired_session_dirs
 from isolate_mcp import (
@@ -65,6 +84,7 @@ from isolate_mcp import (
     token_scopes,
 )
 from isolate_jobs import JobError, execute_job, get_job, list_jobs
+from isolate_runbooks import RunbookError, list_runbooks, render_runbook
 
 
 def has_mcp_v2():
@@ -133,6 +153,7 @@ class FakeRedis(object):
         return value
 
     def expire(self, key, ttl):
+        self.ttls[self._key(key)] = int(ttl) * 1000
         return True
 
     def ping(self):
@@ -317,6 +338,8 @@ class MCPServiceTest(unittest.TestCase):
                 "inventory_write_scope": "isolate.inventory.write",
                 "policy_read_scope": "isolate.policy.read",
                 "execute_scope": "isolate.execute",
+                "runbook_scope": "isolate.runbook",
+                "operate_scope": "isolate.operate",
                 "inventory_admin_groups": ["Demo-Security"],
                 "policy_admin_groups": ["Demo-Security"],
                 "execution_admin_groups": ["Demo-Security"],
@@ -351,6 +374,21 @@ class MCPServiceTest(unittest.TestCase):
                 "jobs_path": log_path,
                 "signing_key_file": signing_key,
                 "remote_shell": "/bin/sh",
+            },
+            "runbooks": {
+                "enabled": False,
+                "disabled": [],
+                "read_only": {
+                    "allowed_groups": ["Demo-DevOps"],
+                    "allow_sudo": False,
+                    "require_confirmation": True,
+                },
+                "operational": {
+                    "enabled": False,
+                    "allowed_groups": ["Demo-DevOps"],
+                    "allow_sudo": False,
+                    "require_confirmation": True,
+                },
             },
             "access": {
                 "admin_groups": ["Demo-Security"],
@@ -718,6 +756,97 @@ class MCPServiceTest(unittest.TestCase):
             self.assertTrue(allowed["allowed"])
             self.assertEqual(allowed["decision"]["remote_user"], "support")
 
+    def test_runbook_catalog_and_parameter_validation(self):
+        config = self._config("unused")
+        read_only = list_runbooks(config, classes=["read_only"])
+        operational = list_runbooks(config, classes=["operational"])
+        self.assertEqual(len(read_only), 15)
+        self.assertEqual(
+            {item["id"] for item in operational},
+            {"service-restart", "dns-cache-flush", "deploy-diagnostics"},
+        )
+        rendered = render_runbook(config, "journal-tail", {"service": "nginx.service", "lines": 25})
+        self.assertIn("nginx.service", rendered["command"])
+        self.assertIn("25", rendered["command"])
+        self.assertEqual(rendered["policy_action"], "runbook")
+        with self.assertRaises(RunbookError):
+            render_runbook(config, "service-status", {"service": "nginx; id"})
+        with self.assertRaises(RunbookError):
+            render_runbook(config, "uptime", {"command": "id"})
+
+    def test_read_only_runbook_authorization_and_worker_revalidation(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-runbook-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["runbooks"]["enabled"] = True
+            redis = self._redis()
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "runbook"]
+            redis.set("grant_1", json.dumps(grant))
+            service = IsolateMCPService(config, redis)
+
+            with self.assertRaises(MCPAccessDenied):
+                service.runbook_execute(
+                    self._identity(), ["isolate.runbook"], "uptime", "1", confirm=False
+                )
+            queued = service.runbook_execute(
+                self._identity(), ["isolate.runbook"], "uptime", "1", confirm=True
+            )["job"]
+            self.assertEqual(queued["type"], "runbook")
+            self.assertEqual(queued["policy_action"], "runbook")
+            self.assertEqual(service.runbook_list(self._identity(), ["isolate.runbook"])["count"], 15)
+            self.assertEqual(service.runbook_show(
+                self._identity(), ["isolate.runbook"], "uptime"
+            )["runbook"]["class"], "read_only")
+
+            with mock.patch(
+                "isolate_jobs.build_ssh_argv",
+                return_value=[sys.executable, "-c", "print('up 10 days')"],
+            ):
+                completed = execute_job(redis, config, queued)
+            self.assertEqual(completed["status"], "completed")
+            self.assertIn("up 10 days", service.command_job_output(
+                self._identity(), ["isolate.runbook"], queued["id"]
+            )["output"])
+
+            queued = service.runbook_execute(
+                self._identity(), ["isolate.runbook"], "uptime", "1", confirm=True
+            )["job"]
+            grant["allowed_actions"] = ["ssh"]
+            redis.set("grant_1", json.dumps(grant))
+            with mock.patch("isolate_jobs.subprocess.Popen") as popen:
+                failed = execute_job(redis, config, queued)
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("authorization changed", failed["error"])
+            popen.assert_not_called()
+
+    def test_operational_runbooks_require_separate_enable_scope_and_action(self):
+        with tempfile.TemporaryDirectory(prefix="isolate-operational-jobs-") as jobs_path:
+            config = self._config(jobs_path)
+            config["runbooks"]["enabled"] = True
+            redis = self._redis()
+            grant = json.loads(redis.get("grant_1"))
+            grant["allowed_actions"] = ["ssh", "runbook", "operate"]
+            redis.set("grant_1", json.dumps(grant))
+            service = IsolateMCPService(config, redis)
+
+            with self.assertRaises(MCPAccessDenied):
+                service.runbook_execute(
+                    self._identity(), ["isolate.operate"], "service-restart", "1",
+                    parameters={"service": "nginx"}, confirm=True,
+                )
+            config["runbooks"]["operational"]["enabled"] = True
+            with self.assertRaises(MCPAccessDenied):
+                service.runbook_execute(
+                    self._identity(), ["isolate.runbook"], "service-restart", "1",
+                    parameters={"service": "nginx"}, confirm=True,
+                )
+            queued = service.runbook_execute(
+                self._identity(), ["isolate.operate"], "service-restart", "1",
+                parameters={"service": "nginx"}, confirm=True,
+            )["job"]
+            self.assertEqual(queued["runbook_class"], "operational")
+            self.assertEqual(queued["policy_action"], "operate")
+
     def test_command_job_authorization_lifecycle_and_output(self):
         with tempfile.TemporaryDirectory(prefix="isolate-mcp-jobs-") as jobs_path:
             config = self._config(jobs_path)
@@ -890,6 +1019,19 @@ class MCPServiceTest(unittest.TestCase):
         config["command_execution"]["allowed_groups"] = []
         self.assertFalse(validate_config(config)["valid"])
 
+    def test_runbook_config_is_fail_closed(self):
+        config = self._config(os.path.abspath("unused"))
+        config["runbooks"]["enabled"] = True
+        validation = validate_config(config)
+        self.assertTrue(validation["valid"], validation["errors"])
+        config["runbooks"]["read_only"]["allowed_groups"] = []
+        self.assertFalse(validate_config(config)["valid"])
+        config["runbooks"]["read_only"]["allowed_groups"] = ["Demo-DevOps"]
+        config["runbooks"]["operational"]["enabled"] = True
+        validation = validate_config(config)
+        self.assertTrue(validation["valid"], validation["errors"])
+        self.assertIn("operational runbooks are enabled", validation["warnings"])
+
     @unittest.skipUnless(has_mcp_v2(), "MCP SDK v2 is not installed")
     def test_official_sdk_server_registers_phase_three_surface(self):
         from mcp.server.transport_security import TransportSecuritySettings
@@ -897,7 +1039,9 @@ class MCPServiceTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory(prefix="isolate-mcp-sdk-") as logs:
             redis = self._redis()
-            server = create_mcp_server(self._config(logs), redis)
+            config = self._config(logs)
+            config["runbooks"]["enabled"] = True
+            server = create_mcp_server(config, redis)
             app = server.streamable_http_app(
                 stateless_http=True,
                 json_response=True,
@@ -920,7 +1064,7 @@ class MCPServiceTest(unittest.TestCase):
                     "groups": ["Demo-DevOps", "Demo-Security"],
                     "aud": ["isolate-mcp"],
                     "azp": "test-client",
-                    "scope": "isolate.read isolate.self-service isolate.inventory.write isolate.policy.read isolate.execute",
+                    "scope": "isolate.read isolate.self-service isolate.inventory.write isolate.policy.read isolate.execute isolate.runbook isolate.operate",
                     "exp": 2000000000,
                 }
                 meta = {
@@ -955,6 +1099,12 @@ class MCPServiceTest(unittest.TestCase):
                         "_meta": meta,
                     },
                 }
+                runbook_payload = {
+                    "jsonrpc": "2.0",
+                    "id": 5,
+                    "method": "tools/call",
+                    "params": {"name": "runbook_list", "arguments": {}, "_meta": meta},
+                }
                 with mock.patch("isolate_mcp.verify_jwt_claims", return_value=claims):
                     authorized = client.post(
                         "/mcp",
@@ -985,6 +1135,16 @@ class MCPServiceTest(unittest.TestCase):
                             "Mcp-Name": "inventory_host_add",
                         },
                     )
+                    runbooks = client.post(
+                        "/mcp",
+                        json=runbook_payload,
+                        headers={
+                            "Authorization": "Bearer signed-token",
+                            "MCP-Protocol-Version": "2026-07-28",
+                            "Mcp-Method": "tools/call",
+                            "Mcp-Name": "runbook_list",
+                        },
+                    )
             self.assertEqual(response.status_code, 401)
             self.assertIn("resource_metadata=", response.headers.get("www-authenticate", ""))
             self.assertEqual(authorized.status_code, 200)
@@ -1010,10 +1170,15 @@ class MCPServiceTest(unittest.TestCase):
                 "command_job_show",
                 "command_job_output",
                 "command_job_cancel",
+                "runbook_list",
+                "runbook_show",
+                "runbook_execute",
             }.issubset(tool_names))
             self.assertEqual(previewed.status_code, 200)
             self.assertFalse(previewed.json()["result"]["structuredContent"]["applied"])
             self.assertIsNone(redis.get("server_10001"))
+            self.assertEqual(runbooks.status_code, 200)
+            self.assertEqual(runbooks.json()["result"]["structuredContent"]["count"], 15)
 
     def test_log_retention_selects_only_expired_session_directories(self):
         tmpdir = os.path.join(ROOT, ".tmp-retention-{}".format(uuid.uuid4().hex))
@@ -1097,6 +1262,110 @@ class PolicyAsCodeTest(unittest.TestCase):
         self.assertFalse(validation["valid"])
         with self.assertRaises(PolicyBundleError):
             plan_bundle(FakeRedis(), bundle)
+
+    def test_git_prune_preserves_temporary_break_glass_grants(self):
+        redis = self._current_redis()
+        redis.set("grant_3", json.dumps({
+            "schema_version": 2, "subject": "user", "name": "alice", "project": "payments-prod",
+            "remote_user": "dba", "sudo_mode": "none", "allowed_actions": ["ssh"],
+            "temporary": True, "expires_at": 4102444800, "request_id": "9",
+        }))
+        bundle = export_bundle(redis)
+        bundle["grants"] = [row for row in bundle["grants"] if row["id"] == "1"]
+        changes = apply_bundle(redis, bundle, prune=True)
+        self.assertEqual([row["id"] for row in changes["grant_remove"]], ["2"])
+        self.assertIsNotNone(redis.get("grant_3"))
+
+    def test_blast_radius_reports_gained_and_lost_access(self):
+        redis = self._current_redis()
+        bundle = export_bundle(redis)
+        bundle["grants"] = [{
+            "schema_version": 2, "subject": "group", "name": "DBA", "project": "payments-prod",
+            "remote_user": "dba", "sudo_mode": "none", "allowed_actions": ["ssh"],
+        }]
+        radius = blast_radius(redis, bundle, [{
+            "server_id": "10001", "server_name": "db01", "project_name": "payments-prod",
+        }], prune=True)
+        self.assertEqual(radius["counts"]["gained"], 1)
+        self.assertEqual(radius["counts"]["lost"], 1)
+
+    def test_policy_approval_attestation_is_bound_to_bundle_and_branch(self):
+        tmpdir = os.path.join(ROOT, ".tmp-policy-approval-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        try:
+            key_path = os.path.join(tmpdir, "approval.key")
+            bundle_path = os.path.join(tmpdir, "policy.json")
+            with open(key_path, "wb") as key_f:
+                key_f.write(b"test-policy-approval-key-at-least-32-bytes")
+            bundle = {"schema_version": 2, "project_sets": [], "grants": []}
+            with open(bundle_path, "w", encoding="utf-8") as bundle_f:
+                json.dump(bundle, bundle_f)
+            config = {"policy_as_code": {
+                "require_pr_approval": True, "approval_key_file": key_path, "minimum_approvals": 2,
+            }}
+            attestation = create_approval_attestation(
+                config, bundle_path, "main", ["reviewer.one", "reviewer.two"], pr_url="https://git.example/pr/7"
+            )
+            verified = verify_approval_attestation(
+                config, attestation, "a" * 40, "main", policy_sha256=attestation["policy_sha256"]
+            )
+            self.assertTrue(verified["valid"])
+            tampered = dict(attestation, approvals=["attacker"])
+            with self.assertRaises(GitOpsError):
+                verify_approval_attestation(config, tampered, "a" * 40, "main", policy_sha256=attestation["policy_sha256"])
+            with self.assertRaises(GitOpsError):
+                verify_approval_attestation(config, attestation, "a" * 40, "main", policy_sha256="0" * 64)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    @unittest.skipUnless(shutil.which("git") and isolate_policy_bundle.yaml is not None, "git or PyYAML is not installed")
+    def test_signed_git_sync_drift_snapshot_and_rollback(self):
+        tmpdir = os.path.join(ROOT, ".tmp-policy-git-{}".format(uuid.uuid4().hex))
+        source = os.path.join(tmpdir, "source")
+        checkout = os.path.join(tmpdir, "checkout")
+        backups = os.path.join(tmpdir, "backups")
+        key_path = os.path.join(tmpdir, "approval.key")
+        os.makedirs(source)
+        try:
+            with open(key_path, "wb") as key_f:
+                key_f.write(b"test-policy-approval-key-at-least-32-bytes")
+            bundle_path = os.path.join(source, "policy.json")
+            bundle = {"schema_version": 2, "project_sets": [], "grants": [{
+                "schema_version": 2, "subject": "group", "name": "Support", "project": "prod",
+                "remote_user": "support", "sudo_mode": "none", "allowed_actions": ["ssh"],
+            }]}
+            with open(bundle_path, "w", encoding="utf-8") as bundle_f:
+                json.dump(bundle, bundle_f, indent=2, sort_keys=True)
+            config = {"policy_as_code": {
+                "enabled": True, "repository": source, "checkout_path": checkout, "branch": "main",
+                "git_bundle_path": "policy.json", "git_binary": shutil.which("git"), "git_timeout": 30,
+                "prune": True, "require_pr_approval": True, "approval_attestation_path": "policy.approval.json",
+                "approval_key_file": key_path, "minimum_approvals": 1, "backup_dir": backups,
+                "require_confirmation": True,
+            }}
+            attestation = create_approval_attestation(config, bundle_path, "main", ["reviewer.one"])
+            with open(os.path.join(source, "policy.approval.json"), "w", encoding="utf-8") as approval_f:
+                json.dump(attestation, approval_f, indent=2, sort_keys=True)
+            subprocess.run([shutil.which("git"), "init", "-b", "main"], cwd=source, check=True, stdout=subprocess.DEVNULL)
+            subprocess.run([shutil.which("git"), "add", "policy.json", "policy.approval.json"], cwd=source, check=True)
+            subprocess.run([
+                shutil.which("git"), "-c", "user.name=Test Reviewer", "-c", "user.email=test@example.org",
+                "commit", "-m", "test: approved policy",
+            ], cwd=source, check=True, stdout=subprocess.DEVNULL)
+
+            redis = FakeRedis()
+            status = git_policy_status(config, redis)
+            self.assertTrue(status["drift"])
+            applied = sync_git_policy(config, redis, dry_run=False, confirmed=True)
+            self.assertEqual(applied["change_count"], 1)
+            self.assertEqual(json.loads(redis.get("grant_1"))["remote_user"], "support")
+            self.assertFalse(git_policy_status(config, redis)["drift"])
+            revisions = list_policy_snapshots(config)
+            self.assertEqual(len(revisions), 1)
+            rollback_policy(config, redis, revisions[0]["revision_id"], confirmed=True)
+            self.assertIsNone(redis.get("grant_1"))
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 class CentralAuditTest(unittest.TestCase):
@@ -1296,6 +1565,41 @@ class ActiveSessionRegistryTest(unittest.TestCase):
         mark_session_end(redis, "conn-1", exit_code=0)
         self.assertEqual(list_active_sessions(redis), [])
 
+    def test_termination_alert_delivery_and_risk_classification(self):
+        redis = FakeRedis()
+        record = mark_session_start(redis, "conn-2", {
+            "username": "alice", "project": "vip-prod", "server_vip": True,
+            "remote_user": "root", "sudo_mode": "sudo-i", "source_ip": "203.0.113.10",
+        }, ttl=120)
+        requested = request_session_termination(redis, "conn-2", {"username": "security.admin"}, "incident")
+        self.assertTrue(requested["terminate_requested"])
+        self.assertEqual(requested["terminate_requested_by"], "security.admin")
+        self.assertEqual(redis.ttls["active_session_conn-2"], 120000)
+
+        marked = mark_alert_delivery(redis, "conn-2", "vip_session", {
+            "sent": [{"type": "telegram", "status": 200}], "errors": [],
+        })
+        self.assertTrue(marked["alert_deliveries"][0]["ok"])
+        config = {"session_control": {"alerts": {
+            "enabled": True, "vip": True, "privileged": True, "unusual_source": True,
+            "trusted_source_cidrs": ["10.0.0.0/8"], "long_session_seconds": 60,
+        }}}
+        self.assertEqual(
+            initial_session_alerts(config, record),
+            ["vip_session", "privileged_session", "unusual_source_ip"],
+        )
+        record["started_at"] = 1
+        self.assertEqual(long_session_alert(config, record, 62), "long_session")
+        self.assertTrue(source_is_unusual("not-an-ip", ["10.0.0.0/8"]))
+
+    def test_session_notification_contains_dashboard_link(self):
+        notice = build_session_notification(
+            {"dashboard": {"public_url": "https://bastion.example.org"}},
+            "vip_session",
+            {"connection_id": "conn-3", "username": "alice", "project": "prod"},
+        )
+        self.assertEqual(notice["payload"]["dashboard_url"], "https://bastion.example.org/session/conn-3")
+
 
 class InventoryTest(unittest.TestCase):
     def test_search_matches_services_and_note_but_go_fields_do_not(self):
@@ -1425,6 +1729,32 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(updated["privileged_access_provider"], "Warpgate")
         self.assertIn("VIP", format_hosts_table([updated]))
 
+    def test_bulk_update_validates_all_hosts_before_writing(self):
+        redis = FakeRedis()
+        for host_id in ("1", "2"):
+            redis.set("server_{}".format(host_id), json.dumps({
+                "server_id": int(host_id), "project_name": "prod", "server_ip": "10.0.0.{}".format(host_id),
+                "server_name": "node{}".format(host_id), "server_user": "support",
+            }))
+        updated = bulk_update_hosts(redis, ["1", "2"], {"server_services": "nginx"}, updated_by="admin")
+        self.assertEqual(len(updated), 2)
+        self.assertEqual(get_host(redis, "2")["server_services"], "nginx")
+        before = redis.get("server_1")
+        with self.assertRaises(HostValidationError):
+            bulk_update_hosts(redis, ["1", "missing"], {"server_user": "dba"}, updated_by="admin")
+        self.assertEqual(redis.get("server_1"), before)
+
+    def test_host_optimistic_revision_rejects_stale_web_edit(self):
+        redis = FakeRedis()
+        redis.set("server_1", json.dumps({
+            "server_id": 1, "project_name": "prod", "server_ip": "10.0.0.1",
+            "server_name": "node1", "server_user": "support",
+        }))
+        revision = get_host(redis, "1")["_revision"]
+        update_host(redis, "1", {"server_note": "new"}, updated_by="one")
+        with self.assertRaises(HostValidationError):
+            update_host(redis, "1", {"server_note": "stale"}, updated_by="two", expected_revision=revision)
+
 
 class GrantAdminUxTest(unittest.TestCase):
     def test_lists_and_filters_grants(self):
@@ -1543,6 +1873,19 @@ class SSHBuilderTest(unittest.TestCase):
                 {"binary": "/usr/bin/ssh", "config_path": "/tmp/ssh_config", "allowed_extra_args": []},
                 {"hostname": "host.example.com"},
                 extra_args=["-oProxyCommand=sh"],
+            )
+
+    def test_command_audit_environment_is_explicitly_allowlisted(self):
+        argv = build_ssh_argv(
+            {"binary": "/usr/bin/ssh", "config_path": "/tmp/ssh_config", "allowed_extra_args": []},
+            {"hostname": "host.example.com", "user": "support", "port": 22},
+            send_env=["ISOLATE_CONNECTION_ID", "ISOLATE_PROJECT"],
+        )
+        self.assertIn("SendEnv=ISOLATE_CONNECTION_ID ISOLATE_PROJECT", argv)
+        with self.assertRaises(SSHArgumentError):
+            build_ssh_argv(
+                {"binary": "/usr/bin/ssh", "config_path": "/tmp/ssh_config", "allowed_extra_args": []},
+                {"hostname": "host.example.com"}, send_env=["LD_PRELOAD"],
             )
 
 
@@ -1794,6 +2137,41 @@ class HistoryTest(unittest.TestCase):
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
+    def test_merges_legacy_split_connection_events(self):
+        tmpdir = os.path.join(ROOT, ".tmp-history-split-{}".format(uuid.uuid4().hex))
+        try:
+            self._write_session(tmpdir, "alice", "login-session", [{
+                "ts": 100,
+                "event": "policy_selected",
+                "session_id": "login-session",
+                "connection_id": "conn-split",
+                "username": "alice",
+                "groups": ["Support"],
+                "project": "prod",
+                "host_id": "10001",
+                "target_host": "10.0.0.1",
+                "remote_user": "support",
+            }])
+            self._write_session(tmpdir, "alice", "conn-split", [{
+                "ts": 101,
+                "event": "ssh_end",
+                "session_id": "conn-split",
+                "connection_id": "conn-split",
+                "username": "alice",
+                "exit_code": 0,
+                "raw_log_path": os.path.join(tmpdir, "alice", "raw.log"),
+            }])
+
+            rows = read_history(tmpdir, {"username": "alice", "groups": []})
+
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["project"], "prod")
+            self.assertEqual(rows[0]["result"], "exit=0")
+            details = find_session(tmpdir, "conn-split")
+            self.assertEqual([event["event"] for event in details["events"]], ["policy_selected", "ssh_end"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
 
 class SessionReplayTest(unittest.TestCase):
     def test_find_session_details_and_parse_replay(self):
@@ -1895,6 +2273,66 @@ class SessionReplayTest(unittest.TestCase):
         with self.assertRaises(CommandAuditError):
             append_command_event("/tmp/no-such-dir", "missing", "whoami", config={"command_audit": {"enabled": True}})
 
+    def test_command_audit_rejects_spoofed_session_context(self):
+        tmpdir = os.path.join(ROOT, ".tmp-command-context-{}".format(uuid.uuid4().hex))
+        try:
+            self._write_session(tmpdir, "alice", "session-1", [{
+                "event": "ssh_start", "connection_id": "conn-1", "session_id": "session-1",
+                "username": "alice", "project": "prod", "host_id": "10001",
+            }])
+            with self.assertRaises(CommandAuditError):
+                append_command_event(
+                    tmpdir, "conn-1", "whoami", project="other", host_id="10001",
+                    config={"command_audit": {"enabled": True}},
+                )
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_command_audit_cli_requires_active_or_recent_session(self):
+        tmpdir = os.path.join(ROOT, ".tmp-command-active-{}".format(uuid.uuid4().hex))
+        try:
+            self._write_session(tmpdir, "alice", "session-1", [{
+                "event": "ssh_start", "connection_id": "conn-1", "session_id": "session-1",
+                "username": "alice", "project": "prod", "host_id": "10001",
+            }])
+            redis = FakeRedis()
+            args = SimpleNamespace(
+                connection_id="conn-1", command="whoami", cwd="/tmp", exit_code=0,
+                project="prod", host_id="10001", shell="bash", source="target-shell-hook",
+            )
+            config = {"logging": {"base_path": tmpdir}, "command_audit": {
+                "enabled": True, "require_active_session": True, "completion_grace_seconds": 30,
+            }}
+            with mock.patch.object(isolate, "redis_client", return_value=redis), mock.patch.object(
+                isolate, "_effective_username", return_value="auth"
+            ), redirect_stderr(StringIO()):
+                self.assertEqual(isolate.cmd_command_log_append(args, config), 2)
+            mark_session_start(redis, "conn-1", {"username": "alice"})
+            with mock.patch.object(isolate, "redis_client", return_value=redis), mock.patch.object(
+                isolate, "_effective_username", return_value="auth"
+            ), redirect_stdout(StringIO()):
+                self.assertIsNone(isolate.cmd_command_log_append(args, config))
+
+            with mock.patch.object(isolate, "_effective_username", return_value="alice"), redirect_stderr(StringIO()):
+                self.assertEqual(isolate.cmd_command_log_append(args, config), 2)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_session_rejects_raw_path_outside_user_log_directory(self):
+        tmpdir = os.path.join(ROOT, ".tmp-unsafe-raw-{}".format(uuid.uuid4().hex))
+        try:
+            outside = os.path.join(tmpdir, "outside.log")
+            os.makedirs(tmpdir)
+            with open(outside, "w", encoding="utf-8") as raw_f:
+                raw_f.write("1000.000000\nsecret")
+            self._write_session(tmpdir, "alice", "session-1", [{
+                "event": "ssh_end", "connection_id": "conn-1", "session_id": "session-1",
+                "username": "alice", "raw_log_path": outside, "exit_code": 0,
+            }])
+            self.assertIsNone(find_session(tmpdir, "conn-1")["raw_log_path"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_malformed_replay_falls_back_to_plain_text(self):
         tmpdir = os.path.join(ROOT, ".tmp-replay-{}".format(uuid.uuid4().hex))
         raw_path = os.path.join(tmpdir, "raw.log")
@@ -1962,6 +2400,7 @@ class DashboardTest(unittest.TestCase):
             remote_user="dba",
             sudo_mode="none",
             reason="INC-1",
+            ticket="INC-1",
         )
         app.config["TESTING"] = True
         with mock.patch.object(isolate_web, "redis_client", return_value=redis):
@@ -2129,6 +2568,94 @@ class DashboardTest(unittest.TestCase):
             self.assertIn('id="scrubber"', replay_text)
             self.assertIn("Plain transcript", replay_text)
             self.assertIn("replay.json", replay_text)
+            self.assertIn('/static/vendor/xterm/xterm.mjs', replay_text)
+            static_response = client.get('/static/vendor/xterm/xterm.mjs')
+            self.assertEqual(static_response.status_code, 200)
+            static_response.close()
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_live_session_and_admin_termination(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-live-{}".format(uuid.uuid4().hex))
+        raw_path = os.path.join(tmpdir, "alice", "session-1", "raw.log")
+        try:
+            try:
+                app = isolate_web.create_app({
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "session_control": {"enabled": True, "terminate_enabled": True, "live_tail_bytes": 4096},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": tmpdir},
+                })
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            os.makedirs(os.path.dirname(raw_path))
+            with open(raw_path, "w", encoding="utf-8") as raw_f:
+                raw_f.write("1000.000000\n\033[31mactive\033[0m\n")
+            with open(os.path.join(os.path.dirname(raw_path), "session.jsonl"), "w", encoding="utf-8") as session_f:
+                session_f.write(json.dumps({
+                    "event": "ssh_start", "username": "alice", "connection_id": "conn-live",
+                    "session_id": "session-1", "project": "prod", "host_id": "1", "raw_log_path": raw_path,
+                }) + "\n")
+            redis = FakeRedis()
+            mark_session_start(redis, "conn-live", {"username": "alice", "project": "prod", "raw_log_path": raw_path})
+            app.config["TESTING"] = True
+            with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                    sess["csrf_token"] = "csrf"
+                live = client.get("/session/conn-live/live.json")
+                self.assertTrue(live.get_json()["active"])
+                self.assertIn("active", live.get_json()["plain"])
+                page = client.get("/session/conn-live/live").get_data(as_text=True)
+                self.assertIn("xterm.mjs", page)
+                response = client.post("/sessions/conn-live/terminate", data={
+                    "csrf_token": "csrf", "confirm": "true", "reason": "security incident",
+                })
+            self.assertEqual(response.status_code, 302)
+            self.assertTrue(get_session(redis, "conn-live")["terminate_requested"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_dashboard_inventory_policy_bulk_and_simulator(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-admin-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        try:
+            try:
+                app = isolate_web.create_app({
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": tmpdir},
+                    "policy": {"fallback_remote_user": None}, "ssh": {},
+                    "policy_as_code": {"enforce_git": False, "backup_dir": tmpdir},
+                })
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            redis = FakeRedis()
+            app.config["TESTING"] = True
+            with mock.patch.object(isolate_web, "redis_client", return_value=redis), mock.patch.object(isolate_web, "save_policy_snapshot", return_value={}):
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                    sess["csrf_token"] = "csrf"
+                inventory = client.post("/inventory", data={
+                    "csrf_token": "csrf", "confirm": "true", "action": "add", "project": "prod",
+                    "name": "web01", "ip": "10.0.0.1", "port": "22", "user": "support",
+                })
+                self.assertEqual(inventory.status_code, 200)
+                host_id = list_hosts(redis)[0]["server_id"]
+                grant = client.post("/grants", data={
+                    "csrf_token": "csrf", "confirm": "true", "action": "grant_save",
+                    "subject": "group", "name": "DevOps", "selector_type": "project",
+                    "selector_value": "prod", "remote_user": "support", "sudo_mode": "none",
+                    "allowed_actions": "ssh",
+                })
+                self.assertEqual(grant.status_code, 200)
+                simulator = client.get("/policy/simulate?groups=DevOps&project=prod&host={}".format(host_id))
+            self.assertIn("ALLOWED", simulator.get_data(as_text=True))
+            self.assertEqual(len(list_grant_records(redis)), 1)
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

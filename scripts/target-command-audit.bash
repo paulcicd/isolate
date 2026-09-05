@@ -6,6 +6,9 @@
 __isolate_audit_last_command=""
 
 __isolate_audit_preexec() {
+    case "$BASH_COMMAND" in
+        __isolate_audit_*|trap\ *) return ;;
+    esac
     __isolate_audit_last_command="$BASH_COMMAND"
 }
 
@@ -15,17 +18,25 @@ __isolate_audit_prompt() {
     if [[ -z "$connection_id" || -z "$ISOLATE_AUDIT_BASTION" || -z "$__isolate_audit_last_command" ]]; then
         return "$exit_code"
     fi
-    ssh -o BatchMode=yes "$ISOLATE_AUDIT_BASTION" isolate command-log append \
+    local command="$__isolate_audit_last_command"
+    __isolate_audit_last_command=""
+    trap - DEBUG
+    ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=3 \
+        "$ISOLATE_AUDIT_BASTION" isolate command-log append \
         --connection-id "$connection_id" \
         --host-id "${ISOLATE_HOST_ID:-}" \
         --project "${ISOLATE_PROJECT:-}" \
         --cwd "$PWD" \
         --exit-code "$exit_code" \
         --shell bash \
-        --command "$__isolate_audit_last_command" >/dev/null 2>&1 || true
-    __isolate_audit_last_command=""
+        --command "$command" >/dev/null 2>&1 &
+    trap '__isolate_audit_preexec' DEBUG
     return "$exit_code"
 }
 
+if declare -p PROMPT_COMMAND 2>/dev/null | grep -q '^declare -a'; then
+    PROMPT_COMMAND=(__isolate_audit_prompt "${PROMPT_COMMAND[@]}")
+else
+    PROMPT_COMMAND="__isolate_audit_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+fi
 trap '__isolate_audit_preexec' DEBUG
-PROMPT_COMMAND="__isolate_audit_prompt${PROMPT_COMMAND:+;$PROMPT_COMMAND}"

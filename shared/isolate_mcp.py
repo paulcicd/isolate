@@ -26,10 +26,11 @@ from isolate_config import load_config
 from isolate_history import read_history
 from isolate_identity import IdentityError, normalize_claims, verify_jwt_claims
 from isolate_inventory import HostValidationError, create_host, get_host, host_revision, list_hosts, validate_host_updates, update_host
-from isolate_jobs import JobError, create_command_job, get_job, list_jobs, read_job_output, request_job_cancel
+from isolate_jobs import JobError, create_command_job, create_runbook_job, get_job, list_jobs, read_job_output, request_job_cancel
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 from isolate_redis import create_redis_client
+from isolate_runbooks import RunbookError, get_runbook, list_runbooks, render_runbook
 
 
 class MCPAccessDenied(ValueError):
@@ -767,10 +768,113 @@ class IsolateMCPService(object):
         if not (set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
             raise MCPAccessDenied("identity is not in a command execution group")
 
+    def _runbook_access_error(self, identity, scopes, runbook_class):
+        runbooks = self.config.get("runbooks", {}) or {}
+        if not runbooks.get("enabled", False):
+            return "runbooks are disabled"
+        class_config = runbooks.get(runbook_class, {}) or {}
+        if runbook_class == "operational" and not class_config.get("enabled", False):
+            return "operational runbooks are disabled pending security review"
+        scope_name = "operate_scope" if runbook_class == "operational" else "runbook_scope"
+        scope = self.mcp_config.get(scope_name)
+        if not self._has_scope(scopes, scope):
+            return "required scope is missing: {}".format(scope)
+        if not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
+            return "identity is not in an allowed {} runbook group".format(runbook_class)
+        return None
+
+    def _require_runbook_submitter(self, identity, scopes, runbook_class):
+        error = self._runbook_access_error(identity, scopes, runbook_class)
+        if error:
+            raise MCPAccessDenied(error)
+
+    def _is_any_job_submitter(self, identity, scopes):
+        execution = self.config.get("command_execution", {}) or {}
+        command_allowed = bool(
+            execution.get("enabled", False)
+            and self._has_scope(scopes, self.mcp_config.get("execute_scope", "isolate.execute"))
+            and set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])
+        )
+        return command_allowed or any(
+            self._runbook_access_error(identity, scopes, runbook_class) is None
+            for runbook_class in ("read_only", "operational")
+        )
+
     def _can_view_job(self, identity, scopes, record):
         return bool(record and (
             record.get("username") == identity.get("username") or self._is_execution_admin(identity, scopes)
         ))
+
+    def runbook_list(self, identity, scopes):
+        started = time.monotonic()
+        classes = [
+            runbook_class for runbook_class in ("read_only", "operational")
+            if self._runbook_access_error(identity, scopes, runbook_class) is None
+        ]
+        if not classes:
+            self._audit("runbook_list", identity, "denied", started)
+            raise MCPAccessDenied("identity is not allowed to use any runbook class")
+        rows = list_runbooks(self.config, classes=classes)
+        self._audit("runbook_list", identity, "allowed", started, {"result_count": len(rows), "classes": classes})
+        return {"runbooks": rows, "count": len(rows), "classes": classes}
+
+    def runbook_show(self, identity, scopes, runbook_id):
+        started = time.monotonic()
+        runbook_id = _required_text(runbook_id, "runbook_id", 128)
+        runbook = get_runbook(self.config, runbook_id)
+        if runbook is None:
+            self._audit("runbook_show", identity, "denied", started, {"runbook_id": runbook_id})
+            raise MCPAccessDenied("runbook is unknown or disabled")
+        self._require_runbook_submitter(identity, scopes, runbook["class"])
+        self._audit("runbook_show", identity, "allowed", started, {"runbook_id": runbook_id})
+        return {"runbook": runbook}
+
+    def runbook_execute(self, identity, scopes, runbook_id, host_id, parameters=None, timeout=None, confirm=False):
+        started = time.monotonic()
+        runbook_id = _required_text(runbook_id, "runbook_id", 128)
+        host_id = _required_id(host_id, "host_id")
+        try:
+            rendered = render_runbook(self.config, runbook_id, parameters)
+            runbook = rendered["runbook"]
+            self._require_runbook_submitter(identity, scopes, runbook["class"])
+            class_config = (self.config.get("runbooks", {}) or {}).get(runbook["class"], {}) or {}
+            if class_config.get("require_confirmation", True) and confirm is not True:
+                raise MCPAccessDenied("explicit confirm=true is required to queue this runbook")
+            host = get_host(self.redis, host_id)
+            if host is None:
+                raise MCPAccessDenied("host was not found or is not allowed")
+            decision = resolve_grant(
+                identity,
+                project=host.get("project_name"),
+                host=host,
+                grants=load_grants(self.redis),
+                project_sets=load_project_sets(self.redis),
+                defaults=self._policy_defaults(),
+                action=rendered["policy_action"],
+            )
+            if decision.get("sudo_mode") == "sudo-i" and not class_config.get("allow_sudo", False):
+                raise MCPAccessDenied("sudo execution is disabled for this runbook class")
+            job = create_runbook_job(
+                self.redis, self.config, identity, host, decision, rendered, timeout=timeout
+            )
+            self._audit("runbook_execute", identity, "queued", started, {
+                "job_id": job.get("id"),
+                "runbook_id": runbook_id,
+                "runbook_class": runbook["class"],
+                "host_id": host_id,
+                "project": host.get("project_name"),
+            })
+            return {"job": job}
+        except (JobError, MCPAccessDenied, PolicyDenied, RunbookError, ValueError):
+            self._audit("runbook_execute", identity, "denied", started, {
+                "runbook_id": runbook_id, "host_id": host_id,
+            })
+            raise
+        except Exception:
+            self._audit("runbook_execute", identity, "error", started, {
+                "runbook_id": runbook_id, "host_id": host_id,
+            })
+            raise
 
     def command_job_create(self, identity, scopes, host_id, command, timeout=None, confirm=False):
         started = time.monotonic()
@@ -818,7 +922,8 @@ class IsolateMCPService(object):
             raise ValueError("invalid job status")
         admin = self._is_execution_admin(identity, scopes)
         if not admin:
-            self._require_command_submitter(identity, scopes)
+            if not self._is_any_job_submitter(identity, scopes):
+                raise MCPAccessDenied("identity is not allowed to submit or inspect jobs")
             if user and user != identity.get("username"):
                 raise MCPAccessDenied("other users' jobs are visible only to execution admins")
             user = identity.get("username")
@@ -862,7 +967,11 @@ class IsolateMCPService(object):
         if not self._can_view_job(identity, scopes, record):
             self._audit("command_job_cancel", identity, "denied", started, {"job_id": job_id})
             raise MCPAccessDenied("job was not found or is not visible")
-        if self.config.get("command_execution", {}).get("require_confirmation", True) and confirm is not True:
+        if record.get("type") == "runbook":
+            class_config = (self.config.get("runbooks", {}) or {}).get(record.get("runbook_class"), {}) or {}
+        else:
+            class_config = self.config.get("command_execution", {}) or {}
+        if class_config.get("require_confirmation", True) and confirm is not True:
             self._audit("command_job_cancel", identity, "denied", started, {"job_id": job_id})
             raise MCPAccessDenied("explicit confirm=true is required to cancel a job")
         record = request_job_cancel(self.redis, job_id, identity)
@@ -1057,7 +1166,7 @@ def create_mcp_server(config=None, redis=None):
         groups: list[str] | None = None,
         roles: list[str] | None = None,
     ) -> dict[str, Any]:
-        """Simulate an SSH or command policy decision without changing policy."""
+        """Simulate an ssh, command, runbook, or operate policy decision without changing policy."""
         token = _request_token()
         return service.policy_preview(
             normalize_claims(token.claims), token.scopes, project=project, host_id=host_id,
@@ -1168,6 +1277,38 @@ def create_mcp_server(config=None, redis=None):
             request_id,
             reason=reason,
             comment=comment,
+            confirm=confirm,
+        )
+
+    @server.tool(structured_output=True)
+    def runbook_list() -> dict[str, Any]:
+        """List built-in runbooks whose class is allowed by the caller's verified scope and groups."""
+        token = _request_token()
+        return service.runbook_list(normalize_claims(token.claims), token.scopes)
+
+    @server.tool(structured_output=True)
+    def runbook_show(runbook_id: str) -> dict[str, Any]:
+        """Show one allowed runbook, its typed parameters, and its authorization class."""
+        token = _request_token()
+        return service.runbook_show(normalize_claims(token.claims), token.scopes, runbook_id)
+
+    @server.tool(structured_output=True)
+    def runbook_execute(
+        runbook_id: str,
+        host_id: str,
+        parameters: dict[str, Any] | None = None,
+        confirm: bool = False,
+        timeout: int | None = None,
+    ) -> dict[str, Any]:
+        """Queue a typed runbook after scope, group, grant-action, parameter, and confirmation checks."""
+        token = _request_token()
+        return service.runbook_execute(
+            normalize_claims(token.claims),
+            token.scopes,
+            runbook_id,
+            host_id,
+            parameters=parameters,
+            timeout=timeout,
             confirm=confirm,
         )
 

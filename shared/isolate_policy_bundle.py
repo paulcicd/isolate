@@ -3,6 +3,9 @@
 """Git-friendly policy bundle validation, diff, and apply helpers."""
 
 import json
+import re
+
+from isolate_policy import PolicyDenied, resolve_grant
 
 try:
     import yaml
@@ -47,7 +50,11 @@ def grant_identity(grant):
 def load_bundle(path):
     with open(path, "r", encoding="utf-8") as policy_f:
         text = policy_f.read()
-    if path.lower().endswith(".json"):
+    return load_bundle_text(text, input_format="json" if path.lower().endswith(".json") else "yaml")
+
+
+def load_bundle_text(text, input_format="yaml"):
+    if input_format == "json":
         data = json.loads(text)
     else:
         if yaml is None:
@@ -138,6 +145,15 @@ def validate_bundle(bundle):
             errors.append("{} references unknown project set: {}".format(label, grant.get("project_set")))
         if not grant.get("remote_user"):
             errors.append("{}.remote_user is required".format(label))
+        elif re.fullmatch(r"[A-Za-z0-9_,.-]{1,64}", str(grant.get("remote_user"))) is None:
+            errors.append("{}.remote_user is invalid".format(label))
+        if grant.get("sudo_mode", "none") not in ("none", "sudo-i"):
+            errors.append("{}.sudo_mode must be none or sudo-i".format(label))
+        actions = grant.get("allowed_actions", ["ssh"])
+        if not isinstance(actions, list) or not actions:
+            errors.append("{}.allowed_actions must be a non-empty list".format(label))
+        elif any(re.fullmatch(r"[a-z][a-z0-9_-]{0,31}", str(action)) is None for action in actions):
+            errors.append("{}.allowed_actions contains an invalid action".format(label))
         grant_id = grant.get("id")
         if grant_id is not None:
             if not str(grant_id).isdigit():
@@ -162,7 +178,9 @@ def validate_bundle(bundle):
 def _current_maps(redis):
     bundle = export_bundle(redis)
     grants_by_id = {str(row["id"]): row for row in bundle["grants"]}
-    grants_by_identity = {grant_identity(row): row for row in bundle["grants"]}
+    grants_by_identity = {
+        grant_identity(row): row for row in bundle["grants"] if not row.get("temporary")
+    }
     sets_by_name = {row["name"]: row for row in bundle["project_sets"]}
     return grants_by_id, grants_by_identity, sets_by_name
 
@@ -179,6 +197,8 @@ def plan_bundle(redis, bundle, prune=False):
         desired = dict(desired)
         desired_id = desired.get("id")
         current = current_by_id.get(str(desired_id)) if desired_id is not None else None
+        if current is not None and current.get("temporary") and not desired.get("temporary"):
+            current = None
         if current is None:
             current = current_by_identity.get(grant_identity(desired))
         if current is None:
@@ -201,7 +221,10 @@ def plan_bundle(redis, bundle, prune=False):
             changes["project_set_update"].append({"before": current, "after": desired})
 
     if prune:
-        changes["grant_remove"] = [row for grant_id, row in current_by_id.items() if grant_id not in desired_grant_ids]
+        changes["grant_remove"] = [
+            row for grant_id, row in current_by_id.items()
+            if grant_id not in desired_grant_ids and not row.get("temporary")
+        ]
         changes["project_set_remove"] = [row for name, row in current_sets.items() if name not in desired_set_names]
     return changes
 
@@ -255,3 +278,112 @@ def apply_bundle(redis, bundle, prune=False, dry_run=False):
 
 def change_count(changes):
     return sum(len(rows) for rows in changes.values())
+
+
+def _state_after_plan(redis, bundle, prune=False):
+    current = export_bundle(redis)
+    changes = plan_bundle(redis, bundle, prune=prune)
+    grants = {str(row["id"]): dict(row) for row in current["grants"]}
+    project_sets = {row["name"]: dict(row) for row in current["project_sets"]}
+    for row in changes["grant_remove"]:
+        grants.pop(str(row["id"]), None)
+    for change in changes["grant_update"]:
+        grants[str(change["after"]["id"])] = dict(change["after"])
+    synthetic = 0
+    for row in changes["grant_add"]:
+        synthetic += 1
+        item = dict(row)
+        item["id"] = str(item.get("id") or "new-{}".format(synthetic))
+        grants[item["id"]] = item
+    for row in changes["project_set_remove"]:
+        project_sets.pop(row["name"], None)
+    for change in changes["project_set_update"]:
+        project_sets[change["after"]["name"]] = dict(change["after"])
+    for row in changes["project_set_add"]:
+        project_sets[row["name"]] = dict(row)
+    return list(grants.values()), project_sets
+
+
+def _principal_identity(subject, name):
+    identity = {"username": "policy-preview", "groups": [], "roles": []}
+    if subject == "user":
+        identity["username"] = name
+    elif subject == "group":
+        identity["groups"] = [name]
+    elif subject == "role":
+        identity["roles"] = [name]
+    return identity
+
+
+def _decision(identity, host, grants, project_sets, action):
+    try:
+        result = resolve_grant(
+            identity,
+            project=host.get("project_name"),
+            host=host,
+            grants=grants,
+            project_sets=project_sets,
+            defaults={"fallback_remote_user": None, "default_remote_user": None},
+            action=action,
+        )
+        return {
+            "allowed": True,
+            "remote_user": result.get("remote_user"),
+            "sudo_mode": result.get("sudo_mode"),
+            "grant_id": (result.get("matched_rule") or {}).get("id"),
+        }
+    except PolicyDenied:
+        return {"allowed": False}
+
+
+def blast_radius(redis, bundle, hosts, prune=False, max_entries=2000):
+    validation = validate_bundle(bundle)
+    if not validation["valid"]:
+        raise PolicyBundleError("; ".join(validation["errors"]))
+    current = export_bundle(redis)
+    desired_grants, desired_sets = _state_after_plan(redis, bundle, prune=prune)
+    current_grants = current["grants"]
+    current_sets = {row["name"]: row for row in current["project_sets"]}
+    principals = sorted({
+        (str(row.get("subject") or ""), str(row.get("name") or ""))
+        for row in current_grants + desired_grants
+        if row.get("subject") and row.get("name")
+    })
+    actions = sorted({
+        str(action)
+        for row in current_grants + desired_grants
+        for action in (row.get("allowed_actions") or ["ssh"])
+    })
+    impacts = []
+    counts = {"gained": 0, "lost": 0, "changed": 0}
+    truncated = False
+    for subject, name in principals:
+        identity = _principal_identity(subject, name)
+        for host in hosts:
+            for action in actions:
+                before = _decision(identity, host, current_grants, current_sets, action)
+                after = _decision(identity, host, desired_grants, desired_sets, action)
+                if before == after:
+                    continue
+                if not before.get("allowed") and after.get("allowed"):
+                    change = "gained"
+                elif before.get("allowed") and not after.get("allowed"):
+                    change = "lost"
+                else:
+                    change = "changed"
+                counts[change] += 1
+                if len(impacts) >= int(max_entries):
+                    truncated = True
+                    continue
+                impacts.append({
+                    "change": change,
+                    "subject": subject,
+                    "name": name,
+                    "action": action,
+                    "project": host.get("project_name"),
+                    "host_id": str(host.get("server_id")),
+                    "server_name": host.get("server_name"),
+                    "before": before,
+                    "after": after,
+                })
+    return {"counts": counts, "impacts": impacts, "truncated": truncated, "principals": len(principals), "hosts": len(hosts)}

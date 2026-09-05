@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run queued Isolate command jobs."""
+"""Run queued Isolate command and runbook jobs."""
 
 import os
 import sys
@@ -13,8 +13,10 @@ from isolate_redis import create_redis_client
 
 def main():
     config = load_config()
-    if not config.get("command_execution", {}).get("enabled", False):
-        raise SystemExit("command_execution.enabled is false")
+    commands_enabled = config.get("command_execution", {}).get("enabled", False)
+    runbooks_enabled = config.get("runbooks", {}).get("enabled", False)
+    if not commands_enabled and not runbooks_enabled:
+        raise SystemExit("command_execution.enabled and runbooks.enabled are both false")
     run_worker(config, create_redis_client(config), once="--once" in sys.argv[1:])
 
 

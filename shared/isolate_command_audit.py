@@ -41,6 +41,10 @@ def append_command_event(base_path, connection_id, command, cwd=None, exit_code=
 
     events = details.get("events") or []
     context = _first_context(events)
+    for field, supplied in (("project", project), ("host_id", host_id)):
+        trusted = context.get(field)
+        if trusted not in (None, "") and supplied not in (None, "") and str(supplied) != str(trusted):
+            raise CommandAuditError("{} does not match the session context".format(field))
     record = {
         "ts": time.time(),
         "event": "command",
@@ -49,8 +53,8 @@ def append_command_event(base_path, connection_id, command, cwd=None, exit_code=
         "keycloak_sub": context.get("keycloak_sub"),
         "username": context.get("username"),
         "groups": context.get("groups", []),
-        "project": project or context.get("project"),
-        "host_id": host_id or context.get("host_id"),
+        "project": context.get("project") or project,
+        "host_id": context.get("host_id") or host_id,
         "cwd": cwd,
         "command": command,
         "command_truncated": truncated,

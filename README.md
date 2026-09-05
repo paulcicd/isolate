@@ -1395,6 +1395,41 @@ The active session record includes:
 
 The dashboard reads this registry to show current connections.
 
+### Session Control And Alerts
+
+Session control is compatible with the existing `g` flow. The wrapper still starts the same SSH process, but keeps a low-frequency Redis heartbeat and checks for an administrator termination request. Termination and risk alerts are disabled by default.
+
+```yaml
+session_control:
+  enabled: true
+  terminate_enabled: true
+  poll_interval: 1
+  heartbeat_interval: 15
+  active_ttl: 86400
+  live_tail_bytes: 262144
+  alerts:
+    enabled: true
+    long_session_seconds: 14400
+    vip: true
+    privileged: true
+    unusual_source: true
+    trusted_source_cidrs:
+      - 10.0.0.0/8
+      - 192.0.2.0/24
+```
+
+Alerts use the same configured webhook, Telegram, and email sinks as access requests. They are emitted for VIP sessions, `root`/`sudo-i`, sources outside `trusted_source_cidrs`, and sessions longer than `long_session_seconds`. Delivery results remain visible on `/notifications` while the Redis session record exists.
+
+Dashboard administrators can open `/sessions/active`, watch `/session/<connection_id>/live`, and request termination. CLI termination is also available:
+
+```bash
+isolate session terminate 22222222-2222-2222-2222-222222222222 \
+  --reason "INC-2042 containment" \
+  --yes
+```
+
+The command sets an authenticated Redis control flag. The auth-owned wrapper records `session_termination_received`, sends `SIGTERM` to the SSH process group, escalates to `SIGKILL` only if needed, restores the local TTY, and writes `ssh_end` with exit code `143`. If Redis is temporarily unavailable, an existing SSH session continues; control-plane failure does not break the data path.
+
 ## Session Logging
 
 Structured logs are written to:
@@ -1460,7 +1495,9 @@ Replay v2 includes:
 - speed selector;
 - `replay.json` download;
 - plain transcript toggle;
-- safe HTML escaping with a minimal ANSI-friendly fallback.
+- a locally vendored xterm.js terminal engine for ANSI/VT sequences, colors, cursor movement, alternate-screen applications, and Unicode;
+- no external CDN dependency;
+- a safely escaped plain-text fallback for malformed legacy logs.
 
 Configure payload limits:
 
@@ -1480,13 +1517,17 @@ Enable it:
 command_audit:
   enabled: true
   require_connection_id: true
+  require_active_session: true
+  completion_grace_seconds: 30
   max_command_length: 4096
+  send_env: true
+  ingest_user: auth
 ```
 
 Append a command event:
 
 ```bash
-isolate command-log append \
+sudo -u auth /opt/auth/shared/isolate.py command-log append \
   --connection-id 22222222-2222-2222-2222-222222222222 \
   --host-id 10042 \
   --project payments-prod \
@@ -1521,7 +1562,23 @@ Hook templates are provided for target hosts:
 /opt/auth/scripts/target-command-audit.zsh
 ```
 
-The templates expect deployment-specific context, usually environment variables such as `ISOLATE_CONNECTION_ID`, `ISOLATE_HOST_ID`, `ISOLATE_PROJECT`, and `ISOLATE_AUDIT_BASTION`. Install them only on hosts where command audit is required.
+Roll out a target host explicitly:
+
+```bash
+sudo /path/to/isolate/scripts/install-target-command-audit.sh auth@bastion.example.org
+```
+
+The installer deploys Bash and Zsh hooks, adds the four `AcceptEnv` names to an `sshd_config.d` drop-in, validates the SSH daemon config, and reloads SSH. It is inert for connections that do not contain `ISOLATE_CONNECTION_ID`.
+
+Use a dedicated callback key. On the bastion, restrict its `authorized_keys` entry so a compromised target cannot execute arbitrary Isolate commands:
+
+```text
+restrict,command="/opt/auth/scripts/isolate-command-audit-ingest.py" ssh-ed25519 AAAA... isolate-command-audit
+```
+
+Install the corresponding private key on the target with root-only permissions and select it through the target's SSH config for `auth@bastion.example.org`. The forced-command helper accepts only `isolate command-log append`. Isolate also verifies that the supplied project/host match the trusted session JSONL and that the connection is active or ended within the short configured grace period.
+
+The hooks submit asynchronously with `BatchMode`, no forwarding, and a short connection timeout, so a callback outage does not delay the operator prompt. The append endpoint also checks the effective Unix account and accepts events only from `command_audit.ingest_user` (`auth` by default), which prevents interactive bastion users from submitting fabricated events through the CLI. Command audit is best effort unless targets are integrated with a central audit agent. `sudo -i` commonly strips `ISOLATE_*`; if command auditing of privileged shells is required, review a narrowly scoped `sudoers` `env_keep` rule with DevSecOps rather than preserving arbitrary environment variables.
 
 ## Admin Dashboard
 
@@ -1567,14 +1624,18 @@ Routes:
 - `/login`: Keycloak login.
 - `/auth/callback`: OIDC callback.
 - `/logout`: logout.
-- `/sessions/active`: active SSH sessions.
+- `/sessions/active`: active SSH sessions, live view, and optional force termination.
 - `/history`: connection history.
 - `/session/<connection_id>`: session details and timeline.
 - `/session/<connection_id>/events.json`: session JSONL events.
-- `/inventory`: read-only host inventory with service/note search.
+- `/inventory`: searchable inventory, host creation, editing, and validated bulk updates.
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
-- `/grants`: grants and project sets.
-- `/replay/<connection_id>`: raw transcript replay MVP.
+- `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
+- `/policy/simulate`: visual allow/deny simulator using the production resolver.
+- `/policy/gitops`: signed Git policy status, drift/blast-radius refresh, sync, and rollback.
+- `/users` and `/user/<username>`: observed groups, candidate grants, active sessions, and history.
+- `/notifications`: configured sinks and delivery results for access requests and session alerts.
+- `/replay/<connection_id>`: xterm.js ANSI terminal replay.
 - `/replay/<connection_id>.json`: parsed replay chunks.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 
@@ -1593,7 +1654,7 @@ Access approval from the dashboard supports:
 - notification warnings;
 - denial reason.
 
-Dashboard POST actions use a per-session CSRF token.
+Dashboard POST actions use a per-session CSRF token and explicit confirmation. Host edit forms carry an optimistic revision token, so a stale browser form cannot overwrite a newer host update. Policy mutations create a private snapshot first. When `policy_as_code.enforce_git` is true, manual grant/project-set forms are read-only and Git is the only static-policy writer.
 
 ## MCP Server
 
@@ -1625,6 +1686,8 @@ The phase-three administration and jobs surface exposes:
 - `grant_list` and `grant_show`: read grants for policy administrators;
 - `project_set_list` and `project_set_show`: read named project sets;
 - `policy_preview`: simulate `ssh` or `command` decisions without changing policy;
+- `runbook_list` and `runbook_show`: discover typed runbooks allowed by the caller's scope and groups;
+- `runbook_execute`: queue a policy-authorized read-only or operational runbook;
 - `command_job_create`: queue an authorized non-interactive command;
 - `command_job_list`, `command_job_show`, and `command_job_output`: inspect own jobs or all jobs as an execution admin;
 - `command_job_cancel`: cancel a queued or running job.
@@ -1660,6 +1723,8 @@ Configure Keycloak so access tokens presented to Isolate contain:
 - `scope` containing `isolate.approve` only for MCP clients and administrators allowed to approve or deny requests.
 - `scope` containing `isolate.inventory.write` for inventory administrators;
 - `scope` containing `isolate.policy.read` for grant, project-set, and policy-preview access;
+- `scope` containing `isolate.runbook` for approved read-only diagnostics;
+- `scope` containing `isolate.operate` only for identities approved for operational runbooks;
 - `scope` containing `isolate.execute` for users allowed to submit remote command jobs.
 
 `access.admin_groups` remains the source of truth for access administrators. The `isolate.approve` scope is an additional requirement, not a replacement for the group check. Assign the approval client scope narrowly and do not include it in every user's default token.
@@ -1688,6 +1753,8 @@ mcp:
   inventory_write_scope: isolate.inventory.write
   policy_read_scope: isolate.policy.read
   execute_scope: isolate.execute
+  runbook_scope: isolate.runbook
+  operate_scope: isolate.operate
   inventory_admin_groups:
     - Demo-Platform-Admins
   policy_admin_groups:
@@ -1720,6 +1787,105 @@ access:
 ```
 
 An MCP approval token must contain both one of these verified groups and `scope: isolate.approve`. Keeping `prevent_self_approval` and `require_mutation_confirmation` enabled is strongly recommended.
+
+### MCP Runbooks
+
+Runbooks are typed commands executed through the same asynchronous worker as command jobs. They do not enable arbitrary shell input: every executable and option is defined in the auth-owned source catalog, and caller parameters are validated before a job is signed. The worker renders the runbook again and rechecks its definition hash, host routing, Keycloak group snapshot, effective grant action, remote user, and sudo mode immediately before SSH.
+
+The built-in read-only catalog contains 15 runbooks:
+
+| Runbook | Purpose | Parameters |
+| --- | --- | --- |
+| `uptime` | Uptime and load averages | none |
+| `disk-usage` | Filesystem type and space usage | none |
+| `inode-usage` | Filesystem inode usage | none |
+| `memory` | Memory and swap usage | none |
+| `cpu-processes` | Processes sorted by CPU | none |
+| `memory-processes` | Processes sorted by memory | none |
+| `top-snapshot` | One non-interactive top sample | none |
+| `atop-snapshot` | One parseable atop sample | none |
+| `service-status` | Full systemd unit status | `service` |
+| `service-active` | Systemd active state | `service` |
+| `journal-tail` | Recent service journal | `service`, optional `lines` (default 200, max 2000) |
+| `failed-services` | Failed systemd units | none |
+| `listening-sockets` | Listening TCP/UDP sockets | none |
+| `network-addresses` | Interface and address summary | none |
+| `network-routes` | Routing table | none |
+
+The operational catalog contains `service-restart`, `dns-cache-flush`, and `deploy-diagnostics`. Operational runbooks are present in code but hidden and denied until `runbooks.operational.enabled` is explicitly enabled. `dns-cache-flush` only flushes `systemd-resolved`; application cache deletion must use a separately reviewed fixed helper and must never accept an arbitrary filesystem path.
+
+Runbooks have four independent authorization gates:
+
+1. `runbooks.enabled` is true, and operational runbooks additionally require `runbooks.operational.enabled`;
+2. the verified token contains `isolate.runbook` or, for operational actions, `isolate.operate`;
+3. the verified identity belongs to the configured group for that runbook class;
+4. the effective host grant contains `runbook` or, for operational actions, `operate` in `allowed_actions`.
+
+Recommended first rollout for read-only diagnostics:
+
+```yaml
+runbooks:
+  enabled: true
+  disabled: []
+  read_only:
+    allowed_groups:
+      - Demo-Technical-Support
+      - Demo-DevOps
+    allow_sudo: false
+    require_confirmation: true
+  operational:
+    enabled: false
+    allowed_groups: []
+    allow_sudo: false
+    require_confirmation: true
+```
+
+Grant diagnostic access only where it is needed:
+
+```bash
+isolate grant update --id 7 \
+  --allowed-action ssh \
+  --allowed-action runbook
+```
+
+Example MCP calls:
+
+```json
+{"name":"runbook_list","arguments":{}}
+{"name":"runbook_execute","arguments":{"runbook_id":"uptime","host_id":"10042","confirm":true}}
+{"name":"runbook_execute","arguments":{"runbook_id":"journal-tail","host_id":"10042","parameters":{"service":"nginx.service","lines":100},"confirm":true}}
+```
+
+After security review, enable operational actions for a smaller group and selected grants:
+
+```yaml
+runbooks:
+  enabled: true
+  operational:
+    enabled: true
+    allowed_groups:
+      - Demo-Platform-Operators
+    allow_sudo: false
+    require_confirmation: true
+```
+
+```bash
+isolate grant update --id 12 \
+  --allowed-action ssh \
+  --allowed-action runbook \
+  --allowed-action operate
+```
+
+Use a dedicated remote account with narrowly scoped permissions where possible. Set `runbooks.operational.allow_sudo: true` only after reviewing the remote `sudoers` rules and only for grants that intentionally resolve to `sudo_mode: sudo-i`. The worker uses `sudo -n`, so password prompts fail closed.
+
+Operational examples:
+
+```json
+{"name":"runbook_execute","arguments":{"runbook_id":"service-restart","host_id":"10042","parameters":{"service":"nginx.service"},"confirm":true}}
+{"name":"runbook_execute","arguments":{"runbook_id":"deploy-diagnostics","host_id":"10042","parameters":{"service":"payments-api.service","lines":300},"confirm":true}}
+```
+
+Runbook jobs are inspected with the existing `command_job_list`, `command_job_show`, `command_job_output`, and `command_job_cancel` tools. Audit events contain the runbook id and class plus the command SHA-256, but do not copy the full command or parameters into the central audit record. Output remains protected under `/opt/auth/jobs`.
 
 ### Remote Command Jobs
 
@@ -1835,7 +2001,7 @@ journalctl -u isolate-job-worker.service
 
 The unauthenticated MCP request must return `401` with a `WWW-Authenticate` header containing `resource_metadata`. Use the MCP Inspector or another OAuth-capable MCP client for a complete login and tool-call test.
 
-MCP intentionally excludes arbitrary grant mutations, project-set mutations, policy apply, host deletion, backup restore, and interactive SSH. Host add/update and asynchronous commands are explicit, separately scoped operations; command execution remains disabled until configured and its worker is enabled.
+MCP intentionally excludes arbitrary grant mutations, project-set mutations, policy apply, host deletion, backup restore, and interactive SSH. Host add/update, typed runbooks, and asynchronous commands are explicit, separately scoped operations. Runbooks and arbitrary command execution both remain disabled until configured and the job worker is enabled.
 
 ## Production Operations
 
@@ -2117,6 +2283,84 @@ sudo -u auth isolate policy apply --file /opt/auth/configs/policy.yml --prune --
 ```
 
 `--prune` is never implicit. Before a real change, Isolate writes a private backup to `/opt/auth/backups/policy-<timestamp>.yml`. Existing IDs are preserved when an exported bundle is edited, and a matching natural selector updates the existing rule instead of creating a duplicate.
+
+### Optional Signed GitOps Mode
+
+The existing Redis/CLI workflow remains the default. Enable GitOps only when the team is ready to make a protected Git repository the source of truth for static grants and project sets:
+
+```yaml
+policy_as_code:
+  enabled: true
+  enforce_git: true
+  repository: ssh://git@git.example.org/platform/isolate-policy.git
+  checkout_path: /opt/auth/cache/policy-repo
+  branch: main
+  git_bundle_path: policy.yml
+  prune: true
+  require_pr_approval: true
+  approval_attestation_path: policy.approval.json
+  approval_key_file: /opt/auth/keys/policy_approval_hmac.key
+  minimum_approvals: 2
+  backup_dir: /opt/auth/backups
+  require_confirmation: true
+```
+
+When GitOps is enabled, PR approval attestation is mandatory and cannot be disabled. The attestation is signed by trusted CI and binds the target branch, exact SHA-256 of `policy.yml`, approver identities, and optional PR URL. It deliberately signs the policy content rather than the containing commit, avoiding an impossible self-referential commit hash.
+
+Generate a 32-byte-or-longer shared HMAC key once and provision it independently to protected CI secrets and the bastion. Do not commit the key:
+
+```bash
+sudo openssl rand -hex 32 | sudo tee /opt/auth/keys/policy_approval_hmac.key >/dev/null
+sudo chown auth:auth /opt/auth/keys/policy_approval_hmac.key
+sudo chmod 0600 /opt/auth/keys/policy_approval_hmac.key
+```
+
+After CI has verified the required PR approvals, it can produce the repository attestation:
+
+```bash
+ISOLATE_CONFIG=/run/secrets/isolate-ci.yml isolate policy attest \
+  --file policy.yml \
+  --branch main \
+  --approver demo.reviewer-one \
+  --approver demo.reviewer-two \
+  --pr-url https://git.example.org/platform/isolate-policy/merge_requests/42 \
+  --output policy.approval.json
+```
+
+Commit the generated `policy.approval.json` to the reviewed branch. If CI appends it after the first review, configure branch protection to require approval of the final commit as well. A changed policy invalidates the old attestation even if the filename and approver list are copied.
+
+Operator workflow:
+
+```bash
+# Local bundle checks
+isolate policy validate --file policy.yml
+isolate policy diff --file policy.yml --prune
+isolate policy blast-radius --file policy.yml --prune
+
+# Fetch the configured branch and verify CI approval; no writes
+sudo -u auth isolate policy drift --git
+sudo -u auth isolate policy sync --dry-run
+
+# Snapshot Redis, then apply the signed revision
+sudo -u auth isolate policy sync --yes
+
+# Inspect and roll back snapshots
+sudo -u auth isolate policy revisions
+sudo -u auth isolate policy rollback --revision <revision-id> --yes
+```
+
+`blast-radius` reports gained, lost, and changed access for every known subject/action/host combination. Exit code `3` from `policy drift` means valid policy drift was found; exit code `2` means validation, Git, or approval verification failed. With `prune: true`, Git is authoritative for static policy, but active temporary break-glass grants are intentionally preserved. `enforce_git: true` blocks manual static grant/project-set mutations in CLI and dashboard; access-request approval continues to create expiring grants.
+
+For periodic pull/apply, install the supplied units and enable the timer explicitly:
+
+```bash
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-policy-sync.service /etc/systemd/system/
+sudo install -o root -g root -m 0644 /opt/auth/deploy/systemd/isolate-policy-sync.timer /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now isolate-policy-sync.timer
+```
+
+The timer is never enabled by default. With Ansible, set `isolate_enable_policy_sync_timer: true`. A manual rollback creates another pre-rollback snapshot; pause the timer if the Git branch still points to the revision being rolled back.
 
 ## Central Audit Pipeline
 

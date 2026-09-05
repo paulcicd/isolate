@@ -28,7 +28,8 @@ from isolate_config import load_config
 from isolate_identity import local_identity
 from isolate_logging import SessionLogger
 from isolate_redis import create_redis_client
-from isolate_sessions import mark_session_end, mark_session_start
+from isolate_session_alerts import dispatch_alert_async, initial_session_alerts, long_session_alert
+from isolate_sessions import get_session, mark_alert_sent, mark_session_end, mark_session_start, touch_session
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 
 LOGGER = logging.getLogger('ssh-wrapper')
@@ -246,24 +247,49 @@ def _write_raw_log(raw_log, data):
     raw_log.flush()
 
 
-def _run_pipe_command(argv, raw_log):
+def _terminate_child(proc):
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        proc.wait(timeout=3)
+    except Exception:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            proc.kill()
+        proc.wait()
+
+
+def _run_pipe_command(argv, raw_log, control=None):
     proc = subprocess.Popen(
         argv,
         stdin=None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        start_new_session=True,
     )
     while True:
-        chunk = proc.stdout.readline()
-        if not chunk:
+        if control and control():
+            _terminate_child(proc)
+            return 143
+        ready, _, _ = select.select([proc.stdout.fileno()], [], [], 0.5)
+        if ready:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if chunk:
+                os.write(sys.stdout.fileno(), chunk)
+                _write_raw_log(raw_log, chunk)
+        if proc.poll() is not None:
+            remaining = proc.stdout.read() or b""
+            if remaining:
+                os.write(sys.stdout.fileno(), remaining)
+                _write_raw_log(raw_log, remaining)
             break
-        os.write(sys.stdout.fileno(), chunk)
-        _write_raw_log(raw_log, chunk)
     return proc.wait()
 
 
-def _run_pty_command(argv, raw_log):
+def _run_pty_command(argv, raw_log, control=None):
     master_fd, slave_fd = pty.openpty()
     old_tty = None
     stdin_fd = sys.stdin.fileno()
@@ -285,6 +311,9 @@ def _run_pty_command(argv, raw_log):
 
     try:
         while True:
+            if control and control():
+                _terminate_child(proc)
+                return 143
             if proc.poll() is not None:
                 # Drain pending PTY output after process exit.
                 while True:
@@ -342,12 +371,67 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
     audit.event("ssh_start", argv=argv, raw_log_path=raw_log_path, **metadata)
     started = time.time()
     redis = None
+    control_state = {"checked_at": 0.0, "heartbeat_at": 0.0, "terminated": False}
+    control_cfg = (config or {}).get("session_control", {}) or {}
     if config and metadata.get("connection_id"):
         try:
             redis = _redis_client(config)
-            mark_session_start(redis, metadata["connection_id"], metadata)
+            metadata["wrapper_pid"] = os.getpid()
+            metadata["raw_log_path"] = raw_log_path
+            record = mark_session_start(
+                redis,
+                metadata["connection_id"],
+                metadata,
+                ttl=int(control_cfg.get("active_ttl", 86400)),
+            )
+            for alert_name in initial_session_alerts(config, record):
+                mark_alert_sent(redis, metadata["connection_id"], alert_name)
+                audit.event("session_alert", alert=alert_name, **metadata)
+                dispatch_alert_async(config, alert_name, record, redis=redis)
         except Exception as exc:
             LOGGER.warning("active session registry start failed: {}".format(exc))
+
+    def session_control():
+        if redis is None or not control_cfg.get("enabled", True):
+            return False
+        now = time.time()
+        poll_interval = max(float(control_cfg.get("poll_interval", 1)), 0.25)
+        alerts_enabled = bool((control_cfg.get("alerts", {}) or {}).get("enabled", False))
+        frequent_poll = bool(control_cfg.get("terminate_enabled", False) or alerts_enabled)
+        heartbeat_due = now - control_state["heartbeat_at"] >= int(control_cfg.get("heartbeat_interval", 15))
+        if (not frequent_poll and not heartbeat_due) or (
+            frequent_poll and now - control_state["checked_at"] < poll_interval
+        ):
+            return control_state["terminated"]
+        control_state["checked_at"] = now
+        try:
+            record = get_session(redis, metadata["connection_id"])
+            if record and now - control_state["heartbeat_at"] >= int(control_cfg.get("heartbeat_interval", 15)):
+                record = touch_session(
+                    redis,
+                    metadata["connection_id"],
+                    ttl=int(control_cfg.get("active_ttl", 86400)),
+                    now=now,
+                )
+                control_state["heartbeat_at"] = now
+            alert_name = long_session_alert(config, record or {}, now)
+            if alert_name:
+                mark_alert_sent(redis, metadata["connection_id"], alert_name)
+                alert_record = dict(record or {})
+                alert_record["duration_seconds"] = int(now) - int(alert_record.get("started_at") or now)
+                audit.event("session_alert", alert=alert_name, **metadata)
+                dispatch_alert_async(config, alert_name, alert_record, redis=redis)
+            if control_cfg.get("terminate_enabled", False) and record and record.get("terminate_requested"):
+                control_state["terminated"] = True
+                audit.event(
+                    "session_termination_received",
+                    requested_by=record.get("terminate_requested_by"),
+                    reason=record.get("terminate_reason"),
+                    **metadata
+                )
+        except Exception as exc:
+            LOGGER.warning("session control poll failed: {}".format(exc))
+        return control_state["terminated"]
 
     with open(raw_log_path, 'a', encoding='utf-8', errors='replace') as raw_log:
         try:
@@ -355,9 +439,9 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
         except PermissionError:
             pass
         if pty is not None and sys.stdin.isatty() and sys.stdout.isatty():
-            exit_code = _run_pty_command(argv, raw_log)
+            exit_code = _run_pty_command(argv, raw_log, control=session_control)
         else:
-            exit_code = _run_pipe_command(argv, raw_log)
+            exit_code = _run_pipe_command(argv, raw_log, control=session_control)
 
     if exit_code != 0:
         msg = 'Exit code: {1}{0}{2}'.format(exit_code, term_colors['red'], term_colors['reset'])
@@ -392,6 +476,7 @@ if __name__ == '__main__':
     parser.add_argument('--host-id')
     parser.add_argument('--human-user')
     parser.add_argument('--keycloak-sub')
+    parser.add_argument('--vip', action='store_true')
     args, extra_args = parser.parse_known_args()
     #
     if args.debug:
@@ -429,6 +514,16 @@ if __name__ == '__main__':
             "user": host_meta["proxy_user"],
         }
     try:
+        send_env = []
+        if config.get("command_audit", {}).get("send_env", False):
+            context_env = {
+                "ISOLATE_CONNECTION_ID": connection_id,
+                "ISOLATE_HOST_ID": args.host_id or "",
+                "ISOLATE_PROJECT": args.project or "",
+                "ISOLATE_HUMAN_USER": identity.get("username") or "",
+            }
+            os.environ.update(context_env)
+            send_env = sorted(context_env)
         argv = build_ssh_argv(
             config["ssh"],
             {
@@ -440,6 +535,7 @@ if __name__ == '__main__':
             extra_args=extra_args,
             proxy=proxy,
             remote_command=remote_command,
+            send_env=send_env,
         )
     except SSHArgumentError as exc:
         audit.event("ssh_argument_denied", reason=str(exc), **host_meta)
@@ -452,10 +548,14 @@ if __name__ == '__main__':
     host_meta['argv'] = argv
     sys.exit(run_command(argv, raw_log_path, audit, {
         "connection_id": connection_id,
+        "username": identity.get("username"),
+        "keycloak_sub": identity.get("keycloak_sub"),
         "project": args.project,
         "host_id": args.host_id,
         "target_host": host_meta["hostname"],
         "target_port": host_meta["port"],
         "remote_user": host_meta["user"],
+        "sudo_mode": "none" if host_meta['nosudo'] else "sudo-i",
+        "server_vip": bool(args.vip),
         "source_ip": os.getenv("SSH_CONNECTION", "").split(" ")[0] if os.getenv("SSH_CONNECTION") else None,
     }, config=config))

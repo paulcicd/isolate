@@ -4,9 +4,11 @@
 
 import argparse
 import datetime
+import getpass
 import json
 import os
 import sys
+import time
 
 from isolate_access import (
     AccessDenied,
@@ -50,8 +52,11 @@ from isolate_policy_bundle import (
     load_bundle,
     plan_bundle,
     validate_bundle,
+    blast_radius,
 )
+from isolate_gitops import create_approval_attestation, GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, sync_git_policy
 from isolate_redis import create_redis_client
+from isolate_sessions import SessionControlError, get_session, request_session_termination
 
 
 def redis_client(config):
@@ -77,6 +82,21 @@ def _write_private_file(path, content):
         output_f.write(content)
     if os.name == "posix":
         os.chmod(path, 0o640)
+
+
+def _effective_username():
+    if os.name == "posix":
+        import pwd
+
+        return pwd.getpwuid(os.geteuid()).pw_name
+    return getpass.getuser()
+
+
+def _manual_policy_mutation_blocked(config):
+    if config.get("policy_as_code", {}).get("enforce_git", False):
+        print("manual policy mutation is disabled; update the Git policy and run isolate policy sync", file=sys.stderr)
+        return True
+    return False
 
 
 def cmd_config_validate(args, config):
@@ -227,6 +247,8 @@ def cmd_policy_diff(args, config):
 
 
 def cmd_policy_apply(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     policy_cfg = config.get("policy_as_code", {})
     if policy_cfg.get("require_confirmation", True) and not args.dry_run and not args.yes:
         print("policy apply requires --yes; use --dry-run to preview changes", file=sys.stderr)
@@ -253,6 +275,90 @@ def cmd_policy_apply(args, config):
         "changes": changes,
         "source": path,
     }, indent=2, sort_keys=True))
+
+
+def cmd_policy_blast_radius(args, config):
+    try:
+        path, bundle = _policy_bundle_from_args(args, config)
+        redis = redis_client(config)
+        result = blast_radius(redis, bundle, list_hosts(redis), prune=args.prune)
+        result["path"] = path
+    except (OSError, ValueError, PolicyBundleError) as exc:
+        print("policy blast-radius failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_drift(args, config):
+    try:
+        if args.git:
+            result = git_policy_status(config, redis_client(config))
+        else:
+            path, bundle = _policy_bundle_from_args(args, config)
+            redis = redis_client(config)
+            changes = plan_bundle(redis, bundle, prune=args.prune)
+            result = {
+                "source": path,
+                "drift": change_count(changes) > 0,
+                "change_count": change_count(changes),
+                "changes": changes,
+                "blast_radius": blast_radius(redis, bundle, list_hosts(redis), prune=args.prune),
+            }
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy drift failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 3 if result.get("drift") else 0
+
+
+def cmd_policy_sync(args, config):
+    try:
+        result = sync_git_policy(
+            config,
+            redis_client(config),
+            dry_run=bool(args.dry_run or not args.yes),
+            confirmed=bool(args.yes),
+        )
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy sync failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_revisions(args, config):
+    print(json.dumps(list_policy_snapshots(config), indent=2, sort_keys=True))
+
+
+def cmd_policy_rollback(args, config):
+    try:
+        result = rollback_policy(config, redis_client(config), args.revision, confirmed=args.yes)
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy rollback failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_policy_attest(args, config):
+    try:
+        path = args.file or config.get("policy_as_code", {}).get("bundle_path")
+        if not path:
+            raise GitOpsError("policy bundle path is required")
+        record = create_approval_attestation(
+            config,
+            path,
+            args.branch or config.get("policy_as_code", {}).get("branch") or "main",
+            args.approver,
+            pr_url=args.pr_url,
+        )
+        rendered = json.dumps(record, indent=2, sort_keys=True) + "\n"
+        if args.output == "-":
+            sys.stdout.write(rendered)
+        else:
+            _write_private_file(args.output, rendered)
+            print("Policy approval attestation created: {}".format(args.output))
+    except (OSError, ValueError, PolicyBundleError, GitOpsError) as exc:
+        print("policy attestation failed: {}".format(exc), file=sys.stderr)
+        return 2
 
 
 def decode(value):
@@ -394,6 +500,8 @@ def _require_access_admin(config):
 
 
 def cmd_policy_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     rule = {
         "schema_version": 2,
@@ -460,6 +568,30 @@ def cmd_session_search(args, config):
                 print(json.dumps(record, sort_keys=True))
 
 
+def cmd_session_terminate(args, config):
+    if not config.get("session_control", {}).get("terminate_enabled", False):
+        print("session termination is disabled", file=sys.stderr)
+        return 2
+    try:
+        identity = load_verified_identity(config)
+    except IdentityError as exc:
+        print("Isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    admin_groups = config.get("dashboard", {}).get("admin_groups") or config.get("access", {}).get("admin_groups") or []
+    if not is_access_admin(identity, admin_groups):
+        print("session termination requires an administrator group", file=sys.stderr)
+        return 2
+    if not args.yes:
+        print("session terminate requires --yes", file=sys.stderr)
+        return 2
+    try:
+        record = request_session_termination(redis_client(config), args.connection_id, identity, reason=args.reason)
+    except SessionControlError as exc:
+        print("session terminate failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
 def cmd_whoami(args, config):
     try:
         identity = load_verified_identity(config)
@@ -511,6 +643,8 @@ def _subject_from_args(args):
 
 
 def cmd_project_set_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     key = "project_set_{}".format(args.name)
     existing = redis.get(key)
@@ -532,6 +666,8 @@ def cmd_project_set_add(args, config):
 
 
 def cmd_project_set_remove_project(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     key = "project_set_{}".format(args.name)
     existing = redis.get(key)
@@ -565,6 +701,8 @@ def cmd_project_set_show(args, config):
 
 
 def cmd_project_set_remove_pattern(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     key = "project_set_{}".format(args.name)
     existing = redis.get(key)
@@ -578,6 +716,8 @@ def cmd_project_set_remove_pattern(args, config):
 
 
 def cmd_project_set_remove(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     deleted = redis.delete("project_set_{}".format(args.name))
     print("Project sets removed: {}".format(deleted))
@@ -585,6 +725,8 @@ def cmd_project_set_remove(args, config):
 
 
 def cmd_grant_add(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     try:
         subject, name = _subject_from_args(args)
@@ -609,6 +751,8 @@ def cmd_grant_add(args, config):
 
 
 def cmd_grant_revoke(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     if args.id:
         deleted = redis.delete("grant_{}".format(args.id))
@@ -664,6 +808,8 @@ def cmd_grant_show(args, config):
 
 
 def cmd_grant_update(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
     redis = redis_client(config)
     selector_updates = {
         "project": args.project,
@@ -1061,6 +1207,20 @@ def cmd_access_repeat(args, config):
 
 def cmd_command_log_append(args, config):
     try:
+        audit_cfg = config.get("command_audit", {}) or {}
+        ingest_user = str(audit_cfg.get("ingest_user") or "auth")
+        if _effective_username() != ingest_user:
+            raise CommandAuditError("command audit ingest is restricted to the {} account".format(ingest_user))
+        if audit_cfg.get("require_active_session", True):
+            active = get_session(redis_client(config), args.connection_id)
+            grace = max(0, int(audit_cfg.get("completion_grace_seconds", 30)))
+            recent_completion = bool(
+                active
+                and active.get("status") == "completed"
+                and int(time.time()) - int(active.get("ended_at") or 0) <= grace
+            )
+            if not active or (active.get("status") != "active" and not recent_completion):
+                raise CommandAuditError("connection_id is not active")
         record = append_command_event(
             config["logging"]["base_path"],
             args.connection_id,
@@ -1182,6 +1342,38 @@ def build_parser():
     policy_apply.add_argument("--dry-run", action="store_true")
     policy_apply.add_argument("--yes", action="store_true")
     policy_apply.set_defaults(func=cmd_policy_apply)
+
+    policy_blast = policy_sub.add_parser("blast-radius")
+    policy_blast.add_argument("--file")
+    policy_blast.add_argument("--prune", action="store_true")
+    policy_blast.set_defaults(func=cmd_policy_blast_radius)
+
+    policy_drift = policy_sub.add_parser("drift")
+    policy_drift.add_argument("--file")
+    policy_drift.add_argument("--prune", action="store_true")
+    policy_drift.add_argument("--git", action="store_true")
+    policy_drift.set_defaults(func=cmd_policy_drift)
+
+    policy_sync = policy_sub.add_parser("sync")
+    policy_sync.add_argument("--dry-run", action="store_true")
+    policy_sync.add_argument("--yes", action="store_true")
+    policy_sync.set_defaults(func=cmd_policy_sync)
+
+    policy_revisions = policy_sub.add_parser("revisions")
+    policy_revisions.set_defaults(func=cmd_policy_revisions)
+
+    policy_attest = policy_sub.add_parser("attest")
+    policy_attest.add_argument("--file")
+    policy_attest.add_argument("--branch")
+    policy_attest.add_argument("--approver", action="append", required=True)
+    policy_attest.add_argument("--pr-url")
+    policy_attest.add_argument("--output", default="policy.approval.json")
+    policy_attest.set_defaults(func=cmd_policy_attest)
+
+    policy_rollback_parser = policy_sub.add_parser("rollback")
+    policy_rollback_parser.add_argument("--revision", required=True)
+    policy_rollback_parser.add_argument("--yes", action="store_true")
+    policy_rollback_parser.set_defaults(func=cmd_policy_rollback)
 
     project_set = sub.add_parser("project-set")
     project_set_sub = project_set.add_subparsers(dest="project_set_command", required=True)
@@ -1321,6 +1513,12 @@ def build_parser():
     search.add_argument("--user")
     search.add_argument("--project")
     search.set_defaults(func=cmd_session_search)
+
+    session_terminate = session_sub.add_parser("terminate")
+    session_terminate.add_argument("connection_id")
+    session_terminate.add_argument("--reason")
+    session_terminate.add_argument("--yes", action="store_true")
+    session_terminate.set_defaults(func=cmd_session_terminate)
 
     history = sub.add_parser("history")
     history.add_argument("query", nargs="?")

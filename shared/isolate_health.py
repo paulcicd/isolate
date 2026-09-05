@@ -4,6 +4,7 @@
 
 import os
 import re
+import ipaddress
 
 from isolate_redis import create_redis_client
 
@@ -28,6 +29,10 @@ def validate_config(config, check_paths=False):
     dashboard = section("dashboard")
     mcp = section("mcp")
     command_execution = section("command_execution")
+    runbooks = section("runbooks")
+    command_audit = section("command_audit")
+    session_control = section("session_control")
+    policy_as_code = section("policy_as_code")
     backup = section("backup")
 
     try:
@@ -90,6 +95,64 @@ def validate_config(config, check_paths=False):
             errors.append("dashboard secret key file does not exist: {}".format(secret_path or "<unset>"))
         if not dashboard.get("admin_groups"):
             warnings.append("dashboard is enabled without dashboard.admin_groups")
+        if not isinstance(dashboard.get("require_mutation_confirmation", True), bool):
+            errors.append("dashboard.require_mutation_confirmation must be a boolean")
+
+    if not isinstance(command_audit.get("send_env", False), bool):
+        errors.append("command_audit.send_env must be a boolean")
+    for name in ("enabled", "require_connection_id", "require_active_session"):
+        if not isinstance(command_audit.get(name, name == "require_active_session"), bool):
+            errors.append("command_audit.{} must be a boolean".format(name))
+    try:
+        if int(command_audit.get("completion_grace_seconds", 30)) < 0:
+            errors.append("command_audit.completion_grace_seconds must not be negative")
+    except (TypeError, ValueError):
+        errors.append("command_audit.completion_grace_seconds must be an integer")
+    if command_audit.get("send_env") and not command_audit.get("enabled"):
+        warnings.append("command_audit.send_env is enabled while command audit is disabled")
+    ingest_user = str(command_audit.get("ingest_user", "auth") or "")
+    if not ingest_user or re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]{0,47}", ingest_user) is None:
+        errors.append("command_audit.ingest_user must be a valid Unix account name")
+
+    for name, default in (("poll_interval", 1), ("heartbeat_interval", 15), ("active_ttl", 86400), ("live_tail_bytes", 262144)):
+        try:
+            if float(session_control.get(name, default)) <= 0:
+                errors.append("session_control.{} must be greater than zero".format(name))
+        except (TypeError, ValueError):
+            errors.append("session_control.{} must be numeric".format(name))
+    alerts = session_control.get("alerts", {}) or {}
+    for cidr in alerts.get("trusted_source_cidrs") or []:
+        try:
+            ipaddress.ip_network(str(cidr), strict=False)
+        except ValueError:
+            errors.append("session_control.alerts.trusted_source_cidrs contains an invalid network: {}".format(cidr))
+    if session_control.get("terminate_enabled") and not dashboard.get("admin_groups"):
+        warnings.append("session termination is enabled without dashboard.admin_groups")
+
+    if policy_as_code.get("enforce_git") and not policy_as_code.get("enabled"):
+        errors.append("policy_as_code.enabled must be true when enforce_git is enabled")
+    if policy_as_code.get("enabled"):
+        if not policy_as_code.get("require_pr_approval", True):
+            errors.append("policy_as_code.require_pr_approval must remain enabled")
+        if not policy_as_code.get("repository"):
+            errors.append("policy_as_code.repository is required when GitOps is enabled")
+        for name in ("checkout_path", "git_binary"):
+            value = str(policy_as_code.get(name) or "")
+            if not (os.path.isabs(value) or value.startswith("/")):
+                errors.append("policy_as_code.{} must be an absolute path".format(name))
+        if not policy_as_code.get("branch") or not policy_as_code.get("git_bundle_path"):
+            errors.append("policy_as_code.branch and git_bundle_path are required")
+        try:
+            if int(policy_as_code.get("minimum_approvals", 1)) < 1:
+                errors.append("policy_as_code.minimum_approvals must be greater than zero")
+        except (TypeError, ValueError):
+            errors.append("policy_as_code.minimum_approvals must be an integer")
+        if policy_as_code.get("require_pr_approval", True):
+            approval_key = policy_as_code.get("approval_key_file")
+            if not approval_key or not (os.path.isabs(str(approval_key)) or str(approval_key).startswith("/")):
+                errors.append("policy_as_code.approval_key_file must be an absolute path")
+            elif check_paths and not os.path.isfile(approval_key):
+                errors.append("policy approval key does not exist: {}".format(approval_key))
 
     if mcp.get("enabled"):
         mcp_issuer = mcp.get("issuer") or keycloak.get("issuer")
@@ -110,7 +173,7 @@ def validate_config(config, check_paths=False):
             errors.append("mcp.self_service_scope is required when MCP is enabled")
         if not mcp.get("approval_scope"):
             errors.append("mcp.approval_scope is required when MCP is enabled")
-        for scope_name in ("inventory_write_scope", "policy_read_scope", "execute_scope"):
+        for scope_name in ("inventory_write_scope", "policy_read_scope", "execute_scope", "runbook_scope", "operate_scope"):
             if not mcp.get(scope_name):
                 errors.append("mcp.{} is required when MCP is enabled".format(scope_name))
         if not isinstance(mcp.get("prevent_self_approval", True), bool):
@@ -160,22 +223,67 @@ def validate_config(config, check_paths=False):
                 errors.append("command_execution.max_return_bytes cannot exceed max_output_bytes")
         except (TypeError, ValueError):
             pass
+
+    if runbooks.get("enabled"):
+        if not mcp.get("enabled"):
+            errors.append("mcp.enabled must be true when runbooks are enabled")
+        if not isinstance(runbooks.get("disabled", []), list):
+            errors.append("runbooks.disabled must be a list")
+        read_only = runbooks.get("read_only")
+        operational = runbooks.get("operational")
+        if not isinstance(read_only, dict):
+            errors.append("runbooks.read_only must be an object")
+            read_only = {}
+        if not isinstance(operational, dict):
+            errors.append("runbooks.operational must be an object")
+            operational = {}
+        if not read_only.get("allowed_groups") or not isinstance(read_only.get("allowed_groups"), list):
+            errors.append("runbooks.read_only.allowed_groups must be a non-empty list")
+        if operational.get("enabled"):
+            if not operational.get("allowed_groups") or not isinstance(operational.get("allowed_groups"), list):
+                errors.append("runbooks.operational.allowed_groups must be a non-empty list")
+            warnings.append("operational runbooks are enabled")
+            if operational.get("allow_sudo"):
+                warnings.append("sudo operational runbooks are enabled")
+        if not command_execution.get("enabled"):
+            for name, default in (
+                ("default_timeout", 60),
+                ("max_timeout", 900),
+                ("max_output_bytes", 1048576),
+                ("max_return_bytes", 262144),
+            ):
+                try:
+                    if int(command_execution.get(name, default)) < 1:
+                        errors.append("command_execution.{} must be greater than zero".format(name))
+                except (TypeError, ValueError):
+                    errors.append("command_execution.{} must be an integer".format(name))
+            try:
+                if int(command_execution.get("default_timeout", 60)) > int(command_execution.get("max_timeout", 900)):
+                    errors.append("command_execution.default_timeout cannot exceed max_timeout")
+                if int(command_execution.get("max_return_bytes", 262144)) > int(command_execution.get("max_output_bytes", 1048576)):
+                    errors.append("command_execution.max_return_bytes cannot exceed max_output_bytes")
+            except (TypeError, ValueError):
+                pass
+
+    if command_execution.get("enabled") or runbooks.get("enabled"):
         jobs_path = command_execution.get("jobs_path")
         if not jobs_path or not os.path.isabs(str(jobs_path)):
             errors.append("command_execution.jobs_path must be an absolute path")
         elif check_paths and not (os.path.isdir(jobs_path) and os.access(jobs_path, os.W_OK | os.X_OK)):
-            errors.append("command execution jobs path is missing or not writable: {}".format(jobs_path))
+            errors.append("job execution path is missing or not writable: {}".format(jobs_path))
         remote_shell = command_execution.get("remote_shell", "/bin/sh")
-        if not os.path.isabs(str(remote_shell)):
+        # Commands run on Linux targets even when validation is invoked from a
+        # Windows operator workstation, so validate POSIX paths explicitly.
+        if not str(remote_shell).startswith("/"):
             errors.append("command_execution.remote_shell must be an absolute path")
         signing_key = command_execution.get("signing_key_file")
         if not signing_key or not os.path.isabs(str(signing_key)):
             errors.append("command_execution.signing_key_file must be an absolute path")
         elif check_paths:
             if not os.path.isfile(signing_key):
-                errors.append("command execution signing key does not exist: {}".format(signing_key))
+                errors.append("job execution signing key does not exist: {}".format(signing_key))
             elif os.name == "posix" and os.stat(signing_key).st_mode & 0o077:
-                errors.append("command execution signing key must be owner-only (0600 or stricter)")
+                errors.append("job execution signing key must be owner-only (0600 or stricter)")
 
     try:
         if int(backup.get("retention_count", 14)) < 1:

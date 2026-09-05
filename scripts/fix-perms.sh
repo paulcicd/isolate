@@ -55,6 +55,18 @@ find "${AUTH_DATA_ROOT}/wrappers" -type f ! -name ssh.py -print0 | xargs -r -n60
 
 chmod 0700 "${AUTH_DATA_ROOT}/keys"
 
+# Root-run deploy helpers and the restricted command-audit SSH entry point.
+chmod 0700 "${AUTH_DATA_ROOT}/scripts"
+for executable in \
+    fix-perms.sh \
+    install-target-command-audit.sh \
+    isolate-command-audit-ingest.py \
+    isolate-job-worker.py; do
+    if [ -f "${AUTH_DATA_ROOT}/scripts/${executable}" ]; then
+        chmod 0750 "${AUTH_DATA_ROOT}/scripts/${executable}"
+    fi
+done
+
 # JWKS public-key cache is readable by runtime but must not be writable by
 # interactive bastion users; otherwise users could replace signing keys.
 chmod 0750 "${AUTH_DATA_ROOT}/cache"
