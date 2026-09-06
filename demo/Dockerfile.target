@@ -1,0 +1,27 @@
+FROM alpine:3.21
+
+RUN apk add --no-cache bash openssh \
+    && addgroup -S isolate-audit \
+    && adduser -D -s /bin/bash support \
+    && adduser -D -s /bin/bash dev \
+    && adduser -D -s /bin/bash dba \
+    && addgroup support isolate-audit \
+    && addgroup dev isolate-audit \
+    && addgroup dba isolate-audit \
+    && install -d -m 0755 /run/sshd /usr/local/lib/isolate /etc/isolate-audit /var/lib/isolate-audit
+
+COPY scripts/target-command-audit.bash /usr/local/lib/isolate/command-audit.bash
+COPY demo/entrypoint-target.sh /usr/local/sbin/isolate-demo-target
+
+RUN chmod 0644 /usr/local/lib/isolate/command-audit.bash \
+    && chmod 0755 /usr/local/sbin/isolate-demo-target \
+    && printf '%s\n' \
+        'PasswordAuthentication no' \
+        'KbdInteractiveAuthentication no' \
+        'PermitRootLogin no' \
+        'AllowUsers support dev dba' \
+        'AcceptEnv ISOLATE_CONNECTION_ID ISOLATE_HOST_ID ISOLATE_PROJECT ISOLATE_HUMAN_USER' \
+        >> /etc/ssh/sshd_config
+
+EXPOSE 22
+ENTRYPOINT ["/usr/local/sbin/isolate-demo-target"]

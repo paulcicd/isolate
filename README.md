@@ -1,5 +1,7 @@
 # Isolate Bastion Platform v2
 
+> Для быстрого локального запуска bastion, Keycloak, Redis, dashboard и пяти SSH targets используйте [Docker demo](demo/README.md).
+
 Isolate Bastion Platform v2 is an SSH bastion access layer for large Linux fleets. It keeps the familiar `s` and `g` workflow while adding modern identity, policy, audit, temporary access, and dashboard capabilities.
 
 The main idea is simple:

@@ -1,0 +1,72 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        git \
+        locales \
+        netcat-openbsd \
+        openssh-client \
+        openssh-server \
+        openssl \
+        python3 \
+        python3-pip \
+        redis-tools \
+        sudo \
+    && locale-gen en_US.UTF-8 \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 2000 auth \
+    && useradd --uid 2000 --gid auth --create-home --shell /bin/bash auth \
+    && groupadd --gid 2001 alice \
+    && groupadd --gid 2002 bob \
+    && useradd --uid 2001 --gid alice --groups auth --create-home --shell /bin/bash alice \
+    && useradd --uid 2002 --gid bob --groups auth --create-home --shell /bin/bash bob \
+    && install -d -m 0755 /run/sshd /opt/auth /opt/auth/demo /demo/audit-ssh
+
+COPY requirements.txt /tmp/isolate-requirements.txt
+RUN python3 -m pip install --break-system-packages --no-cache-dir -r /tmp/isolate-requirements.txt
+
+COPY shared /opt/auth/shared
+COPY wrappers /opt/auth/wrappers
+COPY scripts /opt/auth/scripts
+COPY demo/isolate.yml /opt/auth/configs/isolate.yml
+COPY demo/ssh_config /opt/auth/configs/demo-ssh.conf
+COPY demo/entrypoint-bastion.sh /opt/auth/demo/entrypoint-bastion.sh
+COPY demo/entrypoint-dashboard.sh /opt/auth/demo/entrypoint-dashboard.sh
+COPY demo/init-demo.sh /opt/auth/demo/init-demo.sh
+COPY demo/seed.py /opt/auth/demo/seed.py
+COPY demo/smoke.py /opt/auth/demo/smoke.py
+
+RUN chmod 0755 /opt/auth/demo/*.sh /opt/auth/demo/*.py \
+    && printf '%s\n' \
+        'Port 22' \
+        'PasswordAuthentication yes' \
+        'KbdInteractiveAuthentication no' \
+        'UsePAM yes' \
+        'PermitRootLogin no' \
+        'AllowUsers alice bob auth' \
+        'AcceptEnv LANG LC_* ISOLATE_CONNECTION_ID ISOLATE_HOST_ID ISOLATE_PROJECT ISOLATE_HUMAN_USER' \
+        'Match User auth' \
+        '    PasswordAuthentication no' \
+        '    KbdInteractiveAuthentication no' \
+        '    AuthenticationMethods publickey' \
+        > /etc/ssh/sshd_config.d/99-isolate-demo.conf \
+    && printf '%s\n' \
+        'Defaults secure_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+        '%auth ALL=(auth) NOPASSWD: /opt/auth/wrappers/ssh.py' \
+        > /etc/sudoers.d/isolate-demo \
+    && chmod 0440 /etc/sudoers.d/isolate-demo \
+    && printf '%s\n' \
+        'export ISOLATE_DATA_ROOT=/opt/auth' \
+        'export ISOLATE_REDIS_HOST=redis' \
+        'if [ -n "${BASH_VERSION:-}" ] && [ -f /opt/auth/shared/bash.sh ]; then . /opt/auth/shared/bash.sh; fi' \
+        > /etc/profile.d/isolate-demo.sh
+
+ENV LANG=en_US.UTF-8 \
+    LC_ALL=en_US.UTF-8 \
+    ISOLATE_DATA_ROOT=/opt/auth \
+    ISOLATE_REDIS_HOST=redis
+
+WORKDIR /opt/auth

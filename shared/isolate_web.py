@@ -38,6 +38,294 @@ def _secret_key(config):
     return os.environ.get("ISOLATE_DASHBOARD_SECRET", "dev-only-change-me")
 
 
+_DASHBOARD_CSS = """
+:root {
+  color-scheme: light;
+  --bg: #f3f6f5;
+  --surface: #ffffff;
+  --surface-muted: #eef3f1;
+  --sidebar: #18211f;
+  --sidebar-muted: #9bacA7;
+  --text: #17201e;
+  --muted: #64716d;
+  --line: #dbe3e0;
+  --accent: #08756b;
+  --accent-strong: #075f57;
+  --accent-soft: #e4f3f0;
+  --blue: #2b65a7;
+  --blue-soft: #eaf2fb;
+  --amber: #936312;
+  --amber-soft: #fff5dc;
+  --red: #a43c3c;
+  --red-soft: #fcecec;
+  --shadow: 0 1px 2px rgba(15, 33, 29, 0.05), 0 8px 24px rgba(15, 33, 29, 0.04);
+}
+
+* { box-sizing: border-box; }
+html { min-width: 320px; background: var(--bg); }
+body {
+  margin: 0;
+  color: var(--text);
+  background: var(--bg);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  letter-spacing: 0;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { color: var(--accent-strong); text-decoration: underline; }
+
+.app-shell { min-height: 100vh; }
+.sidebar {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 20;
+  display: flex;
+  width: 236px;
+  flex-direction: column;
+  overflow-y: auto;
+  color: #f4f8f7;
+  background: var(--sidebar);
+  border-right: 1px solid #2b3734;
+}
+.brand {
+  display: flex;
+  min-height: 76px;
+  align-items: center;
+  gap: 12px;
+  padding: 16px 18px;
+  color: #ffffff;
+  border-bottom: 1px solid #2b3734;
+}
+.brand:hover { color: #ffffff; text-decoration: none; }
+.brand-mark {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  place-items: center;
+  color: #0f2925;
+  background: #7ed5c5;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 800;
+}
+.brand-copy { display: flex; flex-direction: column; font-size: 16px; font-weight: 720; line-height: 1.2; }
+.brand-copy small { margin-top: 3px; color: var(--sidebar-muted); font-size: 11px; font-weight: 600; text-transform: uppercase; }
+
+.primary-nav { flex: 1; padding: 14px 10px; }
+.nav-section + .nav-section { margin-top: 18px; }
+.nav-label {
+  display: block;
+  padding: 0 10px 6px;
+  color: #7f918c;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.nav-link {
+  display: flex;
+  min-height: 36px;
+  align-items: center;
+  margin: 2px 0;
+  padding: 8px 10px;
+  color: #cbd6d3;
+  border-left: 3px solid transparent;
+  border-radius: 4px;
+  font-weight: 560;
+}
+.nav-link:hover { color: #ffffff; background: #222e2b; text-decoration: none; }
+.nav-link.active { color: #ffffff; background: #253532; border-left-color: #72cbbb; }
+
+.sidebar-footer {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 9px;
+  align-items: center;
+  padding: 14px 16px;
+  border-top: 1px solid #2b3734;
+}
+.user-avatar {
+  display: grid;
+  width: 34px;
+  height: 34px;
+  place-items: center;
+  color: #dff8f2;
+  background: #2d4943;
+  border-radius: 50%;
+  font-size: 11px;
+  font-weight: 750;
+}
+.user-copy { min-width: 0; }
+.user-name { display: block; overflow: hidden; color: #f4f8f7; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.logout-link { display: inline-block; color: #9fb1ac; font-size: 12px; }
+.logout-link:hover { color: #ffffff; }
+
+.main { min-height: 100vh; margin-left: 236px; }
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  min-height: 64px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 0 28px;
+  background: rgba(255, 255, 255, 0.96);
+  border-bottom: 1px solid var(--line);
+}
+.topbar-title { font-size: 14px; font-weight: 700; }
+.topbar-kicker { display: block; color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; }
+.runtime-state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 600; }
+.status-dot { width: 8px; height: 8px; background: #2f9d74; border-radius: 50%; box-shadow: 0 0 0 3px #e1f3eb; }
+
+.content { width: 100%; max-width: 1600px; margin: 0 auto; padding: 28px; }
+h1 { margin: 0 0 22px; font-size: 28px; line-height: 1.2; font-weight: 730; }
+h2 { margin: 34px 0 12px; font-size: 18px; line-height: 1.3; font-weight: 700; }
+h3 { margin: 24px 0 10px; font-size: 15px; font-weight: 700; }
+p { margin: 10px 0; }
+.page-lead { max-width: 720px; margin: -12px 0 22px; color: var(--muted); }
+.muted { color: var(--muted); }
+
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.metric {
+  position: relative;
+  min-height: 112px;
+  padding: 20px;
+  overflow: hidden;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+.metric::before { position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--accent); content: ""; }
+.metric:nth-child(2)::before { background: #c28724; }
+.metric:nth-child(3)::before { background: var(--blue); }
+.metric strong { display: block; margin-bottom: 4px; font-size: 30px; line-height: 1; font-variant-numeric: tabular-nums; }
+.metric .muted { font-size: 13px; font-weight: 600; }
+.metric-link { display: inline-block; margin-top: 13px; font-size: 12px; font-weight: 700; }
+.section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; margin-top: 34px; }
+.section-heading h2 { margin: 0; }
+.empty-state { margin-top: 12px; padding: 28px; color: var(--muted); text-align: center; background: var(--surface); border: 1px dashed #bdc9c5; border-radius: 6px; }
+
+.table-wrap {
+  width: 100%;
+  margin-top: 14px;
+  overflow-x: auto;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  box-shadow: var(--shadow);
+}
+table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; }
+th, td { padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid #e7ecea; font-size: 13px; }
+th {
+  color: #52605c;
+  background: #f7f9f8;
+  font-size: 11px;
+  font-weight: 750;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+tbody tr:last-child td { border-bottom: 0; }
+tbody tr:hover td { background: #f8fbfa; }
+td { white-space: nowrap; }
+td.cell-server-services, td.cell-server-note, td.cell-privileged-access-hint, td.cell-command {
+  min-width: 170px;
+  max-width: 280px;
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+td.cell-connection-id { max-width: 220px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+
+.badge { display: inline-flex; min-height: 23px; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 750; white-space: nowrap; }
+.badge-active, .badge-approved, .badge-allowed, .badge-success { color: #176348; background: #e2f4eb; }
+.badge-pending, .badge-vip, .badge-warning { color: var(--amber); background: var(--amber-soft); }
+.badge-denied, .badge-failed, .badge-error { color: var(--red); background: var(--red-soft); }
+.badge-completed { color: var(--blue); background: var(--blue-soft); }
+
+input, select, textarea, button { min-height: 36px; margin: 2px; font: inherit; letter-spacing: 0; }
+input, select, textarea {
+  max-width: 100%;
+  padding: 7px 10px;
+  color: var(--text);
+  background: #ffffff;
+  border: 1px solid #bcc9c5;
+  border-radius: 4px;
+}
+input::placeholder, textarea::placeholder { color: #84918d; }
+input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible {
+  outline: 3px solid rgba(8, 117, 107, 0.2);
+  outline-offset: 1px;
+  border-color: var(--accent);
+}
+button {
+  padding: 7px 13px;
+  color: #ffffff;
+  background: var(--accent);
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  cursor: pointer;
+  font-weight: 680;
+}
+button:hover { background: var(--accent-strong); border-color: var(--accent-strong); }
+button:disabled { cursor: not-allowed; opacity: 0.55; }
+form { margin: 10px 0 18px; }
+form.inline { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; margin: 0; }
+form:not(.inline) { max-width: 1180px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; }
+form p { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+label { color: #485652; font-size: 13px; font-weight: 600; }
+label input[type="checkbox"] { min-height: auto; accent-color: var(--accent); }
+form[action*="/terminate"] button { color: var(--red); background: #ffffff; border-color: #dca6a6; }
+form[action*="/terminate"] button:hover { color: #ffffff; background: var(--red); border-color: var(--red); }
+
+.notice { padding: 12px 14px; margin: 0 0 20px; color: #28587f; background: var(--blue-soft); border: 1px solid #bfd4ea; border-left: 4px solid var(--blue); border-radius: 5px; }
+.notice.error { color: var(--red); background: var(--red-soft); border-color: #ecc0c0; border-left-color: var(--red); }
+.notice.warning { color: var(--amber); background: var(--amber-soft); border-color: #ead39d; border-left-color: #c28724; }
+.notice.info, .notice.success { color: #176348; background: var(--accent-soft); border-color: #b9ded6; border-left-color: var(--accent); }
+
+pre { max-width: 100%; padding: 16px; overflow: auto; color: #dce8e4; background: #16201e; border: 1px solid #2e3a37; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.92em; }
+.terminal { border: 1px solid #34433f; border-radius: 6px; box-shadow: var(--shadow); }
+
+@media (max-width: 1050px) {
+  .sidebar { width: 208px; }
+  .main { margin-left: 208px; }
+  .content { padding: 22px; }
+}
+@media (max-width: 760px) {
+  .sidebar { position: static; width: 100%; max-height: none; }
+  .brand { min-height: 62px; }
+  .primary-nav { display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px; }
+  .nav-section { display: flex; gap: 4px; margin: 0 !important; }
+  .nav-label, .sidebar-footer { display: none; }
+  .nav-link { min-height: 34px; flex: 0 0 auto; padding: 7px 9px; border-left: 0; border-bottom: 2px solid transparent; }
+  .nav-link.active { border-bottom-color: #72cbbb; }
+  .main { margin-left: 0; }
+  .topbar { position: static; min-height: 54px; padding: 0 16px; }
+  .runtime-state { display: none; }
+  .content { padding: 20px 16px; }
+  .grid { grid-template-columns: 1fr; }
+  h1 { font-size: 24px; }
+  form:not(.inline) { padding: 14px; }
+}
+"""
+
+
+_ACTIVE_NAV_SCRIPT = """
+document.querySelectorAll('.nav-link').forEach(function (link) {
+  var href = new URL(link.href).pathname;
+  var path = window.location.pathname;
+  if ((href === '/' && path === '/') || (href !== '/' && (path === href || path.indexOf(href + '/') === 0))) {
+    link.classList.add('active');
+    link.setAttribute('aria-current', 'page');
+  }
+});
+"""
+
+
 def _html(title, body, config=None, notice=None):
     refresh = ""
     refresh_seconds = int((config or {}).get("dashboard", {}).get("refresh_seconds") or 0)
@@ -49,41 +337,84 @@ def _html(title, body, config=None, notice=None):
             html.escape(notice.get("level", "info")),
             html.escape(notice.get("text", "")),
         )
+    username = "Administrator"
+    try:
+        from flask import has_request_context, session
+        if has_request_context() and isinstance(session.get("identity"), dict):
+            username = str(session["identity"].get("username") or username)
+    except (ImportError, RuntimeError):
+        pass
+    initials = "".join(part[:1] for part in username.replace(".", " ").split()[:2]).upper() or "AD"
     return """<!doctype html>
-<html><head><meta charset="utf-8">{refresh}<title>{title}</title>
-<style>
-body {{ font-family: system-ui, sans-serif; margin: 24px; color: #182026; }}
-nav a {{ margin-right: 14px; }}
-table {{ border-collapse: collapse; width: 100%; margin-top: 16px; }}
-th, td {{ border-bottom: 1px solid #d7dde2; padding: 7px 8px; text-align: left; font-size: 14px; }}
-th {{ background: #f4f6f8; }}
-input, select, button {{ padding: 6px 8px; margin: 2px; }}
-form.inline {{ display: inline-flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
-.muted {{ color: #66717b; }}
-.grid {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }}
-.metric {{ border: 1px solid #d7dde2; padding: 12px; border-radius: 6px; }}
-.notice {{ border: 1px solid #b7d5f5; background: #eef7ff; padding: 10px 12px; margin: 14px 0; border-radius: 6px; }}
-.notice.error {{ border-color: #efb4b4; background: #fff1f1; }}
-.notice.warning {{ border-color: #e4c46d; background: #fff8df; }}
-</style></head><body>
-<nav><a href="/">Summary</a><a href="/sessions/active">Active</a><a href="/history">History</a><a href="/inventory">Inventory</a><a href="/access">Access</a><a href="/grants">Grants</a><a href="/policy/simulate">Simulator</a><a href="/policy/gitops">GitOps</a><a href="/users">Users</a><a href="/notifications">Notifications</a><a href="/logout">Logout</a></nav>
-{notice}
-{body}
-</body></html>""".format(refresh=refresh, title=title, notice=notice_html, body=body)
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
+<style>{css}</style></head><body>
+<div class="app-shell">
+  <aside class="sidebar">
+    <a class="brand" href="/" aria-label="Isolate dashboard home">
+      <span class="brand-mark">IS</span>
+      <span class="brand-copy">Isolate <small>Bastion control</small></span>
+    </a>
+    <nav class="primary-nav" aria-label="Primary navigation">
+      <div class="nav-section"><span class="nav-label">Operations</span>
+        <a class="nav-link" href="/">Summary</a><a class="nav-link" href="/sessions/active">Active sessions</a><a class="nav-link" href="/history">History</a><a class="nav-link" href="/inventory">Inventory</a>
+      </div>
+      <div class="nav-section"><span class="nav-label">Access control</span>
+        <a class="nav-link" href="/access">Requests</a><a class="nav-link" href="/grants">Grants</a><a class="nav-link" href="/policy/simulate">Policy simulator</a>
+      </div>
+      <div class="nav-section"><span class="nav-label">Platform</span>
+        <a class="nav-link" href="/policy/gitops">GitOps</a><a class="nav-link" href="/users">Users</a><a class="nav-link" href="/notifications">Notifications</a>
+      </div>
+    </nav>
+    <div class="sidebar-footer">
+      <span class="user-avatar">{initials}</span>
+      <span class="user-copy"><span class="user-name">{username}</span><a class="logout-link" href="/logout">Sign out</a></span>
+    </div>
+  </aside>
+  <main class="main">
+    <header class="topbar"><div><span class="topbar-kicker">Isolate v2</span><span class="topbar-title">Operations console</span></div><div class="runtime-state"><span class="status-dot"></span>Secured by Keycloak</div></header>
+    <div class="content">{notice}{body}</div>
+  </main>
+</div>
+<script>{active_nav_script}</script>
+</body></html>""".format(
+        refresh=refresh,
+        title=html.escape(str(title)),
+        css=_DASHBOARD_CSS,
+        initials=html.escape(initials),
+        username=html.escape(username),
+        notice=notice_html,
+        body=body,
+        active_nav_script=_ACTIVE_NAV_SCRIPT,
+    )
 
 
 def _table(rows, columns):
-    header = "".join("<th>{}</th>".format(label) for key, label in columns)
+    header = "".join("<th scope=\"col\">{}</th>".format(html.escape(str(label))) for key, label in columns)
     body = ""
     for row in rows:
         cells = []
         for key, _ in columns:
             value = row.get(key) or ""
-            if key not in ("raw", "project_link", "history", "details", "replay", "live", "control", "user_link", "edit"):
-                value = html.escape(str(value))
-            cells.append("<td>{}</td>".format(value))
+            safe_html = key in ("raw", "project_link", "history", "details", "replay", "live", "control", "user_link", "edit")
+            rendered = str(value) if safe_html else html.escape(str(value))
+            normalized = str(value).strip().lower()
+            if not safe_html and key == "server_vip_marker" and rendered:
+                rendered = '<span class="badge badge-vip">{}</span>'.format(rendered)
+            elif not safe_html and key == "status" and rendered:
+                badge_class = "badge-{}".format("".join(ch for ch in normalized if ch.isalnum() or ch == "-") or "status")
+                rendered = '<span class="badge {}">{}</span>'.format(badge_class, rendered)
+            elif not safe_html and key == "result" and rendered:
+                if normalized in ("allowed", "ok", "success") or normalized.startswith("exit=0"):
+                    badge_class = "badge-success"
+                elif "denied" in normalized or "failed" in normalized or (normalized.startswith("exit=") and normalized != "exit=0"):
+                    badge_class = "badge-error"
+                else:
+                    badge_class = "badge-completed"
+                rendered = '<span class="badge {}">{}</span>'.format(badge_class, rendered)
+            cell_class = "cell-{}".format(str(key).replace("_", "-"))
+            cells.append('<td class="{}">{}</td>'.format(cell_class, rendered))
         body += "<tr>{}</tr>".format("".join(cells))
-    return "<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>".format(header, body)
+    return '<div class="table-wrap"><table><thead><tr>{}</tr></thead><tbody>{}</tbody></table></div>'.format(header, body)
 
 
 def _split_values(value):
@@ -326,13 +657,29 @@ def create_app(config=None):
         pending = list_access_requests(redis, status="pending")
         recent = read_history(config["logging"]["base_path"], admin, limit=10, admin_groups=config.get("dashboard", {}).get("admin_groups") or [])
         body = """
-<h1>Isolate Dashboard</h1>
+<h1>Operations Overview</h1>
+<p class="page-lead">Current bastion activity, access requests, and recent SSH connections.</p>
 <div class="grid">
-<div class="metric"><strong>{}</strong><br><span class="muted">active sessions</span></div>
-<div class="metric"><strong>{}</strong><br><span class="muted">pending access requests</span></div>
-<div class="metric"><strong>{}</strong><br><span class="muted">recent connections</span></div>
+<div class="metric"><strong>{}</strong><span class="muted">active sessions</span><br><a class="metric-link" href="/sessions/active">Review sessions</a></div>
+<div class="metric"><strong>{}</strong><span class="muted">pending access requests</span><br><a class="metric-link" href="/access?status=pending">Review requests</a></div>
+<div class="metric"><strong>{}</strong><span class="muted">recent connections</span><br><a class="metric-link" href="/history">Open history</a></div>
 </div>
 """.format(len(active), len(pending), len(recent))
+        body += '<div class="section-heading"><h2>Recent Activity</h2><a href="/history">View all history</a></div>'
+        if recent:
+            recent_rows = []
+            for item in recent[:5]:
+                row = dict(item)
+                connection_id = row.get("connection_id") or row.get("session_id")
+                if connection_id:
+                    row["details"] = '<a href="/session/{}">details</a>'.format(html.escape(str(connection_id)))
+                recent_rows.append(row)
+            body += _table(recent_rows, [
+                ("time", "time"), ("username", "user"), ("project", "project"),
+                ("host_id", "host"), ("remote_user", "remote user"), ("result", "result"), ("details", "details"),
+            ])
+        else:
+            body += '<div class="empty-state">No SSH connections have been recorded yet.</div>'
         return _html("Isolate Dashboard", body, config=config)
 
     @app.route("/sessions/active")

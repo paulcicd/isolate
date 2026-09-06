@@ -1,0 +1,215 @@
+name: isolate-v2-demo
+
+x-target: &target
+  build:
+    context: ..
+    dockerfile: demo/Dockerfile.target
+  restart: unless-stopped
+  depends_on:
+    demo-init:
+      condition: service_completed_successfully
+  volumes:
+    - demo-audit-ssh:/demo/audit-ssh:ro
+  healthcheck:
+    test: ["CMD-SHELL", "nc -z 127.0.0.1 22"]
+    interval: 2s
+    timeout: 2s
+    retries: 30
+  networks:
+    isolate-demo:
+
+services:
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.3
+    command:
+      - start-dev
+      - --import-realm
+      - --http-port=18080
+      - --hostname=http://localhost:18080
+      - --hostname-strict=false
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin123
+      JAVA_OPTS_KC_HEAP: -XX:InitialRAMPercentage=20 -XX:MaxRAMPercentage=60
+    ports:
+      - 127.0.0.1:18080:18080
+      - 127.0.0.1:18081:18081
+      - 127.0.0.1:2222:22
+    volumes:
+      - ./keycloak/isolate-demo-realm.json:/opt/keycloak/data/import/isolate-demo-realm.json:ro
+      - demo-keycloak-data:/opt/keycloak/data
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.2
+        aliases:
+          - bastion
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - demo-redis-data:/data
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.3
+    restart: unless-stopped
+
+  demo-init:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bastion
+    command: ["/opt/auth/demo/init-demo.sh"]
+    volumes:
+      - demo-bastion-ssh:/home/auth/.ssh
+      - demo-audit-ssh:/demo/audit-ssh
+      - demo-runtime-keys:/opt/auth/keys
+      - demo-logs:/opt/auth/logs
+      - demo-cache:/opt/auth/cache
+      - demo-backups:/opt/auth/backups
+    networks:
+      - isolate-demo
+    restart: "no"
+
+  target-1:
+    <<: *target
+    hostname: payments-dev-1
+    environment:
+      DEMO_TARGET_NAME: payments-dev-1
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.11
+
+  target-2:
+    <<: *target
+    hostname: payments-prod-1
+    environment:
+      DEMO_TARGET_NAME: payments-prod-1
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.12
+
+  target-3:
+    <<: *target
+    hostname: database-prod-1
+    environment:
+      DEMO_TARGET_NAME: database-prod-1
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.13
+
+  target-4:
+    <<: *target
+    hostname: observability-1
+    environment:
+      DEMO_TARGET_NAME: observability-1
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.14
+
+  target-5:
+    <<: *target
+    hostname: vip-core-1
+    environment:
+      DEMO_TARGET_NAME: vip-core-1
+    networks:
+      isolate-demo:
+        ipv4_address: 172.30.50.15
+
+  bastion:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bastion
+    command: ["/opt/auth/demo/entrypoint-bastion.sh"]
+    network_mode: service:keycloak
+    depends_on:
+      keycloak:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      demo-init:
+        condition: service_completed_successfully
+      target-1:
+        condition: service_healthy
+      target-2:
+        condition: service_healthy
+      target-3:
+        condition: service_healthy
+      target-4:
+        condition: service_healthy
+      target-5:
+        condition: service_healthy
+    volumes:
+      - demo-bastion-ssh:/home/auth/.ssh
+      - demo-runtime-keys:/opt/auth/keys
+      - demo-logs:/opt/auth/logs
+      - demo-cache:/opt/auth/cache
+      - demo-backups:/opt/auth/backups
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 22 && test -s /opt/auth/known_hosts"]
+      interval: 3s
+      timeout: 2s
+      retries: 30
+    restart: unless-stopped
+
+  dashboard:
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bastion
+    command: ["/opt/auth/demo/entrypoint-dashboard.sh"]
+    network_mode: service:keycloak
+    depends_on:
+      keycloak:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      demo-init:
+        condition: service_completed_successfully
+      bastion:
+        condition: service_healthy
+    volumes:
+      - demo-runtime-keys:/opt/auth/keys
+      - demo-logs:/opt/auth/logs
+      - demo-cache:/opt/auth/cache
+      - demo-backups:/opt/auth/backups
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18081/health', timeout=2)"]
+      interval: 3s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  smoke:
+    profiles: ["tools"]
+    build:
+      context: ..
+      dockerfile: demo/Dockerfile.bastion
+    command: ["/opt/auth/demo/smoke.py"]
+    network_mode: service:keycloak
+    depends_on:
+      dashboard:
+        condition: service_healthy
+    volumes:
+      - demo-bastion-ssh:/home/auth/.ssh:ro
+    restart: "no"
+
+networks:
+  isolate-demo:
+    ipam:
+      config:
+        - subnet: 172.30.50.0/24
+
+volumes:
+  demo-keycloak-data:
+  demo-redis-data:
+  demo-bastion-ssh:
+  demo-audit-ssh:
+  demo-runtime-keys:
+  demo-logs:
+  demo-cache:
+  demo-backups:

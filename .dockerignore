@@ -1,0 +1,14 @@
+.git
+.gitignore
+.tmp-*
+__pycache__
+*.pyc
+backups
+cache
+jobs
+keys
+logs
+spool
+img*.png
+logo.jpg
+

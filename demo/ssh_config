@@ -1,0 +1,13 @@
+Host *
+    IdentityFile /home/auth/.ssh/id_ed25519
+    IdentitiesOnly yes
+    UserKnownHostsFile /opt/auth/known_hosts
+    StrictHostKeyChecking yes
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    PreferredAuthentications publickey
+    ForwardAgent no
+    ConnectTimeout 5
+    ServerAliveInterval 15
+    ServerAliveCountMax 2
+
