@@ -31,7 +31,7 @@ from isolate_identity import (
 from isolate_history import HistoryAccessDenied, read_history
 from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, format_hosts_table, get_host, list_hosts, update_host
 from isolate_logging import SessionLogger
-from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant, resolve_policy
+from isolate_policy import PolicyDenied, filter_allowed_hosts, matching_grants, resolve_grant, resolve_policy
 from isolate_replay import find_session, parse_raw_replay
 from isolate_command_audit import CommandAuditError, append_command_event
 from isolate_ssh import SSHArgumentError, build_ssh_argv
@@ -83,8 +83,9 @@ from isolate_mcp import (
     create_mcp_server,
     token_scopes,
 )
-from isolate_jobs import JobError, execute_job, get_job, list_jobs
+from isolate_jobs import JobError, create_runbook_fleet, execute_job, get_job, list_jobs, retry_job, verify_job_signature
 from isolate_runbooks import RunbookError, list_runbooks, render_runbook
+from isolate_dashboard_data import build_access_matrix, collect_alerts, fleet_progress, preview_grant_change, update_alert_state
 
 
 def has_mcp_v2():
@@ -197,6 +198,15 @@ class ProductionHardeningTest(unittest.TestCase):
             self.assertFalse(validate_config(config)["valid"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_dashboard_job_limits_are_validated(self):
+        result = validate_config({
+            "keycloak": {"client_id": "isolate"},
+            "dashboard": {"jobs_max_results": 0},
+            "runbooks": {"max_fleet_hosts": 1001},
+        })
+        self.assertIn("dashboard.jobs_max_results must be greater than zero", result["errors"])
+        self.assertIn("runbooks.max_fleet_hosts must be between 1 and 1000", result["errors"])
 
 
 class ServiceBackupTest(unittest.TestCase):
@@ -1601,6 +1611,109 @@ class ActiveSessionRegistryTest(unittest.TestCase):
         self.assertEqual(notice["payload"]["dashboard_url"], "https://bastion.example.org/session/conn-3")
 
 
+class DashboardOperationsDataTest(unittest.TestCase):
+    def _job_config(self, root):
+        key_path = os.path.join(root, "job.key")
+        with open(key_path, "wb") as key_f:
+            key_f.write(b"x" * 64)
+        return {
+            "command_execution": {
+                "signing_key_file": key_path,
+                "jobs_path": os.path.join(root, "jobs"),
+                "default_timeout": 60,
+                "max_timeout": 900,
+                "allowed_groups": ["DevOps"],
+            },
+            "runbooks": {
+                "enabled": True,
+                "max_fleet_hosts": 10,
+                "read_only": {"allowed_groups": ["DevOps"], "allow_sudo": False, "require_confirmation": True},
+                "operational": {"enabled": False, "allowed_groups": []},
+            },
+            "policy": {"fallback_remote_user": None},
+            "ssh": {"default_sudo_mode": "none"},
+            "logging": {"sinks": []},
+        }
+
+    def _seed_hosts_and_grant(self, redis):
+        for host_id in ("1", "2"):
+            redis.set("server_{}".format(host_id), json.dumps({
+                "server_id": int(host_id), "project_name": "prod", "server_ip": "10.0.0.{}".format(host_id),
+                "server_port": 22, "server_name": "node{}".format(host_id), "server_user": "support",
+            }))
+        redis.set("grant_1", json.dumps({
+            "id": "1", "subject": "group", "name": "DevOps", "project": "prod",
+            "remote_user": "support", "sudo_mode": "none", "allowed_actions": ["ssh", "runbook"],
+        }))
+
+    def test_fleet_progress_and_retry_replace_failed_attempt(self):
+        root = os.path.join(ROOT, ".tmp-dashboard-jobs-{}".format(uuid.uuid4().hex))
+        os.makedirs(root)
+        try:
+            redis = FakeRedis()
+            self._seed_hosts_and_grant(redis)
+            config = self._job_config(root)
+            identity = {"username": "admin", "keycloak_sub": "sub", "groups": ["DevOps"], "roles": []}
+            fleet = create_runbook_fleet(redis, config, identity, "uptime", ["1", "2"], confirmed=True)
+            self.assertEqual(fleet["count"], 2)
+            self.assertEqual(fleet["jobs"][0]["schema_version"], 2)
+            self.assertTrue(verify_job_signature(fleet["jobs"][0], config))
+            failed = fleet["jobs"][0]
+            failed.update({"status": "failed", "finished_at": 100, "error": "network"})
+            redis.set("job_{}".format(failed["id"]), json.dumps(failed))
+            summary = fleet_progress(list_jobs(redis, limit=100))
+            self.assertEqual(summary[0]["total"], 2)
+            self.assertEqual(summary[0]["failed"], 1)
+
+            retried = retry_job(redis, config, failed["id"], {"username": "security.admin"})
+            self.assertEqual(retried["retry_of"], failed["id"])
+            self.assertEqual(retried["attempt"], 2)
+            summary = fleet_progress(list_jobs(redis, limit=100))[0]
+            self.assertEqual(summary["total"], 2)
+            self.assertEqual(summary["failed"], 0)
+            self.assertEqual(summary["queued"], 2)
+        finally:
+            shutil.rmtree(root, ignore_errors=True)
+
+    def test_alert_aggregation_and_state(self):
+        redis = FakeRedis()
+        redis.set("job_7", json.dumps({
+            "id": "7", "status": "failed", "type": "runbook", "username": "alice",
+            "project": "prod", "host_id": "1", "created_at": 10, "finished_at": 11, "error": "timeout",
+        }))
+        mark_session_start(redis, "conn-risk", {
+            "username": "alice", "project": "prod", "host_id": "1", "server_vip": True,
+            "remote_user": "root", "sudo_mode": "sudo-i", "source_ip": "203.0.113.8", "started_at": 1,
+        })
+        config = {"session_control": {"alerts": {
+            "enabled": True, "vip": True, "privileged": True, "unusual_source": True,
+            "trusted_source_cidrs": ["10.0.0.0/8"], "long_session_seconds": 60,
+        }}}
+        alerts = collect_alerts(redis, config, now=100)
+        kinds = {row["kind"] for row in alerts}
+        self.assertTrue({"failed_job", "vip_session", "privileged_session", "unusual_source_ip", "long_session"}.issubset(kinds))
+        selected = next(row for row in alerts if row["kind"] == "failed_job")
+        update_alert_state(redis, selected["id"], {"username": "admin"}, "acknowledge", "investigating", now=101)
+        refreshed = next(row for row in collect_alerts(redis, config, now=102) if row["id"] == selected["id"])
+        self.assertEqual(refreshed["status"], "acknowledged")
+        self.assertEqual(refreshed["comments"][0]["text"], "investigating")
+
+    def test_access_matrix_findings_and_preview(self):
+        hosts = [{"server_id": 1, "project_name": "prod", "server_name": "web", "server_ip": "10.0.0.1"}]
+        grants = [
+            {"id": "1", "subject": "group", "name": "DevOps", "project": "prod", "remote_user": "support", "sudo_mode": "none", "allowed_actions": ["ssh"]},
+            {"id": "2", "subject": "group", "name": "DevOps", "project": "prod", "remote_user": "root", "sudo_mode": "sudo-i", "allowed_actions": ["ssh"]},
+        ]
+        matrix = build_access_matrix(grants, {}, hosts, defaults={})
+        self.assertEqual(matrix["rows"][0]["cells"]["prod"]["state"], "allowed")
+        self.assertIn("conflict", {row["type"] for row in matrix["findings"]})
+        preview = preview_grant_change([], {}, hosts, {
+            "subject": "group", "name": "Support", "project": "prod", "remote_user": "support",
+            "sudo_mode": "none", "allowed_actions": ["ssh"],
+        })
+        self.assertEqual(preview["counts"]["gained"], 1)
+
+
 class InventoryTest(unittest.TestCase):
     def test_search_matches_services_and_note_but_go_fields_do_not(self):
         try:
@@ -2084,6 +2197,7 @@ class HistoryTest(unittest.TestCase):
                         "username": "alice",
                         "project": "kube",
                         "host_id": "10004",
+                        "server_name": "control-plane",
                         "target_host": "192.168.234.4",
                         "remote_user": "dba",
                     },
@@ -2102,6 +2216,7 @@ class HistoryTest(unittest.TestCase):
 
             self.assertEqual(len(rows), 1)
             self.assertEqual(rows[0]["project"], "kube")
+            self.assertEqual(rows[0]["server_name"], "control-plane")
             self.assertEqual(rows[0]["result"], "exit=0")
             self.assertEqual(rows[0]["raw_log_path"], "/opt/auth/logs/alice/raw.log")
         finally:
@@ -2413,6 +2528,10 @@ class DashboardTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         text = response.get_data(as_text=True)
         self.assertIn('http-equiv="refresh" content="15"', text)
+        self.assertIn('class="theme-switch"', text)
+        self.assertIn('data-theme-choice="dark"', text)
+        self.assertIn("About this page", text)
+        self.assertIn("Review temporary access requests", text)
         self.assertIn('name="csrf_token" value="csrf"', text)
         self.assertIn("INC-1", text)
         self.assertIn('name="comment"', text)
@@ -2487,6 +2606,46 @@ class DashboardTest(unittest.TestCase):
         self.assertIn("&lt;sudo via PAM&gt;", text)
         self.assertIn('/history?host=10703', text)
         self.assertIn("&lt;vip&gt;", text)
+
+    def test_history_enriches_legacy_rows_with_inventory_host_name(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-history-{}".format(uuid.uuid4().hex))
+        try:
+            session_dir = os.path.join(tmpdir, "admin", "session-history")
+            os.makedirs(session_dir)
+            with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as session_f:
+                session_f.write(json.dumps({
+                    "event": "policy_selected", "ts": 10.0, "username": "admin",
+                    "project": "prod", "host_id": "10007", "target_host": "10.0.0.7",
+                    "remote_user": "support", "connection_id": "conn-history",
+                    "session_id": "session-history",
+                }) + "\n")
+            redis = FakeRedis()
+            redis.set("server_10007", json.dumps({
+                "server_id": "10007", "project_name": "prod", "server_ip": "10.0.0.7",
+                "server_name": "api-primary", "server_user": "support",
+            }))
+            try:
+                app = isolate_web.create_app({
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": tmpdir},
+                })
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            app.config["TESTING"] = True
+            with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                response = client.get("/history")
+
+            self.assertEqual(response.status_code, 200)
+            text = response.get_data(as_text=True)
+            self.assertIn("api-primary", text)
+            self.assertIn("host name", text)
+            self.assertIn("Search audited SSH connections", text)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
 
     def test_session_details_and_replay_routes(self):
         tmpdir = os.path.join(ROOT, ".tmp-dashboard-session-{}".format(uuid.uuid4().hex))
@@ -2656,6 +2815,74 @@ class DashboardTest(unittest.TestCase):
                 simulator = client.get("/policy/simulate?groups=DevOps&project=prod&host={}".format(host_id))
             self.assertIn("ALLOWED", simulator.get_data(as_text=True))
             self.assertEqual(len(list_grant_records(redis)), 1)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_jobs_alerts_and_access_matrix_pages(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-operations-{}".format(uuid.uuid4().hex))
+        os.makedirs(tmpdir)
+        try:
+            try:
+                app = isolate_web.create_app({
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "session_control": {"alerts": {"enabled": True, "long_session_seconds": 60}},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": tmpdir},
+                    "policy": {"fallback_remote_user": None}, "ssh": {},
+                    "runbooks": {"enabled": False},
+                    "command_execution": {"jobs_path": os.path.join(tmpdir, "jobs")},
+                })
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            redis = FakeRedis()
+            redis.set("server_1", json.dumps({
+                "server_id": 1, "project_name": "prod", "server_ip": "10.0.0.1",
+                "server_name": "web", "server_user": "support",
+            }))
+            redis.set("grant_1", json.dumps({
+                "subject": "group", "name": "DevOps", "project": "prod", "remote_user": "support",
+                "sudo_mode": "none", "allowed_actions": ["ssh"],
+            }))
+            redis.set("job_7", json.dumps({
+                "id": "7", "status": "failed", "type": "runbook", "runbook_id": "uptime",
+                "username": "alice", "project": "prod", "host_id": "1", "created_at": 10,
+                "finished_at": 11, "error": "network",
+            }))
+            app.config["TESTING"] = True
+            with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                    sess["csrf_token"] = "csrf"
+                jobs = client.get("/jobs")
+                job_details = client.get("/job/7")
+                alerts = client.get("/alerts")
+                matrix = client.get("/policy/matrix")
+                alert_id = collect_alerts(redis, app.config.get("ISOLATE_CONFIG", {
+                    "session_control": {"alerts": {"enabled": True, "long_session_seconds": 60}}
+                }))[0]["id"]
+                acknowledge = client.post("/alerts", data={
+                    "csrf_token": "csrf", "confirm": "true", "alert_id": alert_id,
+                    "action": "acknowledge", "comment": "investigating",
+                })
+                preview = client.post("/policy/matrix", data={
+                    "csrf_token": "csrf", "subject": "group", "name": "Support",
+                    "selector_type": "project", "selector_value": "prod", "remote_user": "support",
+                    "sudo_mode": "none", "allowed_actions": "ssh",
+                })
+
+            self.assertEqual(jobs.status_code, 200)
+            self.assertIn("Jobs &amp; Runbooks", jobs.get_data(as_text=True))
+            self.assertIn("network", job_details.get_data(as_text=True))
+            self.assertEqual(alerts.status_code, 200)
+            self.assertIn("Failed job 7", alerts.get_data(as_text=True))
+            self.assertEqual(acknowledge.status_code, 200)
+            self.assertIn("acknowledged", acknowledge.get_data(as_text=True))
+            self.assertEqual(matrix.status_code, 200)
+            self.assertIn("Access Matrix", matrix.get_data(as_text=True))
+            self.assertIn("group:DevOps", matrix.get_data(as_text=True))
+            self.assertIn("Blast radius preview", preview.get_data(as_text=True))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 

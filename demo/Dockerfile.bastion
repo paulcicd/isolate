@@ -38,6 +38,7 @@ COPY demo/entrypoint-dashboard.sh /opt/auth/demo/entrypoint-dashboard.sh
 COPY demo/init-demo.sh /opt/auth/demo/init-demo.sh
 COPY demo/seed.py /opt/auth/demo/seed.py
 COPY demo/smoke.py /opt/auth/demo/smoke.py
+COPY demo/smoke-dashboard.py /opt/auth/demo/smoke-dashboard.py
 
 RUN chmod 0755 /opt/auth/demo/*.sh /opt/auth/demo/*.py \
     && printf '%s\n' \

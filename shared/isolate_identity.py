@@ -8,6 +8,7 @@ import os
 import ssl
 import time
 import uuid
+import warnings
 from urllib import error, parse, request
 
 
@@ -152,22 +153,40 @@ def verify_jwt_claims(token, keycloak_config, now=None):
     if not keycloak_config.get("verify_tokens", True):
         return decode_jwt_payload(token)
     try:
-        from authlib.jose import JsonWebKey, JsonWebToken
+        claims = _verify_jwt_signature(token, load_jwks(keycloak_config))
     except ImportError:
-        raise IdentityError("Authlib is required for JWT verification")
-
-    jwks = load_jwks(keycloak_config)
-    try:
-        key_set = JsonWebKey.import_key_set(jwks)
-        jwt = JsonWebToken(["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"])
-        claims = jwt.decode(token, key_set)
-        claims.validate()
+        raise IdentityError("joserfc or Authlib is required for JWT verification")
     except Exception as exc:
         raise IdentityError("invalid identity token: {}".format(exc))
 
-    claims = dict(claims)
     _validate_claims(claims, keycloak_config, now=now)
     return claims
+
+
+def _verify_jwt_signature(token, jwks):
+    algorithms = ["RS256", "RS384", "RS512", "ES256", "ES384", "ES512"]
+    try:
+        from joserfc import jwt
+        from joserfc.jwk import KeySet
+
+        decoded = jwt.decode(token, KeySet.import_key_set(jwks), algorithms=algorithms)
+        return dict(decoded.claims)
+    except ImportError:
+        # Rolling upgrades can load new code before dependencies are refreshed.
+        # Keep the verified Authlib path as a silent compatibility fallback.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="authlib.jose module is deprecated.*",
+                category=DeprecationWarning,
+            )
+            from authlib.jose import JsonWebKey, JsonWebToken
+
+        key_set = JsonWebKey.import_key_set(jwks)
+        legacy_jwt = JsonWebToken(algorithms)
+        claims = legacy_jwt.decode(token, key_set)
+        claims.validate()
+        return dict(claims)
 
 
 def _validate_claims(claims, keycloak_config, now=None):

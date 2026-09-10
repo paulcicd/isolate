@@ -146,6 +146,7 @@ Dependencies are declared in `requirements.txt`:
 - `PyYAML`
 - `Flask`
 - `Authlib`
+- `joserfc` for non-deprecated local JWT/JWKS verification
 - `gunicorn`
 - official `mcp` Python SDK v2
 
@@ -233,6 +234,7 @@ After manual updates, run:
 
 ```bash
 git pull
+python3 -m pip install --break-system-packages -r /opt/auth/requirements.txt
 sudo bash /opt/auth/scripts/fix-perms.sh
 ```
 
@@ -242,6 +244,31 @@ Also run it after:
 git reset --hard origin/master
 git checkout <branch>
 ```
+
+### Production Update And Downtime
+
+`git pull` alone is not a complete production update. CLI processes load updated Python files on their next invocation, but the dashboard, MCP server, and job worker are long-running processes. A release may also change Python dependencies, systemd units, or required permissions.
+
+For the current in-place deployment, use this maintenance sequence:
+
+```bash
+cd /opt/auth
+sudo -u auth git fetch --prune
+sudo -u auth git pull --ff-only
+python3 -m pip install --break-system-packages -r /opt/auth/requirements.txt
+sudo bash /opt/auth/scripts/fix-perms.sh
+
+PYTHONPYCACHEPREFIX=/tmp/isolate-pycache python3 -m compileall shared wrappers tests
+PYTHONPYCACHEPREFIX=/tmp/isolate-pycache python3 -m unittest discover -s tests
+sudo -u auth /opt/auth/shared/isolate.py config validate --check-paths
+
+sudo systemctl reload isolate-dashboard.service
+sudo systemctl restart isolate-mcp.service isolate-job-worker.service
+```
+
+Gunicorn dashboard reload is graceful because the supplied systemd unit sends `HUP`: new workers start before old workers finish current requests. Existing SSH sessions are separate wrapper/SSH processes and continue running with the code they already loaded. Restarting MCP and the job worker causes a short control-plane interruption; queued job records remain in Redis and are picked up after restart, while a running remote command must be checked before restarting the worker.
+
+For strict zero-downtime releases, do not update `/opt/auth` in place. Build an immutable release and virtual environment under `/opt/isolate/releases/<git-sha>`, run preflight checks there, switch a `current` symlink, and roll two dashboard/MCP instances behind the reverse proxy one at a time. Keep Redis schemas backward-compatible across the old and new process versions, drain the job worker before switching it, and roll back by restoring the previous symlink. This release-slot workflow is recommended for a later deployment automation iteration; the current repository does not claim zero-downtime MCP/worker restarts.
 
 ## Shell Integration
 
@@ -435,6 +462,7 @@ dashboard:
   public_url: https://bastion.example.org
   secret_key_file: /opt/auth/keys/dashboard_secret
   refresh_seconds: 15
+  jobs_max_results: 250
   admin_groups:
     - Demo-DevOps
     - Demo-Security
@@ -1627,6 +1655,9 @@ Routes:
 - `/auth/callback`: OIDC callback.
 - `/logout`: logout.
 - `/sessions/active`: active SSH sessions, live view, and optional force termination.
+- `/jobs`: jobs/runbooks queue, fleet progress, filters, cancel, and failed-host retry.
+- `/job/<job_id>`: job authorization snapshot, execution metadata, and captured output.
+- `/alerts`: long/VIP/privileged/unusual sessions, failed jobs, and notification failures.
 - `/history`: connection history.
 - `/session/<connection_id>`: session details and timeline.
 - `/session/<connection_id>/events.json`: session JSONL events.
@@ -1634,6 +1665,7 @@ Routes:
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
 - `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
 - `/policy/simulate`: visual allow/deny simulator using the production resolver.
+- `/policy/matrix`: effective `user/group/role x project` access, policy findings, and blast-radius preview.
 - `/policy/gitops`: signed Git policy status, drift/blast-radius refresh, sync, and rollback.
 - `/users` and `/user/<username>`: observed groups, candidate grants, active sessions, and history.
 - `/notifications`: configured sinks and delivery results for access requests and session alerts.
@@ -1657,6 +1689,36 @@ Access approval from the dashboard supports:
 - denial reason.
 
 Dashboard POST actions use a per-session CSRF token and explicit confirmation. Host edit forms carry an optimistic revision token, so a stale browser form cannot overwrite a newer host update. Policy mutations create a private snapshot first. When `policy_as_code.enforce_git` is true, manual grant/project-set forms are read-only and Git is the only static-policy writer.
+
+### Jobs And Runbooks Console
+
+The console uses the existing signed asynchronous job records and worker. It does not execute commands in the Flask process. A dashboard administrator can queue an enabled typed runbook for one host or a comma-separated fleet of host IDs. Before any job is created, Isolate validates the complete fleet, runbook parameters, current Keycloak groups, effective grant action (`runbook` or `operate`), remote user, sudo mode, timeout, and configured fleet limit.
+
+```yaml
+runbooks:
+  enabled: true
+  max_fleet_hosts: 100
+  read_only:
+    allowed_groups: [Demo-DevOps]
+    allow_sudo: false
+    require_confirmation: true
+```
+
+Each fleet child remains a normal `job_*` record accepted by the existing worker and additionally carries `fleet_id`, slot, size, and attempt metadata. Fleet progress counts only the newest attempt for each host. Retry is limited to failed or timed-out jobs, verifies the original HMAC authorization signature, and re-evaluates current inventory, grants, runbook configuration, groups, remote identity, and sudo policy. Cancel and retry require CSRF plus explicit confirmation and emit dashboard admin audit events.
+
+### Alert Center
+
+The alert center aggregates existing runtime sources without replacing them:
+
+- active/recent `active_session_*` records for VIP, root/sudo, unusual-source, and long-session alerts;
+- failed and timed-out `job_*` records;
+- failed access-request and session-alert notification deliveries.
+
+Acknowledge, resolve, reopen, and comments are stored separately as `dashboard_alert_state_*`. This means an operator action cannot alter the original session, job, or delivery evidence. Add `dashboard_alert_state_*` to custom backup/Redis ACL configurations when overriding the defaults.
+
+### Access Matrix
+
+The access matrix invokes the same grant resolver as `s`, `g`, MCP, and the worker. Every cell shows effective host coverage, remote users, and allowed actions for a subject/project pair. Findings identify equal-precedence grants with conflicting or identical outcomes and grants shadowed across the current inventory. A preview can simulate a new grant or replace an existing grant ID and reports gained, lost, and changed host access. Preview is read-only and never writes Redis policy.
 
 ## MCP Server
 
@@ -2119,6 +2181,8 @@ backup:
     - project_set_*
     - access_request_*
     - active_session_*
+    - job_*
+    - dashboard_alert_state_*
     - ssh_config_*
     - complete_hosts_*
     - offset_*
@@ -2221,7 +2285,7 @@ redis:
 A representative Redis ACL is:
 
 ```text
-user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~inventory_lock_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~job_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
+user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~inventory_lock_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~job_* ~dashboard_alert_state_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
 ```
 
 Test ACL/TLS with `isolate health` before disabling the old Redis user. Client certificate fields are optional and are only needed for mutual TLS.

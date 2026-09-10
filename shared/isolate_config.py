@@ -122,6 +122,7 @@ DEFAULT_CONFIG = {
         "admin_groups": [],
         "refresh_seconds": 15,
         "require_mutation_confirmation": True,
+        "jobs_max_results": 250,
     },
     "mcp": {
         "enabled": False,
@@ -171,6 +172,7 @@ DEFAULT_CONFIG = {
     },
     "runbooks": {
         "enabled": False,
+        "max_fleet_hosts": 100,
         "disabled": [],
         "read_only": {
             "allowed_groups": [],
@@ -227,6 +229,7 @@ DEFAULT_CONFIG = {
             "access_request_*",
             "active_session_*",
             "job_*",
+            "dashboard_alert_state_*",
             "ssh_config_*",
             "complete_hosts_*",
             "offset_*",

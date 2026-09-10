@@ -71,6 +71,7 @@ def _row_from_events(events):
         "username": source.get("username"),
         "project": source.get("project"),
         "host_id": source.get("host_id"),
+        "server_name": source.get("server_name") or source.get("host_name"),
         "target": source.get("target_host"),
         "remote_user": source.get("remote_user"),
         "connection_id": source.get("connection_id"),
@@ -102,6 +103,7 @@ def _matches(row, query=None, user=None, project=None, host=None):
             row.get("username"),
             row.get("project"),
             row.get("host_id"),
+            row.get("server_name"),
             row.get("target"),
             row.get("remote_user"),
         ]
@@ -154,6 +156,7 @@ def format_history_table(rows):
         ("username", "user", 14),
         ("project", "project", 12),
         ("host_id", "host_id", 7),
+        ("server_name", "host_name", 18),
         ("target", "target", 16),
         ("remote_user", "remote_user", 12),
         ("result", "result", 10),

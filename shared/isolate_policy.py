@@ -94,6 +94,11 @@ def _grant_rank(grant):
     return host_rank + subject_rank + _selector_rank(grant)
 
 
+def grant_specificity(grant):
+    """Return the resolver rank used for diagnostics and policy tooling."""
+    return _grant_rank(grant)
+
+
 def _matches(grant, identity, project=None, host=None, project_sets=None):
     return (
         not _is_expired(grant)
@@ -101,6 +106,15 @@ def _matches(grant, identity, project=None, host=None, project_sets=None):
         and _host_matches(grant, host)
         and _project_matches(grant, project, project_sets=project_sets)
     )
+
+
+def matching_grants(identity, project=None, host=None, grants=None, project_sets=None):
+    """Return all non-expired matching grants in resolver precedence order."""
+    matches = [
+        grant for grant in (grants or [])
+        if _matches(grant, identity, project=project, host=host, project_sets=project_sets)
+    ]
+    return sorted(matches, key=_grant_rank, reverse=True)
 
 
 def _is_expired(grant, now=None):
@@ -113,8 +127,13 @@ def _is_expired(grant, now=None):
 def resolve_grant(identity, project=None, host=None, grants=None, project_sets=None, defaults=None, action="ssh"):
     grants = grants or []
     defaults = defaults or {}
-    matches = [grant for grant in grants if _matches(grant, identity, project=project, host=host, project_sets=project_sets)]
-    matches = sorted(matches, key=_grant_rank, reverse=True)
+    matches = matching_grants(
+        identity,
+        project=project,
+        host=host,
+        grants=grants,
+        project_sets=project_sets,
+    )
 
     selected = matches[0] if matches else None
     if selected is None:

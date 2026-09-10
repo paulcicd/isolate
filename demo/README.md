@@ -24,6 +24,7 @@
 docker compose -f demo/docker-compose.yml up -d --build
 docker compose -f demo/docker-compose.yml ps
 docker compose -f demo/docker-compose.yml --profile tools run --rm smoke
+docker compose -f demo/docker-compose.yml exec -T dashboard python3 /opt/auth/demo/smoke-dashboard.py
 ```
 
 Первый build и старт Keycloak могут занять несколько минут. Состояние сервисов:

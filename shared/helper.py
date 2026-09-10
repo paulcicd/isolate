@@ -356,6 +356,9 @@ class ServerConnection(object):
             self.ssh_wrapper_argv.extend(['--project', str(self.project_name)])
         if self.server_id:
             self.ssh_wrapper_argv.extend(['--host-id', str(self.server_id)])
+        server_name = (self.search_results[0] if len(self.search_results) == 1 else {}).get('server_name')
+        if server_name:
+            self.ssh_wrapper_argv.extend(['--server-name', str(server_name)])
         if self.helper.identity.get('username'):
             self.ssh_wrapper_argv.extend(['--human-user', str(self.helper.identity.get('username'))])
         if self.helper.identity.get('keycloak_sub'):
@@ -437,6 +440,7 @@ class ServerConnection(object):
             "policy_selected",
             project=self.project_name,
             host_id=self.server_id,
+            server_name=(self.search_results[0] if len(self.search_results) == 1 else {}).get('server_name'),
             target_host=self.host,
             remote_user=self.user,
             connection_id=self.connection_id,

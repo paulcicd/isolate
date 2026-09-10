@@ -97,6 +97,18 @@ def validate_config(config, check_paths=False):
             warnings.append("dashboard is enabled without dashboard.admin_groups")
         if not isinstance(dashboard.get("require_mutation_confirmation", True), bool):
             errors.append("dashboard.require_mutation_confirmation must be a boolean")
+    try:
+        if int(dashboard.get("jobs_max_results", 250)) < 1:
+            errors.append("dashboard.jobs_max_results must be greater than zero")
+    except (TypeError, ValueError):
+        errors.append("dashboard.jobs_max_results must be an integer")
+
+    try:
+        max_fleet_hosts = int(runbooks.get("max_fleet_hosts", 100))
+        if not 1 <= max_fleet_hosts <= 1000:
+            errors.append("runbooks.max_fleet_hosts must be between 1 and 1000")
+    except (TypeError, ValueError):
+        errors.append("runbooks.max_fleet_hosts must be an integer")
 
     if not isinstance(command_audit.get("send_env", False), bool):
         errors.append("command_audit.send_env must be a boolean")

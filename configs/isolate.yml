@@ -34,6 +34,7 @@ dashboard:
   admin_groups: []
   refresh_seconds: 15
   require_mutation_confirmation: true
+  jobs_max_results: 250
 
 command_audit:
   enabled: false
@@ -118,6 +119,7 @@ command_execution:
 
 runbooks:
   enabled: false
+  max_fleet_hosts: 100
   # Built-ins can be removed from the MCP catalog by id without editing code.
   disabled: []
   read_only:
@@ -202,6 +204,7 @@ backup:
     - access_request_*
     - active_session_*
     - job_*
+    - dashboard_alert_state_*
     - ssh_config_*
     - complete_hosts_*
     - offset_*

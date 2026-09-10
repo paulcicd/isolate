@@ -17,11 +17,22 @@ from isolate_history import list_user_profiles, read_history
 from isolate_health import run_health_checks
 from isolate_identity import normalize_claims
 from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, get_host, list_hosts, update_host
+from isolate_dashboard_data import (
+    DashboardDataError,
+    build_access_matrix,
+    collect_alerts,
+    filter_jobs,
+    fleet_progress,
+    preview_grant_change,
+    update_alert_state,
+)
+from isolate_jobs import JobError, create_runbook_fleet, get_job, list_jobs, read_job_output, request_job_cancel, retry_job
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_replay import find_session, parse_raw_replay
 from isolate_policy import PolicyDenied, resolve_grant
 from isolate_policy_bundle import PolicyBundleError, apply_bundle, blast_radius, export_bundle, plan_bundle, validate_bundle
 from isolate_gitops import GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, save_policy_snapshot, sync_git_policy
+from isolate_runbooks import list_runbooks
 from isolate_sessions import SessionControlError, get_session, list_active_sessions, list_session_records, request_session_termination
 
 
@@ -41,24 +52,70 @@ def _secret_key(config):
 _DASHBOARD_CSS = """
 :root {
   color-scheme: light;
-  --bg: #f3f6f5;
+  --bg: #f4f6fa;
   --surface: #ffffff;
-  --surface-muted: #eef3f1;
-  --sidebar: #18211f;
-  --sidebar-muted: #9bacA7;
-  --text: #17201e;
-  --muted: #64716d;
-  --line: #dbe3e0;
-  --accent: #08756b;
-  --accent-strong: #075f57;
-  --accent-soft: #e4f3f0;
-  --blue: #2b65a7;
-  --blue-soft: #eaf2fb;
-  --amber: #936312;
-  --amber-soft: #fff5dc;
-  --red: #a43c3c;
-  --red-soft: #fcecec;
-  --shadow: 0 1px 2px rgba(15, 33, 29, 0.05), 0 8px 24px rgba(15, 33, 29, 0.04);
+  --surface-muted: #eef1f7;
+  --sidebar: #111622;
+  --sidebar-hover: #1c2433;
+  --sidebar-active: #252f44;
+  --sidebar-line: #293246;
+  --sidebar-text: #d8deeb;
+  --sidebar-muted: #8f9bb3;
+  --text: #192131;
+  --muted: #68748a;
+  --line: #dbe1ec;
+  --accent: #4967d5;
+  --accent-strong: #334fb7;
+  --accent-soft: #edf0ff;
+  --info: #3274c8;
+  --info-soft: #eaf2fc;
+  --positive: #286ea8;
+  --positive-soft: #e8f3fb;
+  --amber: #94600c;
+  --amber-soft: #fff3d6;
+  --red: #ae3f51;
+  --red-soft: #fcebef;
+  --topbar: rgba(255, 255, 255, 0.96);
+  --table-head: #f7f8fb;
+  --table-hover: #f7f9fd;
+  --input: #ffffff;
+  --terminal: #111722;
+  --terminal-text: #dce4f3;
+  --shadow: 0 1px 2px rgba(23, 31, 48, 0.05), 0 8px 24px rgba(23, 31, 48, 0.05);
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #0c1018;
+  --surface: #151b27;
+  --surface-muted: #1d2534;
+  --sidebar: #080c13;
+  --sidebar-hover: #171e2b;
+  --sidebar-active: #222c40;
+  --sidebar-line: #252d3d;
+  --sidebar-text: #d7ddea;
+  --sidebar-muted: #8894aa;
+  --text: #e8ecf5;
+  --muted: #98a4b9;
+  --line: #2a3447;
+  --accent: #8ea2ff;
+  --accent-strong: #adbbff;
+  --accent-soft: #252d4a;
+  --info: #7eb2f3;
+  --info-soft: #1b2b42;
+  --positive: #72a9df;
+  --positive-soft: #1a2b3d;
+  --amber: #e1b45e;
+  --amber-soft: #382d1a;
+  --red: #ee91a0;
+  --red-soft: #3a2028;
+  --topbar: rgba(21, 27, 39, 0.96);
+  --table-head: #19212e;
+  --table-hover: #1a2230;
+  --input: #111722;
+  --terminal: #080c12;
+  --terminal-text: #dce4f3;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.24), 0 10px 28px rgba(0, 0, 0, 0.18);
 }
 
 * { box-sizing: border-box; }
@@ -85,9 +142,9 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   width: 236px;
   flex-direction: column;
   overflow-y: auto;
-  color: #f4f8f7;
+  color: var(--sidebar-text);
   background: var(--sidebar);
-  border-right: 1px solid #2b3734;
+  border-right: 1px solid var(--sidebar-line);
 }
 .brand {
   display: flex;
@@ -96,7 +153,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   gap: 12px;
   padding: 16px 18px;
   color: #ffffff;
-  border-bottom: 1px solid #2b3734;
+  border-bottom: 1px solid var(--sidebar-line);
 }
 .brand:hover { color: #ffffff; text-decoration: none; }
 .brand-mark {
@@ -105,8 +162,8 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   height: 36px;
   flex: 0 0 36px;
   place-items: center;
-  color: #0f2925;
-  background: #7ed5c5;
+  color: #ffffff;
+  background: var(--accent);
   border-radius: 6px;
   font-size: 13px;
   font-weight: 800;
@@ -119,7 +176,7 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
 .nav-label {
   display: block;
   padding: 0 10px 6px;
-  color: #7f918c;
+  color: var(--sidebar-muted);
   font-size: 11px;
   font-weight: 700;
   text-transform: uppercase;
@@ -130,13 +187,13 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   align-items: center;
   margin: 2px 0;
   padding: 8px 10px;
-  color: #cbd6d3;
+  color: var(--sidebar-text);
   border-left: 3px solid transparent;
   border-radius: 4px;
   font-weight: 560;
 }
-.nav-link:hover { color: #ffffff; background: #222e2b; text-decoration: none; }
-.nav-link.active { color: #ffffff; background: #253532; border-left-color: #72cbbb; }
+.nav-link:hover { color: #ffffff; background: var(--sidebar-hover); text-decoration: none; }
+.nav-link.active { color: #ffffff; background: var(--sidebar-active); border-left-color: var(--accent); }
 
 .sidebar-footer {
   display: grid;
@@ -144,22 +201,22 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   gap: 9px;
   align-items: center;
   padding: 14px 16px;
-  border-top: 1px solid #2b3734;
+  border-top: 1px solid var(--sidebar-line);
 }
 .user-avatar {
   display: grid;
   width: 34px;
   height: 34px;
   place-items: center;
-  color: #dff8f2;
-  background: #2d4943;
+  color: #eef1ff;
+  background: #303a55;
   border-radius: 50%;
   font-size: 11px;
   font-weight: 750;
 }
 .user-copy { min-width: 0; }
-.user-name { display: block; overflow: hidden; color: #f4f8f7; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
-.logout-link { display: inline-block; color: #9fb1ac; font-size: 12px; }
+.user-name { display: block; overflow: hidden; color: #f3f5fa; font-size: 13px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
+.logout-link { display: inline-block; color: var(--sidebar-muted); font-size: 12px; }
 .logout-link:hover { color: #ffffff; }
 
 .main { min-height: 100vh; margin-left: 236px; }
@@ -173,13 +230,13 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   justify-content: space-between;
   gap: 20px;
   padding: 0 28px;
-  background: rgba(255, 255, 255, 0.96);
+  background: var(--topbar);
   border-bottom: 1px solid var(--line);
 }
 .topbar-title { font-size: 14px; font-weight: 700; }
 .topbar-kicker { display: block; color: var(--muted); font-size: 11px; font-weight: 650; text-transform: uppercase; }
 .runtime-state { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; font-weight: 600; }
-.status-dot { width: 8px; height: 8px; background: #2f9d74; border-radius: 50%; box-shadow: 0 0 0 3px #e1f3eb; }
+.status-dot { width: 8px; height: 8px; background: var(--accent); border-radius: 50%; box-shadow: 0 0 0 3px var(--accent-soft); }
 
 .content { width: 100%; max-width: 1600px; margin: 0 auto; padding: 28px; }
 h1 { margin: 0 0 22px; font-size: 28px; line-height: 1.2; font-weight: 730; }
@@ -201,14 +258,42 @@ p { margin: 10px 0; }
   box-shadow: var(--shadow);
 }
 .metric::before { position: absolute; inset: 0 auto 0 0; width: 4px; background: var(--accent); content: ""; }
-.metric:nth-child(2)::before { background: #c28724; }
-.metric:nth-child(3)::before { background: var(--blue); }
+.metric:nth-child(2)::before { background: var(--amber); }
+.metric:nth-child(3)::before { background: var(--info); }
 .metric strong { display: block; margin-bottom: 4px; font-size: 30px; line-height: 1; font-variant-numeric: tabular-nums; }
 .metric .muted { font-size: 13px; font-weight: 600; }
 .metric-link { display: inline-block; margin-top: 13px; font-size: 12px; font-weight: 700; }
 .section-heading { display: flex; align-items: baseline; justify-content: space-between; gap: 18px; margin-top: 34px; }
 .section-heading h2 { margin: 0; }
-.empty-state { margin-top: 12px; padding: 28px; color: var(--muted); text-align: center; background: var(--surface); border: 1px dashed #bdc9c5; border-radius: 6px; }
+.empty-state { margin-top: 12px; padding: 28px; color: var(--muted); text-align: center; background: var(--surface); border: 1px dashed var(--line); border-radius: 6px; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: space-between; margin: 0 0 14px; }
+.toolbar form { flex: 1; }
+.panel { margin-top: 14px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
+.panel h2, .panel h3 { margin-top: 0; }
+.summary-list { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; margin: 14px 0; }
+.summary-item { padding: 12px; background: var(--surface-muted); border-radius: 5px; }
+.summary-item strong { display: block; font-size: 20px; font-variant-numeric: tabular-nums; }
+.progress { width: 150px; height: 8px; overflow: hidden; background: var(--surface-muted); border-radius: 4px; }
+.progress > span { display: block; height: 100%; background: var(--accent); }
+.matrix-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
+.matrix { width: max-content; min-width: 100%; }
+.matrix th:first-child, .matrix td:first-child { position: sticky; left: 0; z-index: 2; background: var(--table-head); }
+.matrix-cell { min-width: 154px; max-width: 220px; white-space: normal; }
+.matrix-cell strong { display: block; margin-bottom: 3px; }
+.matrix-allowed { background: var(--positive-soft); }
+.matrix-partial, .matrix-mixed { background: var(--amber-soft); }
+.matrix-denied { color: var(--muted); background: var(--surface-muted); }
+.severity-critical { color: var(--red); background: var(--red-soft); }
+.severity-high { color: var(--red); background: var(--red-soft); }
+.severity-medium { color: var(--amber); background: var(--amber-soft); }
+.severity-low { color: var(--info); background: var(--info-soft); }
+.button-secondary { color: var(--accent); background: var(--surface); }
+.button-secondary:hover { color: #ffffff; }
+.button-danger { color: var(--red); background: var(--surface); border-color: var(--red); }
+.button-danger:hover { color: #ffffff; background: var(--red); border-color: var(--red); }
+.key-value { display: grid; grid-template-columns: minmax(130px, 190px) minmax(0, 1fr); gap: 7px 16px; }
+.key-value dt { color: var(--muted); font-weight: 650; }
+.key-value dd { margin: 0; overflow-wrap: anywhere; }
 
 .table-wrap {
   width: 100%;
@@ -220,17 +305,17 @@ p { margin: 10px 0; }
   box-shadow: var(--shadow);
 }
 table { width: max-content; min-width: 100%; border-collapse: separate; border-spacing: 0; }
-th, td { padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid #e7ecea; font-size: 13px; }
+th, td { padding: 10px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); font-size: 13px; }
 th {
-  color: #52605c;
-  background: #f7f9f8;
+  color: var(--muted);
+  background: var(--table-head);
   font-size: 11px;
   font-weight: 750;
   text-transform: uppercase;
   white-space: nowrap;
 }
 tbody tr:last-child td { border-bottom: 0; }
-tbody tr:hover td { background: #f8fbfa; }
+tbody tr:hover td { background: var(--table-hover); }
 td { white-space: nowrap; }
 td.cell-server-services, td.cell-server-note, td.cell-privileged-access-hint, td.cell-command {
   min-width: 170px;
@@ -241,23 +326,23 @@ td.cell-server-services, td.cell-server-note, td.cell-privileged-access-hint, td
 td.cell-connection-id { max-width: 220px; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 
 .badge { display: inline-flex; min-height: 23px; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 750; white-space: nowrap; }
-.badge-active, .badge-approved, .badge-allowed, .badge-success { color: #176348; background: #e2f4eb; }
+.badge-active, .badge-approved, .badge-allowed, .badge-success { color: var(--positive); background: var(--positive-soft); }
 .badge-pending, .badge-vip, .badge-warning { color: var(--amber); background: var(--amber-soft); }
 .badge-denied, .badge-failed, .badge-error { color: var(--red); background: var(--red-soft); }
-.badge-completed { color: var(--blue); background: var(--blue-soft); }
+.badge-completed { color: var(--info); background: var(--info-soft); }
 
 input, select, textarea, button { min-height: 36px; margin: 2px; font: inherit; letter-spacing: 0; }
 input, select, textarea {
   max-width: 100%;
   padding: 7px 10px;
   color: var(--text);
-  background: #ffffff;
-  border: 1px solid #bcc9c5;
+  background: var(--input);
+  border: 1px solid var(--line);
   border-radius: 4px;
 }
-input::placeholder, textarea::placeholder { color: #84918d; }
+input::placeholder, textarea::placeholder { color: var(--muted); }
 input:focus, select:focus, textarea:focus, button:focus-visible, a:focus-visible {
-  outline: 3px solid rgba(8, 117, 107, 0.2);
+  outline: 3px solid rgba(73, 103, 213, 0.22);
   outline-offset: 1px;
   border-color: var(--accent);
 }
@@ -276,24 +361,56 @@ form { margin: 10px 0 18px; }
 form.inline { display: inline-flex; flex-wrap: wrap; gap: 5px; align-items: center; margin: 0; }
 form:not(.inline) { max-width: 1180px; padding: 18px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; }
 form p { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-label { color: #485652; font-size: 13px; font-weight: 600; }
+label { color: var(--text); font-size: 13px; font-weight: 600; }
 label input[type="checkbox"] { min-height: auto; accent-color: var(--accent); }
-form[action*="/terminate"] button { color: var(--red); background: #ffffff; border-color: #dca6a6; }
+form[action*="/terminate"] button { color: var(--red); background: var(--surface); border-color: var(--red); }
 form[action*="/terminate"] button:hover { color: #ffffff; background: var(--red); border-color: var(--red); }
 
-.notice { padding: 12px 14px; margin: 0 0 20px; color: #28587f; background: var(--blue-soft); border: 1px solid #bfd4ea; border-left: 4px solid var(--blue); border-radius: 5px; }
-.notice.error { color: var(--red); background: var(--red-soft); border-color: #ecc0c0; border-left-color: var(--red); }
-.notice.warning { color: var(--amber); background: var(--amber-soft); border-color: #ead39d; border-left-color: #c28724; }
-.notice.info, .notice.success { color: #176348; background: var(--accent-soft); border-color: #b9ded6; border-left-color: var(--accent); }
+.notice { padding: 12px 14px; margin: 0 0 20px; color: var(--info); background: var(--info-soft); border: 1px solid var(--line); border-left: 4px solid var(--info); border-radius: 5px; }
+.notice.error { color: var(--red); background: var(--red-soft); border-left-color: var(--red); }
+.notice.warning { color: var(--amber); background: var(--amber-soft); border-left-color: var(--amber); }
+.notice.info, .notice.success { color: var(--positive); background: var(--positive-soft); border-left-color: var(--positive); }
 
-pre { max-width: 100%; padding: 16px; overflow: auto; color: #dce8e4; background: #16201e; border: 1px solid #2e3a37; border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+pre { max-width: 100%; padding: 16px; overflow: auto; color: var(--terminal-text); background: var(--terminal); border: 1px solid var(--line); border-radius: 6px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
 code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.92em; }
-.terminal { border: 1px solid #34433f; border-radius: 6px; box-shadow: var(--shadow); }
+.terminal { border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
+
+.topbar-actions { display: flex; align-items: center; gap: 18px; }
+.theme-switch {
+  display: inline-grid;
+  grid-template-columns: repeat(2, minmax(54px, 1fr));
+  padding: 3px;
+  background: var(--surface-muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+.theme-switch button {
+  min-height: 28px;
+  margin: 0;
+  padding: 3px 9px;
+  color: var(--muted);
+  background: transparent;
+  border: 0;
+  border-radius: 4px;
+  font-size: 12px;
+  font-weight: 650;
+}
+.theme-switch button:hover { color: var(--text); background: var(--surface); }
+.theme-switch button[aria-pressed="true"] { color: var(--text); background: var(--surface); box-shadow: 0 1px 3px rgba(20, 28, 45, 0.16); }
+.page-help {
+  max-width: 900px;
+  margin: -10px 0 22px;
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+.page-help summary { width: max-content; padding: 6px 0 9px; color: var(--accent); cursor: pointer; font-size: 12px; font-weight: 700; }
+.page-help p { max-width: 820px; margin: 0 0 14px; }
 
 @media (max-width: 1050px) {
   .sidebar { width: 208px; }
   .main { margin-left: 208px; }
   .content { padding: 22px; }
+  .summary-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 @media (max-width: 760px) {
   .sidebar { position: static; width: 100%; max-height: none; }
@@ -302,12 +419,16 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   .nav-section { display: flex; gap: 4px; margin: 0 !important; }
   .nav-label, .sidebar-footer { display: none; }
   .nav-link { min-height: 34px; flex: 0 0 auto; padding: 7px 9px; border-left: 0; border-bottom: 2px solid transparent; }
-  .nav-link.active { border-bottom-color: #72cbbb; }
+  .nav-link.active { border-bottom-color: var(--accent); }
   .main { margin-left: 0; }
   .topbar { position: static; min-height: 54px; padding: 0 16px; }
   .runtime-state { display: none; }
+  .topbar-actions { gap: 8px; }
   .content { padding: 20px 16px; }
   .grid { grid-template-columns: 1fr; }
+  .summary-list { grid-template-columns: 1fr 1fr; }
+  .key-value { grid-template-columns: 1fr; gap: 2px; }
+  .key-value dd { margin-bottom: 8px; }
   h1 { font-size: 24px; }
   form:not(.inline) { padding: 14px; }
 }
@@ -323,7 +444,61 @@ document.querySelectorAll('.nav-link').forEach(function (link) {
     link.setAttribute('aria-current', 'page');
   }
 });
+document.querySelectorAll('[data-theme-choice]').forEach(function (button) {
+  function updateState() {
+    button.setAttribute('aria-pressed', String(document.documentElement.dataset.theme === button.dataset.themeChoice));
+  }
+  button.addEventListener('click', function () {
+    document.documentElement.dataset.theme = button.dataset.themeChoice;
+    localStorage.setItem('isolate-theme', button.dataset.themeChoice);
+    document.querySelectorAll('[data-theme-choice]').forEach(function (choice) {
+      choice.setAttribute('aria-pressed', String(choice.dataset.themeChoice === button.dataset.themeChoice));
+    });
+  });
+  updateState();
+});
 """
+
+
+_THEME_BOOTSTRAP_SCRIPT = """
+(function () {
+  var saved = localStorage.getItem('isolate-theme');
+  var preferred = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+  document.documentElement.dataset.theme = saved === 'dark' || saved === 'light' ? saved : preferred;
+})();
+"""
+
+
+_PAGE_HELP = {
+    "Isolate Dashboard": "Operational overview of active sessions, pending access requests, recent connections, jobs, and security alerts.",
+    "Jobs & Runbooks": "Run approved operational procedures across one host or a fleet, then monitor progress, output, retries, and cancellations.",
+    "Alert Center": "Review session risks, failed jobs, and notification delivery failures; acknowledge or resolve findings with an audit trail.",
+    "Access Matrix": "Inspect effective user and group access by project, identify conflicting grants, and preview the blast radius of changes.",
+    "Active Sessions": "See current SSH connections, their duration and target identity, and terminate a session when an incident requires it.",
+    "History": "Search audited SSH connections by user, project, host ID, host name, or target address and open their session details.",
+    "Access Requests": "Review temporary access requests, comments, tickets, notification status, and approve or deny break-glass grants.",
+    "Inventory": "Browse bastion-managed hosts, service metadata, VIP markers, and privileged access guidance. Host changes are audited.",
+    "Session Details": "Inspect one connection's identity, policy decision, command events, timestamps, exit status, raw log, and replay artifacts.",
+    "Live Session": "Follow newly written terminal output for an active connection. This view is observational and does not provide Web SSH.",
+    "Session Replay": "Replay the recorded terminal stream with seek, speed, ANSI rendering, and raw or JSON download options.",
+    "Policy Simulator": "Explain which grant would apply to a specific identity, project, and host before changing production access.",
+    "Policy GitOps": "Validate, compare, apply, and roll back optional Git-managed grants and project sets while tracking Redis drift.",
+    "Users": "Inspect identities observed in audit data together with effective grants, active sessions, and connection history.",
+    "User Details": "Review one user's observed groups, access rules, active sessions, and historical activity.",
+    "Notifications": "Check recent webhook, Telegram, and email delivery outcomes for access workflow events.",
+    "Grants": "Manage RBAC grants and project sets that determine visible hosts, allowed actions, remote users, and sudo mode.",
+}
+
+
+def _page_help(title):
+    description = _PAGE_HELP.get(str(title))
+    if not description and str(title).startswith("Job "):
+        description = "Inspect per-host execution state, output, errors, cancellation status, and retry failed targets for this job."
+    if not description:
+        return ""
+    return '<details class="page-help"><summary>About this page</summary><p>{}</p></details>'.format(
+        html.escape(description)
+    )
 
 
 def _html(title, body, config=None, notice=None):
@@ -347,6 +522,7 @@ def _html(title, body, config=None, notice=None):
     initials = "".join(part[:1] for part in username.replace(".", " ").split()[:2]).upper() or "AD"
     return """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
+<script>{theme_bootstrap_script}</script>
 <style>{css}</style></head><body>
 <div class="app-shell">
   <aside class="sidebar">
@@ -356,10 +532,10 @@ def _html(title, body, config=None, notice=None):
     </a>
     <nav class="primary-nav" aria-label="Primary navigation">
       <div class="nav-section"><span class="nav-label">Operations</span>
-        <a class="nav-link" href="/">Summary</a><a class="nav-link" href="/sessions/active">Active sessions</a><a class="nav-link" href="/history">History</a><a class="nav-link" href="/inventory">Inventory</a>
+        <a class="nav-link" href="/">Summary</a><a class="nav-link" href="/jobs">Jobs &amp; runbooks</a><a class="nav-link" href="/alerts">Alert center</a><a class="nav-link" href="/sessions/active">Active sessions</a><a class="nav-link" href="/history">History</a><a class="nav-link" href="/inventory">Inventory</a>
       </div>
       <div class="nav-section"><span class="nav-label">Access control</span>
-        <a class="nav-link" href="/access">Requests</a><a class="nav-link" href="/grants">Grants</a><a class="nav-link" href="/policy/simulate">Policy simulator</a>
+        <a class="nav-link" href="/access">Requests</a><a class="nav-link" href="/grants">Grants</a><a class="nav-link" href="/policy/matrix">Access matrix</a><a class="nav-link" href="/policy/simulate">Policy simulator</a>
       </div>
       <div class="nav-section"><span class="nav-label">Platform</span>
         <a class="nav-link" href="/policy/gitops">GitOps</a><a class="nav-link" href="/users">Users</a><a class="nav-link" href="/notifications">Notifications</a>
@@ -371,18 +547,20 @@ def _html(title, body, config=None, notice=None):
     </div>
   </aside>
   <main class="main">
-    <header class="topbar"><div><span class="topbar-kicker">Isolate v2</span><span class="topbar-title">Operations console</span></div><div class="runtime-state"><span class="status-dot"></span>Secured by Keycloak</div></header>
-    <div class="content">{notice}{body}</div>
+    <header class="topbar"><div><span class="topbar-kicker">Isolate v2</span><span class="topbar-title">Operations console</span></div><div class="topbar-actions"><div class="theme-switch" aria-label="Color theme"><button type="button" data-theme-choice="light" aria-pressed="false">Day</button><button type="button" data-theme-choice="dark" aria-pressed="false">Night</button></div><div class="runtime-state"><span class="status-dot"></span>Secured by Keycloak</div></div></header>
+    <div class="content">{notice}{page_help}{body}</div>
   </main>
 </div>
 <script>{active_nav_script}</script>
 </body></html>""".format(
         refresh=refresh,
         title=html.escape(str(title)),
+        theme_bootstrap_script=_THEME_BOOTSTRAP_SCRIPT,
         css=_DASHBOARD_CSS,
         initials=html.escape(initials),
         username=html.escape(username),
         notice=notice_html,
+        page_help=_page_help(title),
         body=body,
         active_nav_script=_ACTIVE_NAV_SCRIPT,
     )
@@ -395,7 +573,10 @@ def _table(rows, columns):
         cells = []
         for key, _ in columns:
             value = row.get(key) or ""
-            safe_html = key in ("raw", "project_link", "history", "details", "replay", "live", "control", "user_link", "edit")
+            safe_html = key in (
+                "raw", "project_link", "history", "details", "replay", "live", "control",
+                "user_link", "edit", "actions", "progress", "source_link", "severity_badge",
+            )
             rendered = str(value) if safe_html else html.escape(str(value))
             normalized = str(value).strip().lower()
             if not safe_html and key == "server_vip_marker" and rendered:
@@ -430,6 +611,25 @@ def _optional_bool(value):
     if normalized in ("0", "false", "no", "off"):
         return False
     raise ValueError("boolean field must be true or false")
+
+
+def _format_ts(value):
+    if not value:
+        return ""
+    try:
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return str(value)
+
+
+def _parse_json_object(value, field_name="JSON parameters"):
+    try:
+        result = json.loads(value or "{}")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("{} are invalid: {}".format(field_name, exc)) from exc
+    if not isinstance(result, dict):
+        raise ValueError("{} must be a JSON object".format(field_name))
+    return result
 
 
 def _host_form_values(form, partial=False):
@@ -682,6 +882,372 @@ def create_app(config=None):
             body += '<div class="empty-state">No SSH connections have been recorded yet.</div>'
         return _html("Isolate Dashboard", body, config=config)
 
+    @app.route("/jobs", methods=["GET", "POST"])
+    def jobs_console():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        notice = None
+        if request.method == "POST":
+            validate_csrf()
+            try:
+                require_mutation_confirmation()
+                action = request.form.get("action")
+                if action == "queue_runbook":
+                    parameters = _parse_json_object(request.form.get("parameters"), "runbook parameters")
+                    timeout = request.form.get("timeout") or None
+                    result = create_runbook_fleet(
+                        redis,
+                        config,
+                        admin,
+                        request.form.get("runbook_id"),
+                        _split_values(request.form.get("host_ids")),
+                        parameters=parameters,
+                        timeout=int(timeout) if timeout else None,
+                        confirmed=True,
+                    )
+                    audit_admin("runbook_fleet_queue", admin, "success", {
+                        "fleet_id": result["fleet_id"], "job_count": result["count"],
+                    })
+                    notice = {"level": "success", "text": "Queued fleet {} with {} job(s).".format(result["fleet_id"], result["count"])}
+                elif action == "retry_fleet":
+                    fleet_id = str(request.form.get("fleet_id") or "")
+                    summary = next((row for row in fleet_progress(list_jobs(redis, limit=10000)) if row["fleet_id"] == fleet_id), None)
+                    if summary is None:
+                        raise JobError("fleet was not found")
+                    retried = [retry_job(redis, config, job_id, admin) for job_id in summary["failed_job_ids"]]
+                    if not retried:
+                        raise JobError("fleet has no failed hosts to retry")
+                    audit_admin("job_fleet_retry", admin, "success", {"fleet_id": fleet_id, "job_count": len(retried)})
+                    notice = {"level": "success", "text": "Retried {} failed host(s) in fleet {}.".format(len(retried), fleet_id)}
+                else:
+                    raise JobError("unknown jobs action")
+            except (JobError, ValueError) as exc:
+                audit_admin("jobs_action", admin, "denied", {"error": str(exc)})
+                notice = {"level": "error", "text": str(exc)}
+
+        all_jobs = list_jobs(redis, limit=10000)
+        rows = filter_jobs(
+            all_jobs,
+            status=request.args.get("status") or None,
+            user=request.args.get("user") or None,
+            project=request.args.get("project") or None,
+            host=request.args.get("host") or None,
+            job_type=request.args.get("type") or None,
+        )[: int(config.get("dashboard", {}).get("jobs_max_results") or 250)]
+        status_counts = {name: sum(1 for row in all_jobs if row.get("status") == name) for name in ("queued", "running", "completed", "failed")}
+        body = """<h1>Jobs &amp; Runbooks</h1>
+<p class="page-lead">Queue policy-authorized diagnostics, monitor execution, inspect output, and retry failed hosts.</p>
+<div class="summary-list">
+<div class="summary-item"><strong>{queued}</strong><span class="muted">queued</span></div>
+<div class="summary-item"><strong>{running}</strong><span class="muted">running</span></div>
+<div class="summary-item"><strong>{completed}</strong><span class="muted">completed</span></div>
+<div class="summary-item"><strong>{failed}</strong><span class="muted">failed</span></div>
+</div>""".format(**status_counts)
+
+        runbook_cfg = config.get("runbooks", {}) or {}
+        available = []
+        if runbook_cfg.get("enabled", False):
+            for item in list_runbooks(config):
+                class_cfg = runbook_cfg.get(item.get("class"), {}) or {}
+                if item.get("class") == "operational" and not class_cfg.get("enabled", False):
+                    continue
+                if set(admin.get("groups") or []) & set(class_cfg.get("allowed_groups") or []):
+                    available.append(item)
+        if available:
+            options = "".join('<option value="{}">{}: {}</option>'.format(
+                html.escape(str(item["id"])), html.escape(str(item["id"])), html.escape(str(item.get("title") or item["id"])),
+            ) for item in available)
+            body += """<div class="panel"><h2>Queue runbook</h2>
+<form method="post"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="queue_runbook">
+<p><label>Runbook <select name="runbook_id" required>{options}</select></label>
+<label>Host IDs <input name="host_ids" placeholder="10001, 10002" required></label>
+<label>Timeout <input name="timeout" type="number" min="1" placeholder="default"></label></p>
+<p><label>Parameters JSON <textarea name="parameters" rows="3" cols="72">{{}}</textarea></label></p>
+<p><label><input type="checkbox" name="confirm" value="true" required> confirm execution on all selected hosts</label> <button type="submit">Queue runbook</button></p>
+</form></div>""".format(token=html.escape(csrf_token()), options=options)
+        else:
+            body += '<div class="notice warning">No runbook class is enabled for your verified Keycloak groups.</div>'
+
+        fleets = fleet_progress(all_jobs)
+        if fleets:
+            fleet_rows = []
+            for fleet in fleets:
+                row = dict(fleet)
+                row["progress"] = '<div class="progress" title="{percent}%"><span style="width:{percent}%"></span></div><small>{finished}/{total} finished</small>'.format(
+                    percent=int(fleet["progress_percent"]), finished=fleet["finished"], total=fleet["total"]
+                )
+                row["counts"] = "ok={} failed={} running={} queued={}".format(
+                    fleet["completed"], fleet["failed"] + fleet["timed_out"], fleet["running"], fleet["queued"]
+                )
+                if fleet["failed_job_ids"]:
+                    row["actions"] = """<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="retry_fleet"><input type="hidden" name="fleet_id" value="{fleet_id}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button class="button-secondary">Retry failed</button></form>""".format(
+                        token=html.escape(csrf_token()), fleet_id=html.escape(fleet["fleet_id"])
+                    )
+                fleet_rows.append(row)
+            body += "<h2>Fleet rollouts</h2>" + _table(fleet_rows, [
+                ("fleet_id", "fleet"), ("runbook_id", "runbook"), ("username", "user"),
+                ("status", "status"), ("progress", "progress"), ("counts", "results"), ("actions", "actions"),
+            ])
+
+        body += """<h2>Job history</h2><form class="inline" method="get">
+<select name="status"><option value="">all statuses</option>{status_options}</select>
+<select name="type"><option value="">all types</option><option value="runbook">runbook</option><option value="remote-command">remote command</option></select>
+<input name="user" value="{user}" placeholder="user"><input name="project" value="{project}" placeholder="project"><input name="host" value="{host}" placeholder="host id"><button>Filter</button></form>""".format(
+            status_options="".join('<option value="{0}">{0}</option>'.format(value) for value in ("queued", "running", "completed", "failed", "cancelled", "timed_out")),
+            user=html.escape(request.args.get("user", "")), project=html.escape(request.args.get("project", "")), host=html.escape(request.args.get("host", "")),
+        )
+        job_rows = []
+        for job in rows:
+            row = dict(job)
+            row["created"] = _format_ts(job.get("created_at"))
+            row["operation"] = job.get("runbook_id") or str(job.get("command") or "")[:80]
+            row["details"] = '<a href="/job/{}">open</a>'.format(html.escape(str(job.get("id"))))
+            job_rows.append(row)
+        body += _table(job_rows, [
+            ("id", "id"), ("created", "created"), ("status", "status"), ("type", "type"),
+            ("operation", "operation"), ("username", "user"), ("project", "project"),
+            ("host_id", "host"), ("exit_code", "exit"), ("details", "details"),
+        ]) if job_rows else '<div class="empty-state">No jobs match the selected filters.</div>'
+        return _html("Jobs & Runbooks", body, config=config, notice=notice)
+
+    @app.route("/job/<job_id>")
+    def job_details(job_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        job = get_job(redis, job_id)
+        if job is None:
+            abort(404)
+        jobs_path = (config.get("command_execution", {}) or {}).get("jobs_path", "/opt/auth/jobs")
+        output = read_job_output(
+            job,
+            max_bytes=int((config.get("command_execution", {}) or {}).get("max_return_bytes", 262144)),
+            jobs_path=jobs_path,
+            job_id=job_id,
+        )
+        body = """<h1>Job {job_id}</h1><p class="page-lead">Execution details and captured output.</p>
+<div class="panel"><dl class="key-value">
+<dt>Status</dt><dd><span class="badge badge-{status}">{status}</span></dd>
+<dt>Type</dt><dd>{type}</dd><dt>Runbook</dt><dd>{runbook}</dd><dt>User</dt><dd>{user}</dd>
+<dt>Project / host</dt><dd>{project} / <a href="/history?host={host}">{host}</a></dd>
+<dt>Remote identity</dt><dd>{remote_user} ({sudo_mode})</dd><dt>Created</dt><dd>{created}</dd>
+<dt>Started</dt><dd>{started}</dd><dt>Finished</dt><dd>{finished}</dd><dt>Exit code</dt><dd>{exit_code}</dd>
+<dt>Error</dt><dd>{error}</dd><dt>Fleet / attempt</dt><dd>{fleet} / {attempt}</dd>
+</dl></div>""".format(
+            job_id=html.escape(str(job_id)), status=html.escape(str(job.get("status") or "unknown")),
+            type=html.escape(str(job.get("type") or "")), runbook=html.escape(str(job.get("runbook_id") or "")),
+            user=html.escape(str(job.get("username") or "")), project=html.escape(str(job.get("project") or "")),
+            host=html.escape(str(job.get("host_id") or "")), remote_user=html.escape(str(job.get("remote_user") or "")),
+            sudo_mode=html.escape(str(job.get("sudo_mode") or "")), created=html.escape(_format_ts(job.get("created_at"))),
+            started=html.escape(_format_ts(job.get("started_at"))), finished=html.escape(_format_ts(job.get("finished_at"))),
+            exit_code=html.escape(str(job.get("exit_code") if job.get("exit_code") is not None else "")),
+            error=html.escape(str(job.get("error") or "")), fleet=html.escape(str(job.get("fleet_id") or "single")),
+            attempt=html.escape(str(job.get("attempt") or 1)),
+        )
+        if job.get("status") in ("queued", "running"):
+            body += """<form class="inline" method="post" action="/job/{}/cancel"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button class="button-danger">Cancel job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))
+        if job.get("status") in ("failed", "timed_out"):
+            body += """<form class="inline" method="post" action="/job/{}/retry"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Retry job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))
+        body += "<h2>Output</h2><pre>{}</pre>".format(html.escape(output or "No output was captured."))
+        body += "<h2>Authorization snapshot</h2><pre>{}</pre>".format(html.escape(json.dumps({
+            "groups": job.get("groups") or [], "roles": job.get("roles") or [], "grant_id": job.get("grant_id"),
+            "policy_action": job.get("policy_action") or "command", "command_sha256": job.get("command_sha256"),
+        }, indent=2, sort_keys=True)))
+        return _html("Job {}".format(job_id), body, config=config)
+
+    @app.route("/job/<job_id>/cancel", methods=["POST"])
+    def job_cancel(job_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        validate_csrf()
+        try:
+            require_mutation_confirmation()
+            record = request_job_cancel(redis_client(config), job_id, admin)
+            if record is None:
+                abort(404)
+            audit_admin("job_cancel", admin, "success", {"job_id": job_id})
+        except (JobError, ValueError) as exc:
+            audit_admin("job_cancel", admin, "denied", {"job_id": job_id, "error": str(exc)})
+            abort(409, description=str(exc))
+        return redirect(url_for("job_details", job_id=job_id))
+
+    @app.route("/job/<job_id>/retry", methods=["POST"])
+    def job_retry(job_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        validate_csrf()
+        try:
+            require_mutation_confirmation()
+            record = retry_job(redis_client(config), config, job_id, admin)
+            audit_admin("job_retry", admin, "success", {"job_id": record["id"], "retry_of": job_id})
+        except (JobError, ValueError) as exc:
+            audit_admin("job_retry", admin, "denied", {"job_id": job_id, "error": str(exc)})
+            abort(409, description=str(exc))
+        return redirect(url_for("job_details", job_id=record["id"]))
+
+    @app.route("/alerts", methods=["GET", "POST"])
+    def alert_center():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        notice = None
+        if request.method == "POST":
+            validate_csrf()
+            try:
+                require_mutation_confirmation()
+                alert_id = request.form.get("alert_id")
+                known = {row["id"] for row in collect_alerts(redis, config)}
+                if alert_id not in known:
+                    raise DashboardDataError("alert was not found")
+                state = update_alert_state(
+                    redis, alert_id, admin, request.form.get("action"), comment=request.form.get("comment") or None
+                )
+                audit_admin("alert_{}".format(request.form.get("action")), admin, "success", {
+                    "alert_id": alert_id, "status": state.get("status"),
+                })
+                notice = {"level": "success", "text": "Alert state updated."}
+            except (DashboardDataError, ValueError) as exc:
+                audit_admin("alert_action", admin, "denied", {"error": str(exc)})
+                notice = {"level": "error", "text": str(exc)}
+        rows = collect_alerts(
+            redis,
+            config,
+            status=request.args.get("status") or None,
+            kind=request.args.get("kind") or None,
+            user=request.args.get("user") or None,
+            project=request.args.get("project") or None,
+        )
+        all_rows = collect_alerts(redis, config)
+        counts = {name: sum(1 for row in all_rows if row.get("status") == name) for name in ("open", "acknowledged", "resolved")}
+        body = """<h1>Alert Center</h1><p class="page-lead">Session risk, failed jobs, and notification delivery failures in one operational queue.</p>
+<div class="summary-list"><div class="summary-item"><strong>{open}</strong><span class="muted">open</span></div><div class="summary-item"><strong>{acknowledged}</strong><span class="muted">acknowledged</span></div><div class="summary-item"><strong>{resolved}</strong><span class="muted">resolved</span></div><div class="summary-item"><strong>{total}</strong><span class="muted">total</span></div></div>
+<form class="inline" method="get"><select name="status"><option value="">all statuses</option><option>open</option><option>acknowledged</option><option>resolved</option></select><select name="kind"><option value="">all kinds</option><option value="long_session">long session</option><option value="vip_session">VIP</option><option value="privileged_session">privileged</option><option value="unusual_source_ip">unusual source</option><option value="failed_job">failed job</option><option value="notification_delivery_failed">notification failure</option></select><input name="user" value="{user}" placeholder="user"><input name="project" value="{project}" placeholder="project"><button>Filter</button></form>""".format(
+            total=len(all_rows), user=html.escape(request.args.get("user", "")), project=html.escape(request.args.get("project", "")), **counts
+        )
+        alert_rows = []
+        for alert in rows:
+            row = dict(alert)
+            row["created"] = _format_ts(alert.get("created_at"))
+            row["severity_badge"] = '<span class="badge severity-{}">{}</span>'.format(
+                html.escape(str(alert.get("severity") or "medium")), html.escape(str(alert.get("severity") or "medium"))
+            )
+            row["message"] = alert.get("details")
+            if alert.get("source_type") == "session":
+                row["source_link"] = '<a href="/session/{}">session</a>'.format(html.escape(str(alert.get("source_id"))))
+            elif alert.get("source_type") == "job":
+                row["source_link"] = '<a href="/job/{}">job {}</a>'.format(html.escape(str(alert.get("source_id"))), html.escape(str(alert.get("source_id"))))
+            else:
+                row["source_link"] = '<a href="/access?id={}">request {}</a>'.format(html.escape(str(alert.get("source_id"))), html.escape(str(alert.get("source_id"))))
+            buttons = []
+            if alert.get("status") == "open":
+                buttons.append('<button name="action" value="acknowledge" class="button-secondary">Acknowledge</button>')
+            if alert.get("status") != "resolved":
+                buttons.append('<button name="action" value="resolve">Resolve</button>')
+            else:
+                buttons.append('<button name="action" value="reopen" class="button-secondary">Reopen</button>')
+            buttons.append('<button name="action" value="comment" class="button-secondary">Comment</button>')
+            row["control"] = '<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="alert_id" value="{}"><input name="comment" placeholder="optional comment">{}<label><input type="checkbox" name="confirm" value="true" required> confirm</label></form>'.format(
+                html.escape(csrf_token()), html.escape(alert["id"]), "".join(buttons)
+            )
+            row["comments_count"] = len(alert.get("comments") or [])
+            alert_rows.append(row)
+        body += _table(alert_rows, [
+            ("created", "created"), ("severity_badge", "severity"), ("status", "status"), ("title", "alert"),
+            ("username", "user"), ("project", "project"), ("host_id", "host"), ("message", "details"),
+            ("source_link", "source"), ("comments_count", "comments"), ("control", "actions"),
+        ]) if alert_rows else '<div class="empty-state">No alerts match the selected filters.</div>'
+        return _html("Alert Center", body, config=config, notice=notice)
+
+    @app.route("/policy/matrix", methods=["GET", "POST"])
+    def access_matrix():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        grants = load_grants(redis)
+        project_sets = load_project_sets(redis)
+        hosts = list_hosts(redis)
+        defaults = {**config.get("policy", {}), **config.get("ssh", {})}
+        matrix = build_access_matrix(grants, project_sets, hosts, defaults=defaults)
+        preview = None
+        notice = None
+        if request.method == "POST":
+            validate_csrf()
+            try:
+                selector_type = request.form.get("selector_type")
+                if selector_type not in ("project", "project_set", "project_glob"):
+                    raise DashboardDataError("invalid selector type")
+                candidate = {
+                    "subject": request.form.get("subject"), "name": request.form.get("name"),
+                    "replace_grant_id": request.form.get("replace_grant_id") or None,
+                    selector_type: request.form.get("selector_value"),
+                    "host": request.form.get("host") or None,
+                    "remote_user": request.form.get("remote_user") or None,
+                    "sudo_mode": request.form.get("sudo_mode") or "none",
+                    "allowed_actions": _split_values(request.form.get("allowed_actions") or "ssh"),
+                }
+                preview = preview_grant_change(grants, project_sets, hosts, candidate, defaults=defaults)
+            except (DashboardDataError, ValueError) as exc:
+                notice = {"level": "error", "text": str(exc)}
+        subject_query = (request.args.get("subject") or "").lower()
+        selected_project = request.args.get("project") or ""
+        rows = [row for row in matrix["rows"] if not subject_query or subject_query in "{}:{}".format(row["subject"], row["name"]).lower()]
+        projects = [project for project in matrix["projects"] if not selected_project or project == selected_project]
+        header = '<th scope="col">subject</th>' + "".join('<th scope="col">{}</th>'.format(html.escape(project)) for project in projects)
+        matrix_rows = ""
+        for row in rows:
+            cells = ['<td><strong>{}:{}</strong></td>'.format(html.escape(row["subject"]), html.escape(row["name"]))]
+            for project in projects:
+                cell = row["cells"][project]
+                detail = "{}/{} hosts".format(cell["allowed_hosts"], cell["total_hosts"])
+                if cell["remote_users"]:
+                    detail += "<br>{}".format(html.escape(", ".join(cell["remote_users"])))
+                if cell["actions"]:
+                    detail += "<br><small>{}</small>".format(html.escape(", ".join(cell["actions"])))
+                cells.append('<td class="matrix-cell matrix-{}"><strong>{}</strong>{}</td>'.format(
+                    html.escape(cell["state"]), html.escape(cell["state"]), detail
+                ))
+            matrix_rows += "<tr>{}</tr>".format("".join(cells))
+        body = """<h1>Access Matrix</h1><p class="page-lead">Effective group, role, and user access across projects, calculated with the production policy resolver.</p>
+<form class="inline" method="get"><input name="subject" value="{subject_query}" placeholder="group or user"><select name="project"><option value="">all projects</option>{project_options}</select><button>Filter</button></form>
+<div class="matrix-wrap"><table class="matrix"><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></div>""".format(
+            subject_query=html.escape(request.args.get("subject", "")),
+            project_options="".join('<option value="{}">{}</option>'.format(html.escape(project), html.escape(project)) for project in matrix["projects"]),
+            header=header, rows=matrix_rows,
+        )
+        finding_type = request.args.get("finding") or ""
+        findings = [item for item in matrix["findings"] if not finding_type or item.get("type") == finding_type]
+        for finding in findings:
+            finding["finding_summary"] = finding.get("details")
+        body += '<h2>Policy findings</h2><form class="inline" method="get"><select name="finding"><option value="">all findings</option><option>conflict</option><option>redundant</option><option>shadowed</option></select><button>Filter</button></form>'
+        body += _table(findings, [
+            ("type", "type"), ("subject", "subject"), ("project", "project"), ("host_id", "host"),
+            ("grant_ids", "grants"), ("finding_summary", "details"),
+        ]) if findings else '<div class="empty-state">No conflicting, redundant, or shadowed grants were found for current inventory.</div>'
+        body += """<div class="panel"><h2>Preview grant blast radius</h2><p class="muted">This form never applies policy. It compares the current resolver result with a hypothetical additional grant.</p>
+<form method="post"><input type="hidden" name="csrf_token" value="{token}"><p><select name="subject"><option>group</option><option>user</option><option>role</option></select><input name="name" placeholder="subject name" required><select name="selector_type"><option>project</option><option>project_set</option><option>project_glob</option></select><input name="selector_value" placeholder="selector" required><input name="host" placeholder="optional host"></p><p><input name="replace_grant_id" placeholder="optional grant id to replace"><input name="remote_user" placeholder="remote user" required><select name="sudo_mode"><option>none</option><option>sudo-i</option></select><input name="allowed_actions" value="ssh" placeholder="ssh,runbook"><button>Preview</button></p></form></div>""".format(token=html.escape(csrf_token()))
+        if preview is not None:
+            body += "<h2>Blast radius preview</h2><p><strong>Gained:</strong> {} &nbsp; <strong>Lost:</strong> {} &nbsp; <strong>Changed:</strong> {}</p>".format(
+                preview["counts"]["gained"], preview["counts"]["lost"], preview["counts"]["changed"]
+            )
+            impacts = []
+            for impact in preview["impacts"]:
+                row = dict(impact)
+                row["before_summary"] = json.dumps(impact["before"], sort_keys=True)
+                row["after_summary"] = json.dumps(impact["after"], sort_keys=True)
+                impacts.append(row)
+            body += _table(impacts, [
+                ("change", "change"), ("project", "project"), ("host_id", "host"),
+                ("server_name", "server"), ("before_summary", "before"), ("after_summary", "after"),
+            ]) if impacts else '<div class="empty-state">The hypothetical grant does not change effective access.</div>'
+        return _html("Access Matrix", body, config=config, notice=notice)
+
     @app.route("/sessions/active")
     def active_sessions():
         admin = require_admin()
@@ -743,9 +1309,14 @@ def create_app(config=None):
             limit=int(request.args.get("limit", 50)),
             admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
         )
+        redis = redis_client(config)
         for row in rows:
             connection_id = row.get("connection_id") or row.get("session_id")
             username = str(row.get("username") or "")
+            if not row.get("server_name") and row.get("host_id"):
+                host_record = get_host(redis, row.get("host_id"))
+                if host_record is not None:
+                    row["server_name"] = host_record.get("server_name")
             row["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
             if connection_id:
                 row["details"] = '<a href="/session/{}">details</a>'.format(html.escape(str(connection_id)))
@@ -756,8 +1327,9 @@ def create_app(config=None):
                 )
         return _html("History", "<h1>History</h1>" + _table(rows, [
             ("time", "time"), ("user_link", "user"), ("project", "project"), ("host_id", "host"),
-            ("target", "target"), ("remote_user", "remote_user"), ("result", "result"), ("details", "details"), ("raw", "raw")
-        ]))
+            ("server_name", "host name"), ("target", "target"), ("remote_user", "remote_user"),
+            ("result", "result"), ("details", "details"), ("raw", "raw")
+        ]), config=config)
 
     @app.route("/access", methods=["GET", "POST"])
     def access():
@@ -1026,7 +1598,7 @@ No sudo <select name="nosudo"><option value="false">false</option><option value=
             ("ts", "ts"), ("event", "event"), ("project", "project"), ("host_id", "host"),
             ("remote_user", "remote_user"), ("exit_code", "exit")
         ])
-        return _html("Session Details", body)
+        return _html("Session Details", body, config=config)
 
     @app.route("/session/<connection_id>/events.json")
     def session_events_json(connection_id):
@@ -1094,7 +1666,7 @@ async function refreshLive() {{
 refreshLive();
 </script>
 """.format(connection_id=connection_id_safe)
-        return _html("Live Session", body)
+        return _html("Live Session", body, config=config)
 
     @app.route("/replay/<connection_id>.json")
     def replay_json(connection_id):
@@ -1201,7 +1773,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
 """.format(connection_id=html.escape(str(connection_id)), plain=plain, default_speed=default_speed)
         if error:
             body = '<div class="notice warning">{}</div>'.format(html.escape(str(error))) + body
-        return _html("Session Replay", body)
+        return _html("Session Replay", body, config=config)
 
     @app.route("/policy/simulate", methods=["GET", "POST"])
     def policy_simulate():

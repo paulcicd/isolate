@@ -474,6 +474,7 @@ if __name__ == '__main__':
     parser.add_argument('--connection-id')
     parser.add_argument('--project')
     parser.add_argument('--host-id')
+    parser.add_argument('--server-name')
     parser.add_argument('--human-user')
     parser.add_argument('--keycloak-sub')
     parser.add_argument('--vip', action='store_true')
@@ -552,6 +553,7 @@ if __name__ == '__main__':
         "keycloak_sub": identity.get("keycloak_sub"),
         "project": args.project,
         "host_id": args.host_id,
+        "server_name": args.server_name,
         "target_host": host_meta["hostname"],
         "target_port": host_meta["port"],
         "remote_user": host_meta["user"],

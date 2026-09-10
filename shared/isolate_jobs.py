@@ -23,6 +23,9 @@ class JobError(Exception):
     pass
 
 
+FAILED_JOB_STATUSES = ("failed", "timed_out")
+
+
 SIGNED_JOB_FIELDS_V1 = (
     "schema_version", "id", "type", "username", "keycloak_sub", "groups", "roles",
     "project", "host_id", "target_host", "target_port", "remote_user", "sudo_mode",
@@ -33,7 +36,6 @@ SIGNED_RUNBOOK_FIELDS = (
     "runbook_id", "runbook_class", "runbook_parameters", "policy_action",
     "runbook_definition_sha256",
 )
-
 
 def decode(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
@@ -213,6 +215,160 @@ def create_runbook_job(redis, config, identity, host, decision, rendered, timeou
     }
     sign_job(record, config)
     return _save(redis, record)
+
+
+def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None):
+    runbooks = config.get("runbooks", {}) or {}
+    if not runbooks.get("enabled", False):
+        raise JobError("runbooks are disabled")
+    try:
+        rendered = render_runbook(config, runbook_id, parameters)
+    except RunbookError as exc:
+        raise JobError(str(exc)) from exc
+    runbook = rendered["runbook"]
+    class_config = runbooks.get(runbook["class"], {}) or {}
+    if runbook["class"] == "operational" and not class_config.get("enabled", False):
+        raise JobError("operational runbooks are disabled pending security review")
+    if not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
+        raise JobError("identity is not in an allowed {} runbook group".format(runbook["class"]))
+    selected_ids = []
+    for host_id in host_ids:
+        host_id = str(host_id).strip()
+        if host_id and host_id not in selected_ids:
+            selected_ids.append(host_id)
+    maximum = int(runbooks.get("max_fleet_hosts") or 100)
+    if not selected_ids:
+        raise JobError("at least one host id is required")
+    if len(selected_ids) > maximum:
+        raise JobError("fleet exceeds configured maximum of {} hosts".format(maximum))
+    grants = _load_json_records(redis, "grant_*", "grant_")
+    project_sets = _load_project_sets(redis)
+    defaults = {**config.get("policy", {}), **config.get("ssh", {})}
+    planned = []
+    for host_id in selected_ids:
+        host = get_host(redis, host_id)
+        if host is None:
+            raise JobError("host {} was not found".format(host_id))
+        try:
+            decision = resolve_grant(
+                identity,
+                project=host.get("project_name"),
+                host=host,
+                grants=grants,
+                project_sets=project_sets,
+                defaults=defaults,
+                action=rendered["policy_action"],
+            )
+        except PolicyDenied as exc:
+            raise JobError("host {} is not allowed: {}".format(host_id, exc)) from exc
+        if decision.get("sudo_mode") == "sudo-i" and not class_config.get("allow_sudo", False):
+            raise JobError("sudo execution is disabled for this runbook class")
+        planned.append((host, decision))
+    return rendered, planned, timeout
+
+
+def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None, confirmed=False):
+    """Queue a runbook for multiple hosts after validating the entire fleet."""
+    rendered, planned, timeout = _runbook_submission_plan(
+        redis, config, identity, runbook_id, host_ids, parameters=parameters, timeout=timeout
+    )
+    class_config = (config.get("runbooks", {}) or {}).get(rendered["runbook"]["class"], {}) or {}
+    if class_config.get("require_confirmation", True) and not confirmed:
+        raise JobError("explicit confirmation is required to queue this runbook")
+    fleet_id = str(redis.incr("offset_fleet_id"))
+    jobs = []
+    for index, (host, decision) in enumerate(planned, start=1):
+        job = create_runbook_job(redis, config, identity, host, decision, rendered, timeout=timeout)
+        job.update({
+            "fleet_id": fleet_id,
+            "fleet_index": index,
+            "fleet_size": len(planned),
+            "fleet_slot": str(host.get("server_id")),
+            "retry_of": None,
+            "attempt": 1,
+        })
+        sign_job(job, config)
+        jobs.append(_save(redis, job))
+    _audit(config, "fleet_queued", jobs[0], {
+        "fleet_id": fleet_id,
+        "runbook_id": rendered["runbook"]["id"],
+        "host_count": len(jobs),
+    })
+    return {"fleet_id": fleet_id, "jobs": jobs, "count": len(jobs)}
+
+
+def retry_job(redis, config, original_job_id, actor):
+    """Requeue a terminal failed job using its original identity and current policy."""
+    original = get_job(redis, original_job_id)
+    if original is None:
+        raise JobError("job was not found")
+    if original.get("status") not in FAILED_JOB_STATUSES:
+        raise JobError("only failed or timed-out jobs can be retried")
+    if not verify_job_signature(original, config):
+        raise JobError("job authorization signature is invalid")
+    identity = {
+        "username": original.get("username"),
+        "keycloak_sub": original.get("keycloak_sub"),
+        "groups": original.get("groups") or [],
+        "roles": original.get("roles") or [],
+    }
+    host = get_host(redis, original.get("host_id"))
+    if host is None:
+        raise JobError("host no longer exists")
+    grants = _load_json_records(redis, "grant_*", "grant_")
+    project_sets = _load_project_sets(redis)
+    defaults = {**config.get("policy", {}), **config.get("ssh", {})}
+    if original.get("type") == "runbook":
+        rendered, planned, timeout = _runbook_submission_plan(
+            redis,
+            config,
+            identity,
+            original.get("runbook_id"),
+            [original.get("host_id")],
+            parameters=original.get("runbook_parameters") or {},
+            timeout=original.get("timeout"),
+        )
+        retried = create_runbook_job(redis, config, identity, planned[0][0], planned[0][1], rendered, timeout=timeout)
+    elif original.get("type") == "remote-command":
+        execution = config.get("command_execution", {}) or {}
+        if not execution.get("enabled", False):
+            raise JobError("command execution is disabled")
+        if not (set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
+            raise JobError("submitter group is no longer allowed by command execution config")
+        try:
+            decision = resolve_grant(
+                identity,
+                project=host.get("project_name"),
+                host=host,
+                grants=grants,
+                project_sets=project_sets,
+                defaults=defaults,
+                action="command",
+            )
+        except PolicyDenied as exc:
+            raise JobError("job authorization changed: {}".format(exc)) from exc
+        retried = create_command_job(
+            redis, config, identity, host, decision, original.get("command"), timeout=original.get("timeout")
+        )
+    else:
+        raise JobError("unsupported job type")
+    retried.update({
+        "fleet_id": original.get("fleet_id"),
+        "fleet_index": original.get("fleet_index"),
+        "fleet_size": original.get("fleet_size"),
+        "fleet_slot": original.get("fleet_slot") or str(original.get("host_id")),
+        "retry_of": str(original.get("id")),
+        "attempt": int(original.get("attempt") or 1) + 1,
+        "retried_by": (actor or {}).get("username") or (actor or {}).get("keycloak_sub"),
+    })
+    sign_job(retried, config)
+    _save(redis, retried)
+    _audit(config, "job_retried", retried, {
+        "retry_of": str(original.get("id")),
+        "retried_by": retried.get("retried_by"),
+        "fleet_id": retried.get("fleet_id"),
+    })
+    return retried
 
 
 def request_job_cancel(redis, job_id, actor):
