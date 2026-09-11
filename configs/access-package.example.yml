@@ -1,0 +1,34 @@
+name: Support Read-Only
+description: Read-only diagnostics for fictional production application services
+status: enabled
+
+access:
+  - id: app-production
+    project_set: prod-apps
+    remote_user: support
+    sudo_mode: none
+    allowed_actions:
+      - ssh
+      - runbook
+
+  - id: staging-command
+    project_glob: "*-stage"
+    remote_user: dev
+    sudo_mode: none
+    allowed_actions:
+      - ssh
+      - command
+      - runbook
+
+lifecycle:
+  default_ttl: 7d
+  max_ttl: 30d
+  permanent_allowed: true
+
+approval:
+  required: true
+  admin_groups:
+    - Demo-DevSecOps
+    - Demo-OS-Admin
+  ticket_required: true
+  minimum_approvals: 1

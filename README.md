@@ -463,9 +463,20 @@ dashboard:
   secret_key_file: /opt/auth/keys/dashboard_secret
   refresh_seconds: 15
   jobs_max_results: 250
+  default_locale: en
   admin_groups:
     - Demo-DevOps
     - Demo-Security
+
+build:
+  version: 2.1.0
+  revision: null
+  built_at: null
+
+access_packages:
+  enabled: true
+  max_rules: 50
+  max_assignments_per_operation: 100
 
 notifications:
   enabled: true
@@ -1165,6 +1176,85 @@ isolate grant add --group Demo-DBA --project-set db-prod --remote-user dba --sud
 isolate grant add --group Demo-Developers --project-glob '*-stage' --remote-user dev --sudo-mode none
 ```
 
+## Access Packages
+
+Access Packages are reusable, administrator-defined access profiles. A package can have any meaningful internal name, such as `Support Read-Only`, `DBA Production`, or `DevOps VIP`, and may contain several project/project-set/glob rules with different remote users and actions. It also defines assignment lifetime and an approval route.
+
+Packages do not introduce a second policy engine. An assignment materializes normal `grant_*` records, so `s`, `g`, MCP, jobs, the dashboard matrix, and `grant explain` continue to use the existing resolver. Generated grants carry `managed_by: access_package` and cannot be edited or revoked through the low-level grant UI; update the package or revoke its assignment instead.
+
+Example package file, using fictional identities and projects:
+
+```yaml
+name: Support Read-Only
+description: Read-only diagnostics for production application services
+status: enabled
+access:
+  - id: app-production
+    project_set: prod-apps
+    remote_user: support
+    sudo_mode: none
+    allowed_actions: [ssh, runbook]
+  - id: staging-command
+    project_glob: "*-stage"
+    remote_user: dev
+    sudo_mode: none
+    allowed_actions: [ssh, command, runbook]
+lifecycle:
+  default_ttl: 7d
+  max_ttl: 30d
+  permanent_allowed: true
+approval:
+  required: true
+  admin_groups: [Demo-DevSecOps, Demo-OS-Admin]
+  ticket_required: true
+  minimum_approvals: 1
+```
+
+Create and inspect a package:
+
+```bash
+isolate package create --file /opt/auth/configs/support-readonly.yml
+isolate package list
+isolate package show "Support Read-Only"
+```
+
+Assign it to one or many Keycloak subjects. Each `--user`, `--group`, and `--role` creates an independent assignment:
+
+```bash
+isolate package assign "Support Read-Only" \
+  --group Demo-Support-L1 \
+  --group Demo-Support-L2 \
+  --user demo.alex \
+  --ttl 7d \
+  --ticket CHG-1042 \
+  --yes
+```
+
+Use `--permanent` only when the package allows permanent assignments. `default_ttl` is used when neither `--ttl` nor `--permanent` is provided; `max_ttl` limits administrator input. `ticket_required` rejects assignments without `--ticket`. `approval.admin_groups`, when non-empty, limits which configured access admins can assign the package. Values above `minimum_approvals: 1` intentionally block direct assignment until a multi-approver workflow is configured.
+
+Preview and apply a new immutable revision:
+
+```bash
+isolate package preview "Support Read-Only" --file /tmp/support-readonly-v2.yml
+isolate package apply "Support Read-Only" \
+  --file /tmp/support-readonly-v2.yml \
+  --expected-revision 1 \
+  --yes
+```
+
+Preview is read-only and reports affected subjects plus grant creates, updates, and deletes. Stable rule `id` values preserve generated grant IDs between revisions. `--expected-revision` prevents an administrator from overwriting a concurrent change.
+
+List or revoke assignments and roll back safely:
+
+```bash
+isolate package assignments --package "Support Read-Only"
+isolate package unassign --id 12 --yes
+isolate package revisions "Support Read-Only"
+isolate package rollback "Support Read-Only" --revision 1 --expected-revision 3 --yes
+```
+
+Rollback never rewrites history. It creates a new package revision from the selected snapshot and synchronizes active assignments. GitOps prune preserves package-managed grants and project sets they reference. When `policy_as_code.enforce_git: true`, package mutation is disabled with the other manual policy operations.
+
 ## Break-Glass Access
 
 Break-glass access creates temporary grants through approval.
@@ -1637,6 +1727,7 @@ dashboard:
   public_url: https://bastion.example.org
   secret_key_file: /opt/auth/keys/dashboard_secret
   refresh_seconds: 15
+  default_locale: en
   admin_groups:
     - Demo-DevOps
     - Demo-Security
@@ -1664,16 +1755,28 @@ Routes:
 - `/inventory`: searchable inventory, host creation, editing, and validated bulk updates.
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
 - `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
+- `/packages`: create and assign reusable access profiles; package details provide preview, revision apply, and rollback.
 - `/policy/simulate`: visual allow/deny simulator using the production resolver.
 - `/policy/matrix`: effective `user/group/role x project` access, policy findings, and blast-radius preview.
 - `/policy/gitops`: signed Git policy status, drift/blast-radius refresh, sync, and rollback.
 - `/users` and `/user/<username>`: observed groups, candidate grants, active sessions, and history.
 - `/notifications`: configured sinks and delivery results for access requests and session alerts.
+- `/docs`: bilingual English/Russian operator documentation with practical examples and build information.
 - `/replay/<connection_id>`: xterm.js ANSI terminal replay.
 - `/replay/<connection_id>.json`: parsed replay chunks.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 
 The dashboard is admin-only. If a user is authenticated but does not belong to `dashboard.admin_groups`, the dashboard returns HTTP 403.
+
+Use the `EN` / `RU` control in the top bar to select the dashboard locale. The choice is stored in the authenticated Flask session. Navigation, compact per-page explanations, and input-field help are localized without changing data or policy values. Day/night theme remains a browser-local preference.
+
+The sidebar shows the product version, short build revision, schema version, and Python runtime. `/docs` shows the full build metadata. Production packages should set immutable values through the systemd environment or CI/CD:
+
+```bash
+ISOLATE_VERSION=2.1.0
+ISOLATE_BUILD_SHA=0123456789abcdef
+ISOLATE_BUILD_DATE=2026-09-10T12:00:00Z
+```
 
 The `/`, `/sessions/active`, and `/access` pages auto-refresh when `dashboard.refresh_seconds` is greater than `0`. Set it to `0` to disable refresh.
 
@@ -2285,7 +2388,7 @@ redis:
 A representative Redis ACL is:
 
 ```text
-user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~inventory_lock_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~active_session_* ~job_* ~dashboard_alert_state_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
+user isolate on >CHANGE_ME_STRONG_PASSWORD ~server_* ~inventory_lock_* ~grant_* ~policy_* ~project_set_* ~access_request_* ~access_package_* ~active_session_* ~job_* ~dashboard_alert_state_* ~offset_* ~projects_list ~ssh_config_* +get +set +del +incr +expire +keys +ping +multi +exec +discard
 ```
 
 Test ACL/TLS with `isolate health` before disabling the old Redis user. Client certificate fields are optional and are only needed for mutual TLS.

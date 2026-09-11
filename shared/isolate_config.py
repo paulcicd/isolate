@@ -84,6 +84,11 @@ DEFAULT_CONFIG = {
         "ticket_pattern": None,
         "request_templates": {},
     },
+    "access_packages": {
+        "enabled": True,
+        "max_rules": 50,
+        "max_assignments_per_operation": 100,
+    },
     "command_audit": {
         "enabled": False,
         "require_connection_id": True,
@@ -123,6 +128,12 @@ DEFAULT_CONFIG = {
         "refresh_seconds": 15,
         "require_mutation_confirmation": True,
         "jobs_max_results": 250,
+        "default_locale": "en",
+    },
+    "build": {
+        "version": "2.1.0-dev",
+        "revision": None,
+        "built_at": None,
     },
     "mcp": {
         "enabled": False,
@@ -230,6 +241,7 @@ DEFAULT_CONFIG = {
             "active_session_*",
             "job_*",
             "dashboard_alert_state_*",
+            "access_package_*",
             "ssh_config_*",
             "complete_hosts_*",
             "offset_*",

@@ -1040,6 +1040,8 @@ def create_mcp_server(config=None, redis=None):
             issuer_url=AnyHttpUrl(issuer),
             resource_server_url=AnyHttpUrl(public_url),
             required_scopes=list(mcp_cfg.get("required_scopes") or ["isolate.read"]),
+            # KeycloakMCPTokenVerifier already enforces the configured JWT audience.
+            validate_token_resource=False,
         ),
     )
 

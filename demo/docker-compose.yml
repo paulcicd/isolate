@@ -32,15 +32,14 @@ services:
       KC_BOOTSTRAP_ADMIN_PASSWORD: admin123
       JAVA_OPTS_KC_HEAP: -XX:InitialRAMPercentage=20 -XX:MaxRAMPercentage=60
     ports:
-      - 127.0.0.1:18080:18080
-      - 127.0.0.1:18081:18081
-      - 127.0.0.1:2222:22
+      - 127.0.0.1:${ISOLATE_DEMO_KEYCLOAK_PORT:-18080}:18080
+      - 127.0.0.1:${ISOLATE_DEMO_DASHBOARD_PORT:-18081}:18081
+      - 127.0.0.1:${ISOLATE_DEMO_SSH_PORT:-2222}:22
     volumes:
       - ./keycloak/isolate-demo-realm.json:/opt/keycloak/data/import/isolate-demo-realm.json:ro
       - demo-keycloak-data:/opt/keycloak/data
     networks:
       isolate-demo:
-        ipv4_address: 172.30.50.2
         aliases:
           - bastion
     restart: unless-stopped

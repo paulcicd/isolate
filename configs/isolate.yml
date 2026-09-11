@@ -35,6 +35,17 @@ dashboard:
   refresh_seconds: 15
   require_mutation_confirmation: true
   jobs_max_results: 250
+  default_locale: en
+
+build:
+  version: 2.1.0-dev
+  revision: null
+  built_at: null
+
+access_packages:
+  enabled: true
+  max_rules: 50
+  max_assignments_per_operation: 100
 
 command_audit:
   enabled: false
@@ -205,6 +216,7 @@ backup:
     - active_session_*
     - job_*
     - dashboard_alert_state_*
+    - access_package_*
     - ssh_config_*
     - complete_hosts_*
     - offset_*

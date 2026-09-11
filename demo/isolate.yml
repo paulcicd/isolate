@@ -32,6 +32,16 @@ dashboard:
     - Demo-DevOps
   refresh_seconds: 5
   require_mutation_confirmation: true
+  default_locale: en
+
+build:
+  version: 2.1.0-demo
+  revision: demo-source
+
+access_packages:
+  enabled: true
+  max_rules: 50
+  max_assignments_per_operation: 100
 
 history:
   admin_groups:
@@ -115,4 +125,3 @@ backup:
   base_path: /opt/auth/backups/service
   retention_count: 3
   include_logs: true
-

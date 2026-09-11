@@ -25,6 +25,8 @@ def main():
         ("/history", "History"),
         ("/inventory", "Inventory"),
         ("/grants", "Grants"),
+        ("/packages", "Access Packages"),
+        ("/docs", "Isolate Documentation"),
     ]
     for path, marker in checks:
         response = client.get(path)
@@ -34,6 +36,11 @@ def main():
         if 'class="theme-switch"' not in text or "About this page" not in text:
             raise SystemExit("[failed] {} missed dashboard theme or page help controls".format(path))
         print("[ok] dashboard {}".format(path))
+
+    russian = client.get("/docs?lang=ru").get_data(as_text=True)
+    if '<html lang="ru">' not in russian or "Документация Isolate" not in russian or "2.1.0-demo" not in russian:
+        raise SystemExit("[failed] localized documentation or build metadata is missing")
+    print("[ok] dashboard Russian documentation and build metadata")
 
 
 if __name__ == "__main__":

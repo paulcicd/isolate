@@ -49,7 +49,7 @@ from isolate_access import (
     parse_duration,
     repeat_access_request,
 )
-from isolate import list_grant_records, load_project_sets, update_grant_record
+from isolate import list_grant_records, load_grants, load_project_sets, update_grant_record
 from isolate_sessions import (
     get_session,
     list_active_sessions,
@@ -86,6 +86,19 @@ from isolate_mcp import (
 from isolate_jobs import JobError, create_runbook_fleet, execute_job, get_job, list_jobs, retry_job, verify_job_signature
 from isolate_runbooks import RunbookError, list_runbooks, render_runbook
 from isolate_dashboard_data import build_access_matrix, collect_alerts, fleet_progress, preview_grant_change, update_alert_state
+from isolate_build import get_build_info
+from isolate_packages import (
+    AccessPackageError,
+    assign_package,
+    create_package,
+    get_package,
+    list_assignments,
+    list_package_revisions,
+    preview_package_update,
+    rollback_package,
+    unassign_package,
+    update_package,
+)
 
 
 def has_mcp_v2():
@@ -1869,6 +1882,124 @@ class InventoryTest(unittest.TestCase):
             update_host(redis, "1", {"server_note": "stale"}, updated_by="two", expected_revision=revision)
 
 
+class AccessPackageTest(unittest.TestCase):
+    @staticmethod
+    def package(remote_user="support", status="enabled"):
+        return {
+            "name": "Support Read-Only",
+            "description": "Reusable support profile",
+            "status": status,
+            "access": [{
+                "id": "prod-support",
+                "project_set": "prod-apps",
+                "remote_user": remote_user,
+                "sudo_mode": "none",
+                "allowed_actions": ["ssh", "runbook"],
+            }],
+            "lifecycle": {"default_ttl": "7d", "max_ttl": "30d", "permanent_allowed": True},
+            "approval": {"required": True, "admin_groups": ["DevSecOps"], "ticket_required": True},
+        }
+
+    def test_assignment_materializes_grant_and_policy_resolves(self):
+        redis = FakeRedis()
+        redis.set("project_set_prod-apps", json.dumps({"name": "prod-apps", "projects": ["payments-prod"], "project_globs": []}))
+        package = create_package(redis, self.package(), actor="admin", now=100)
+        assignment, changes = assign_package(
+            redis, package["name"], "group", "Support-L2", actor="admin", ttl="2h", ticket="CHG-1042", now=100,
+        )
+
+        self.assertEqual(changes["count"], 1)
+        self.assertEqual(assignment["expires_at"], 7300)
+        grants = load_grants(redis)
+        generated = grants[0]
+        self.assertEqual(generated["managed_by"], "access_package")
+        self.assertEqual(generated["package_id"], package["id"])
+        with mock.patch("isolate_policy.time.time", return_value=200):
+            decision = resolve_grant(
+                {"username": "demo.alex", "groups": ["Support-L2"], "roles": []},
+                project="payments-prod", host={"server_id": "10703"}, grants=grants,
+                project_sets=load_project_sets(redis), defaults={},
+            )
+        self.assertEqual(decision["remote_user"], "support")
+        self.assertIn("runbook", decision["allowed_actions"])
+
+    def test_preview_update_and_rollback_preserve_managed_grant_id(self):
+        redis = FakeRedis()
+        package = create_package(redis, self.package(), actor="admin", now=100)
+        assignment, _ = assign_package(redis, package["id"], "group", "Support-L2", actor="admin", ticket="CHG-1", now=100)
+        original_grant_id = assignment["grant_ids"][0]
+        redis.set("grant_99", json.dumps({
+            "subject": "user", "name": "manual.user", "project": "sandbox",
+            "remote_user": "dev", "sudo_mode": "none", "allowed_actions": ["ssh"],
+        }))
+
+        preview = preview_package_update(redis, package["id"], self.package(remote_user="l2-support"), actor="admin", now=200)
+        self.assertEqual(preview["grant_change_count"], 1)
+        self.assertEqual(json.loads(redis.get("grant_{}".format(original_grant_id)))["remote_user"], "support")
+        updated, _ = update_package(
+            redis, package["id"], self.package(remote_user="l2-support"), actor="admin",
+            expected_revision=1, now=200,
+        )
+        refreshed = list_assignments(redis, package=package["id"])[0]
+        self.assertEqual(refreshed["grant_ids"], [original_grant_id])
+        self.assertEqual(json.loads(redis.get("grant_{}".format(original_grant_id)))["remote_user"], "l2-support")
+        self.assertIsNotNone(redis.get("grant_99"))
+
+        rolled_back, _ = rollback_package(redis, package["id"], 1, actor="admin", expected_revision=2, now=300)
+        self.assertEqual(rolled_back["revision"], 3)
+        self.assertEqual(json.loads(redis.get("grant_{}".format(original_grant_id)))["remote_user"], "support")
+        self.assertEqual([row["revision"] for row in list_package_revisions(redis, package["id"])] , [3, 2, 1])
+        self.assertEqual(updated["revision"], 2)
+
+    def test_unassign_and_package_validation(self):
+        redis = FakeRedis()
+        package = create_package(redis, self.package(), actor="admin", now=100)
+        with self.assertRaises(AccessPackageError):
+            assign_package(redis, package["id"], "group", "Support-L2", actor="admin", now=100)
+        assignment, _ = assign_package(redis, package["id"], "group", "Support-L2", actor="admin", ticket="CHG-1", now=100)
+        revoked, deleted = unassign_package(redis, assignment["id"], actor="admin", now=200)
+        self.assertEqual(revoked["status"], "revoked")
+        self.assertEqual(deleted, 1)
+        self.assertEqual(load_grants(redis), [])
+        with self.assertRaises(AccessPackageError):
+            create_package(redis, self.package(), actor="admin")
+        with self.assertRaises(AccessPackageError):
+            list_assignments(redis, package="missing")
+
+    def test_multi_approval_blocks_direct_assignment(self):
+        redis = FakeRedis()
+        payload = self.package()
+        payload["approval"]["minimum_approvals"] = 2
+        package = create_package(redis, payload, actor="admin")
+        with self.assertRaises(AccessPackageError):
+            assign_package(redis, package["id"], "group", "DBA", actor="admin", ticket="CHG-2")
+
+    def test_gitops_prune_preserves_package_grants_and_referenced_sets(self):
+        redis = FakeRedis()
+        redis.set("project_set_prod-apps", json.dumps({"schema_version": 2, "name": "prod-apps", "projects": ["prod"], "project_globs": []}))
+        package = create_package(redis, self.package(), actor="admin")
+        assign_package(redis, package["id"], "group", "Support-L2", actor="admin", ticket="CHG-3")
+
+        changes = plan_bundle(redis, {"schema_version": 2, "project_sets": [], "grants": []}, prune=True)
+
+        self.assertEqual(changes["grant_remove"], [])
+        self.assertEqual(changes["project_set_remove"], [])
+
+    def test_assignment_conflict_is_rejected_before_grants_are_written(self):
+        redis = FakeRedis()
+        first = create_package(redis, self.package(), actor="admin")
+        assign_package(redis, first["id"], "group", "Support-L2", actor="admin", ticket="CHG-4")
+        second_payload = self.package(remote_user="dev")
+        second_payload["name"] = "Conflicting Support"
+        second = create_package(redis, second_payload, actor="admin")
+
+        with self.assertRaises(AccessPackageError):
+            assign_package(redis, second["id"], "group", "Support-L2", actor="admin", ticket="CHG-5")
+
+        self.assertEqual(len(load_grants(redis)), 1)
+        self.assertEqual(list_assignments(redis, package=second["id"]), [])
+
+
 class GrantAdminUxTest(unittest.TestCase):
     def test_lists_and_filters_grants(self):
         redis = FakeRedis()
@@ -2475,6 +2606,65 @@ class DashboardTest(unittest.TestCase):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
         self.assertTrue(is_dashboard_admin({"groups": ["DevOps"]}, config))
         self.assertFalse(is_dashboard_admin({"groups": ["DBA"]}, config))
+
+    def test_dashboard_packages_documentation_locales_and_build_info(self):
+        try:
+            app = isolate_web.create_app({
+                "schema_version": 2,
+                "data_root": ROOT,
+                "build": {"version": "2.1.0-test", "revision": "abcdef1234567890", "built_at": "2026-09-10T10:00:00Z"},
+                "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org", "default_locale": "en"},
+                "access_packages": {"enabled": True, "max_rules": 50, "max_assignments_per_operation": 100},
+                "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                "logging": {"base_path": "/tmp/no-history", "sinks": []},
+            })
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        redis = FakeRedis()
+        app.config["TESTING"] = True
+        with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                sess["csrf_token"] = "csrf"
+            response = client.post("/packages", data={
+                "csrf_token": "csrf", "action": "create", "confirm": "true",
+                "name": "Support Read-Only", "description": "Demo profile", "status": "enabled",
+                "access_json": json.dumps([{
+                    "id": "prod", "project": "payments-prod", "remote_user": "support",
+                    "sudo_mode": "none", "allowed_actions": ["ssh"],
+                }]),
+                "default_ttl": "7d", "max_ttl": "30d", "permanent_allowed": "true",
+                "minimum_approvals": "1",
+            })
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("Support Read-Only", response.get_data(as_text=True))
+            self.assertIsNotNone(get_package(redis, "Support Read-Only"))
+
+            russian = client.get("/docs?lang=ru")
+            self.assertEqual(russian.status_code, 200)
+            russian_text = russian.get_data(as_text=True)
+            self.assertIn('<html lang="ru">', russian_text)
+            self.assertIn("Документация Isolate", russian_text)
+            self.assertIn("Пакеты доступа", russian_text)
+            self.assertIn("2.1.0-test", russian_text)
+            self.assertIn("abcdef123456", russian_text)
+            self.assertIn('class="locale-switch"', russian_text)
+
+            access = client.get("/access")
+            self.assertIn("Об этой странице", access.get_data(as_text=True))
+            english = client.get("/docs?lang=en")
+            self.assertIn("Access packages", english.get_data(as_text=True))
+
+    def test_build_info_prefers_release_environment(self):
+        with mock.patch.dict(os.environ, {
+            "ISOLATE_VERSION": "2.1.5", "ISOLATE_BUILD_SHA": "1234567890abcdef",
+            "ISOLATE_BUILD_DATE": "2026-09-10T12:00:00Z",
+        }):
+            info = get_build_info({"schema_version": 2, "data_root": ROOT}, started_at=0.1)
+        self.assertEqual(info["version"], "2.1.5")
+        self.assertEqual(info["revision_short"], "1234567890ab")
+        self.assertEqual(info["built_at"], "2026-09-10T12:00:00Z")
 
     def test_health_endpoint_does_not_require_login(self):
         try:

@@ -12,6 +12,7 @@ import urllib.parse
 from isolate import get_grant_record, list_grant_records, load_grants, load_project_sets, redis_client, update_grant_record
 from isolate_audit import prepare_and_dispatch
 from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, set_notification_status
+from isolate_build import get_build_info
 from isolate_config import load_config
 from isolate_history import list_user_profiles, read_history
 from isolate_health import run_health_checks
@@ -28,12 +29,29 @@ from isolate_dashboard_data import (
 )
 from isolate_jobs import JobError, create_runbook_fleet, get_job, list_jobs, read_job_output, request_job_cancel, retry_job
 from isolate_notifications import NotificationError, notify_access_event
+from isolate_packages import (
+    AccessPackageError,
+    assign_package,
+    create_package,
+    get_assignment,
+    get_package,
+    list_assignments,
+    list_package_revisions,
+    list_packages,
+    preview_package_update,
+    rollback_package,
+    unassign_package,
+    update_package,
+)
 from isolate_replay import find_session, parse_raw_replay
 from isolate_policy import PolicyDenied, resolve_grant
 from isolate_policy_bundle import PolicyBundleError, apply_bundle, blast_radius, export_bundle, plan_bundle, validate_bundle
 from isolate_gitops import GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, save_policy_snapshot, sync_git_policy
 from isolate_runbooks import list_runbooks
 from isolate_sessions import SessionControlError, get_session, list_active_sessions, list_session_records, request_session_termination
+
+
+_DASHBOARD_STARTED_AT = time.time()
 
 
 def is_dashboard_admin(identity, config):
@@ -47,6 +65,20 @@ def _secret_key(config):
         with open(path, "r", encoding="utf-8") as secret_f:
             return secret_f.read().strip()
     return os.environ.get("ISOLATE_DASHBOARD_SECRET", "dev-only-change-me")
+
+
+def _build_info(config):
+    try:
+        from flask import current_app, has_app_context
+        if has_app_context():
+            cached = current_app.extensions.get("isolate_build_info")
+            if cached:
+                result = dict(cached)
+                result["uptime_seconds"] = max(0, int(time.time() - _DASHBOARD_STARTED_AT))
+                return result
+    except (ImportError, RuntimeError):
+        pass
+    return get_build_info(config, _DASHBOARD_STARTED_AT)
 
 
 _DASHBOARD_CSS = """
@@ -375,8 +407,8 @@ pre { max-width: 100%; padding: 16px; overflow: auto; color: var(--terminal-text
 code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 0.92em; }
 .terminal { border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
 
-.topbar-actions { display: flex; align-items: center; gap: 18px; }
-.theme-switch {
+.topbar-actions { display: flex; align-items: center; gap: 12px; }
+.theme-switch, .locale-switch {
   display: inline-grid;
   grid-template-columns: repeat(2, minmax(54px, 1fr));
   padding: 3px;
@@ -384,10 +416,12 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   border: 1px solid var(--line);
   border-radius: 6px;
 }
-.theme-switch button {
+.theme-switch button, .locale-switch a {
+  display: grid;
   min-height: 28px;
   margin: 0;
   padding: 3px 9px;
+  place-items: center;
   color: var(--muted);
   background: transparent;
   border: 0;
@@ -395,8 +429,10 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   font-size: 12px;
   font-weight: 650;
 }
-.theme-switch button:hover { color: var(--text); background: var(--surface); }
-.theme-switch button[aria-pressed="true"] { color: var(--text); background: var(--surface); box-shadow: 0 1px 3px rgba(20, 28, 45, 0.16); }
+.theme-switch button:hover, .locale-switch a:hover { color: var(--text); background: var(--surface); text-decoration: none; }
+.theme-switch button[aria-pressed="true"], .locale-switch a.active { color: var(--text); background: var(--surface); box-shadow: 0 1px 3px rgba(20, 28, 45, 0.16); }
+.locale-switch { grid-template-columns: repeat(2, 38px); }
+.locale-switch a { min-width: 38px; font-size: 11px; font-weight: 720; }
 .page-help {
   max-width: 900px;
   margin: -10px 0 22px;
@@ -405,6 +441,36 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
 }
 .page-help summary { width: max-content; padding: 6px 0 9px; color: var(--accent); cursor: pointer; font-size: 12px; font-weight: 700; }
 .page-help p { max-width: 820px; margin: 0 0 14px; }
+.field-help {
+  display: inline-grid;
+  width: 17px;
+  height: 17px;
+  margin-left: 3px;
+  place-items: center;
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-radius: 50%;
+  cursor: help;
+  font-size: 11px;
+  font-style: normal;
+  font-weight: 750;
+  vertical-align: middle;
+}
+.build-info { padding: 10px 16px; color: var(--sidebar-muted); border-top: 1px solid var(--sidebar-line); font-size: 11px; line-height: 1.45; }
+.build-info strong { display: block; color: var(--sidebar-text); font-size: 12px; }
+.docs-layout { display: grid; grid-template-columns: minmax(0, 1fr) 260px; gap: 28px; align-items: start; }
+.docs-main { min-width: 0; }
+.docs-section { padding: 22px 0; border-top: 1px solid var(--line); }
+.docs-section:first-child { padding-top: 0; border-top: 0; }
+.docs-section h2 { margin-top: 0; }
+.docs-section ul { padding-left: 20px; }
+.docs-toc { position: sticky; top: 86px; padding: 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 6px; box-shadow: var(--shadow); }
+.docs-toc strong { display: block; margin-bottom: 8px; }
+.docs-toc a { display: block; padding: 4px 0; font-size: 12px; }
+.build-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.build-grid div { padding: 12px; background: var(--surface-muted); border-radius: 5px; }
+.build-grid strong { display: block; margin-bottom: 3px; font-size: 12px; }
+.package-rule-example { font-size: 12px; }
 
 @media (max-width: 1050px) {
   .sidebar { width: 208px; }
@@ -417,7 +483,7 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   .brand { min-height: 62px; }
   .primary-nav { display: flex; gap: 6px; overflow-x: auto; padding: 8px 10px; }
   .nav-section { display: flex; gap: 4px; margin: 0 !important; }
-  .nav-label, .sidebar-footer { display: none; }
+  .nav-label, .sidebar-footer, .build-info { display: none; }
   .nav-link { min-height: 34px; flex: 0 0 auto; padding: 7px 9px; border-left: 0; border-bottom: 2px solid transparent; }
   .nav-link.active { border-bottom-color: var(--accent); }
   .main { margin-left: 0; }
@@ -431,6 +497,10 @@ code { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size
   .key-value dd { margin-bottom: 8px; }
   h1 { font-size: 24px; }
   form:not(.inline) { padding: 14px; }
+  .locale-switch { display: none; }
+  .docs-layout { grid-template-columns: 1fr; }
+  .docs-toc { position: static; order: -1; }
+  .build-grid { grid-template-columns: 1fr; }
 }
 """
 
@@ -469,39 +539,203 @@ _THEME_BOOTSTRAP_SCRIPT = """
 """
 
 
-_PAGE_HELP = {
-    "Isolate Dashboard": "Operational overview of active sessions, pending access requests, recent connections, jobs, and security alerts.",
-    "Jobs & Runbooks": "Run approved operational procedures across one host or a fleet, then monitor progress, output, retries, and cancellations.",
-    "Alert Center": "Review session risks, failed jobs, and notification delivery failures; acknowledge or resolve findings with an audit trail.",
-    "Access Matrix": "Inspect effective user and group access by project, identify conflicting grants, and preview the blast radius of changes.",
-    "Active Sessions": "See current SSH connections, their duration and target identity, and terminate a session when an incident requires it.",
-    "History": "Search audited SSH connections by user, project, host ID, host name, or target address and open their session details.",
-    "Access Requests": "Review temporary access requests, comments, tickets, notification status, and approve or deny break-glass grants.",
-    "Inventory": "Browse bastion-managed hosts, service metadata, VIP markers, and privileged access guidance. Host changes are audited.",
-    "Session Details": "Inspect one connection's identity, policy decision, command events, timestamps, exit status, raw log, and replay artifacts.",
-    "Live Session": "Follow newly written terminal output for an active connection. This view is observational and does not provide Web SSH.",
-    "Session Replay": "Replay the recorded terminal stream with seek, speed, ANSI rendering, and raw or JSON download options.",
-    "Policy Simulator": "Explain which grant would apply to a specific identity, project, and host before changing production access.",
-    "Policy GitOps": "Validate, compare, apply, and roll back optional Git-managed grants and project sets while tracking Redis drift.",
-    "Users": "Inspect identities observed in audit data together with effective grants, active sessions, and connection history.",
-    "User Details": "Review one user's observed groups, access rules, active sessions, and historical activity.",
-    "Notifications": "Check recent webhook, Telegram, and email delivery outcomes for access workflow events.",
-    "Grants": "Manage RBAC grants and project sets that determine visible hosts, allowed actions, remote users, and sudo mode.",
+_SHELL_I18N = {
+    "en": {
+        "operations": "Operations", "summary": "Summary", "jobs": "Jobs & runbooks", "alerts": "Alert center",
+        "active_sessions": "Active sessions", "history": "History", "inventory": "Inventory",
+        "access_control": "Access control", "requests": "Requests", "grants": "Grants", "packages": "Access packages",
+        "matrix": "Access matrix", "simulator": "Policy simulator", "platform": "Platform", "gitops": "GitOps",
+        "users": "Users", "notifications": "Notifications", "documentation": "Documentation", "sign_out": "Sign out",
+        "bastion_control": "Bastion control", "operations_console": "Operations console", "secured": "Secured by Keycloak",
+        "day": "Day", "night": "Night", "about": "About this page", "primary_nav": "Primary navigation",
+        "theme": "Color theme", "language": "Language",
+    },
+    "ru": {
+        "operations": "Операции", "summary": "Обзор", "jobs": "Задачи и ранбуки", "alerts": "Центр алертов",
+        "active_sessions": "Активные сессии", "history": "История", "inventory": "Инвентарь",
+        "access_control": "Управление доступом", "requests": "Запросы", "grants": "Гранты", "packages": "Пакеты доступа",
+        "matrix": "Матрица доступа", "simulator": "Симулятор политик", "platform": "Платформа", "gitops": "GitOps",
+        "users": "Пользователи", "notifications": "Уведомления", "documentation": "Документация", "sign_out": "Выйти",
+        "bastion_control": "Управление бастионом", "operations_console": "Операционная консоль", "secured": "Защищено Keycloak",
+        "day": "День", "night": "Ночь", "about": "Об этой странице", "primary_nav": "Основная навигация",
+        "theme": "Цветовая тема", "language": "Язык",
+    },
 }
 
 
-def _page_help(title):
-    description = _PAGE_HELP.get(str(title))
-    if not description and str(title).startswith("Job "):
-        description = "Inspect per-host execution state, output, errors, cancellation status, and retry failed targets for this job."
-    if not description:
+_PAGE_HELP = {
+    "Isolate Dashboard": {
+        "en": "Operational overview of active sessions, pending access requests, recent connections, jobs, and security alerts.",
+        "ru": "Операционный обзор активных сессий, запросов доступа, последних подключений, задач и алертов безопасности.",
+    },
+    "Jobs & Runbooks": {
+        "en": "Run approved operational procedures across one host or a fleet, then monitor progress, output, retries, and cancellations.",
+        "ru": "Запускайте разрешённые операции на одном сервере или группе серверов и отслеживайте прогресс, вывод, повторы и отмену.",
+    },
+    "Alert Center": {
+        "en": "Review session risks, failed jobs, and notification delivery failures; acknowledge or resolve findings with an audit trail.",
+        "ru": "Проверяйте риски сессий, ошибки задач и доставки уведомлений; подтверждайте и закрывайте события с сохранением аудита.",
+    },
+    "Access Matrix": {
+        "en": "Inspect effective user and group access by project, identify conflicting grants, and preview the blast radius of changes.",
+        "ru": "Смотрите итоговый доступ пользователей и групп по проектам, находите конфликты и оценивайте влияние изменений.",
+    },
+    "Active Sessions": {
+        "en": "See current SSH connections, their duration and target identity, and terminate a session when an incident requires it.",
+        "ru": "Смотрите текущие SSH-подключения, их длительность и целевого пользователя; при необходимости завершайте сессии.",
+    },
+    "History": {
+        "en": "Search audited SSH connections by user, project, host ID, host name, or target address and open their session details.",
+        "ru": "Ищите SSH-подключения по пользователю, проекту, ID или имени сервера и открывайте подробности сессии.",
+    },
+    "Access Requests": {
+        "en": "Review temporary access requests, comments, tickets, notification status, and approve or deny break-glass grants.",
+        "ru": "Обрабатывайте запросы временного доступа, комментарии и тикеты; одобряйте или отклоняйте break-glass доступ.",
+    },
+    "Inventory": {
+        "en": "Browse bastion-managed hosts, service metadata, VIP markers, and privileged access guidance. Host changes are audited.",
+        "ru": "Просматривайте серверы, сервисы, VIP-метки и инструкции по привилегированному доступу. Изменения аудируются.",
+    },
+    "Session Details": {
+        "en": "Inspect one connection's identity, policy decision, commands, timestamps, exit status, raw log, and replay artifacts.",
+        "ru": "Изучайте identity, решение политики, команды, время, код выхода, raw-лог и replay выбранного подключения.",
+    },
+    "Live Session": {
+        "en": "Follow newly written terminal output for an active connection. This observational view is not Web SSH.",
+        "ru": "Наблюдайте новый терминальный вывод активного подключения. Это режим просмотра, а не Web SSH.",
+    },
+    "Session Replay": {
+        "en": "Replay the recorded terminal stream with seek, speed, ANSI rendering, and raw or JSON downloads.",
+        "ru": "Воспроизводите запись терминала с перемоткой, скоростью, ANSI-рендерингом и выгрузкой raw или JSON.",
+    },
+    "Policy Simulator": {
+        "en": "Explain which grant applies to an identity, project, and host before changing production access.",
+        "ru": "Проверяйте, какой grant сработает для identity, проекта и сервера до изменения production-доступа.",
+    },
+    "Policy GitOps": {
+        "en": "Validate, compare, apply, and roll back optional Git-managed grants and project sets while tracking Redis drift.",
+        "ru": "Проверяйте, сравнивайте, применяйте и откатывайте Git-managed grants/project sets с контролем drift в Redis.",
+    },
+    "Users": {
+        "en": "Inspect identities observed in audit data together with effective grants, active sessions, and connection history.",
+        "ru": "Просматривайте identity из аудита вместе с действующими grants, активными сессиями и историей подключений.",
+    },
+    "User Details": {
+        "en": "Review one user's observed groups, access rules, active sessions, and historical activity.",
+        "ru": "Проверяйте группы, правила доступа, активные сессии и историю выбранного пользователя.",
+    },
+    "Notifications": {
+        "en": "Check recent webhook, Telegram, and email delivery outcomes for access and session events.",
+        "ru": "Проверяйте доставку webhook, Telegram и email-уведомлений о доступе и сессиях.",
+    },
+    "Grants": {
+        "en": "Manage low-level RBAC grants and project sets. Package-managed grants are changed through Access Packages.",
+        "ru": "Управляйте низкоуровневыми RBAC grants и project sets. Пакетные grants изменяются через Пакеты доступа.",
+    },
+    "Access Packages": {
+        "en": "Create reusable access profiles, preview revisions, and assign them to Keycloak users, groups, or roles.",
+        "ru": "Создавайте переиспользуемые профили доступа, проверяйте ревизии и назначайте их пользователям, группам или ролям Keycloak.",
+    },
+    "Documentation": {
+        "en": "A practical guide to identity, inventory, policies, packages, temporary access, sessions, jobs, backup, and updates.",
+        "ru": "Практическое руководство по identity, инвентарю, политикам, пакетам, временному доступу, сессиям, backup и обновлениям.",
+    },
+}
+
+
+_FIELD_HELP = {
+    "en": {
+        "q": "Free-text filter for the current table.", "status": "Lifecycle or execution state to display.",
+        "user": "Verified Keycloak username.", "group": "Exact Keycloak group claim.", "role": "Exact signed token role.",
+        "name": "Human-readable object or subject name.", "description": "Short administrator-facing purpose and scope.",
+        "project": "Exact Isolate project name.", "groups": "Comma-separated Keycloak groups used by the simulator.",
+        "roles": "Comma-separated signed token roles used by the simulator.",
+        "host": "Optional server ID restriction.", "remote_user": "Unix account used on the target host.",
+        "sudo_mode": "Whether and how the remote session elevates privileges.", "allowed_actions": "Comma-separated capabilities such as ssh, runbook, command, operate.",
+        "ttl": "Assignment lifetime, for example 2h or 7d.", "ticket": "Incident or change ticket associated with the action.",
+        "reason": "Operational justification stored in audit data.", "comment": "Immutable decision or review note.",
+        "selector_type": "Choose an exact project, glob, or named project set.", "selector_value": "Value for the selected project selector.",
+        "access_json": "JSON list of package access rules; every rule needs one selector and a remote user.",
+        "default_ttl": "Default lifetime used when assignment does not specify one.", "max_ttl": "Maximum assignment lifetime allowed by this package.",
+        "permanent_allowed": "Allow assignments without an expiration time.", "approval_required": "Mark this package as requiring an administrator assignment decision.",
+        "admin_groups": "Comma-separated Keycloak groups allowed to assign this package.", "ticket_required": "Require a ticket for every assignment.",
+        "minimum_approvals": "Required approvers; values above one block direct assignment until a multi-approval workflow is configured.",
+        "package": "Package ID or exact package name.", "subject": "Identity type receiving the package: user, group, or role.",
+        "revision": "Immutable package revision used for rollback.", "permanent": "Create an assignment without expiration when the package permits it.",
+        "ip": "Target IPv4/IPv6 address or validated hostname.", "port": "Target SSH port.",
+        "services": "Free-form searchable service inventory.", "note": "Short operational note shown in inventory.",
+        "policy_action": "Capability evaluated by the production policy resolver.", "confirm": "Explicitly acknowledge this audited mutation.",
+    },
+    "ru": {
+        "q": "Свободный текст для фильтрации текущей таблицы.", "status": "Состояние жизненного цикла или выполнения.",
+        "user": "Проверенное имя пользователя Keycloak.", "group": "Точное значение группы из Keycloak token.", "role": "Точная роль из подписанного token.",
+        "name": "Понятное имя объекта или субъекта.", "description": "Краткое назначение и область действия для администраторов.",
+        "project": "Точное имя проекта Isolate.", "groups": "Группы Keycloak через запятую для policy simulator.",
+        "roles": "Роли из подписанного token через запятую для policy simulator.",
+        "host": "Необязательное ограничение по server ID.", "remote_user": "Unix-пользователь для подключения к целевому серверу.",
+        "sudo_mode": "Режим повышения привилегий в удалённой сессии.", "allowed_actions": "Доступные действия через запятую: ssh, runbook, command, operate.",
+        "ttl": "Срок назначения, например 2h или 7d.", "ticket": "Номер incident/change, связанный с операцией.",
+        "reason": "Обоснование, сохраняемое в аудите.", "comment": "Неизменяемый комментарий к решению или ревью.",
+        "selector_type": "Выберите точный проект, glob-шаблон или именованный project set.", "selector_value": "Значение выбранного project selector.",
+        "access_json": "JSON-список правил пакета; каждому правилу нужен один selector и remote user.",
+        "default_ttl": "Срок по умолчанию, если при назначении он не указан.", "max_ttl": "Максимально допустимый срок назначения пакета.",
+        "permanent_allowed": "Разрешить назначения без срока истечения.", "approval_required": "Пакет должен назначаться администратором после проверки.",
+        "admin_groups": "Группы Keycloak через запятую, которым разрешено назначать пакет.", "ticket_required": "Требовать тикет для каждого назначения.",
+        "minimum_approvals": "Число согласующих; значение больше одного блокирует прямое назначение до появления multi-approval workflow.",
+        "package": "ID пакета или его точное имя.", "subject": "Тип получателя пакета: user, group или role.",
+        "revision": "Неизменяемая ревизия пакета для rollback.", "permanent": "Назначение без срока, если это разрешено пакетом.",
+        "ip": "IPv4/IPv6 или валидированное имя целевого сервера.", "port": "SSH-порт целевого сервера.",
+        "services": "Свободное searchable-описание сервисов.", "note": "Краткая операционная заметка в inventory.",
+        "policy_action": "Действие, проверяемое production policy resolver.", "confirm": "Явное подтверждение аудируемого изменения.",
+    },
+}
+
+
+def _dashboard_locale(config=None):
+    default = str((config or {}).get("dashboard", {}).get("default_locale") or "en").lower()
+    locale = default if default in _SHELL_I18N else "en"
+    try:
+        from flask import has_request_context, request, session
+        if has_request_context():
+            requested = str(request.args.get("lang") or "").lower()
+            if requested in _SHELL_I18N:
+                session["dashboard_locale"] = requested
+            locale = session.get("dashboard_locale") or locale
+    except (ImportError, RuntimeError):
+        pass
+    return locale if locale in _SHELL_I18N else "en"
+
+
+def _locale_url(locale):
+    try:
+        from flask import has_request_context, request
+        if has_request_context():
+            values = request.args.to_dict(flat=False)
+            values["lang"] = [locale]
+            return request.path + "?" + urllib.parse.urlencode(values, doseq=True)
+    except (ImportError, RuntimeError):
+        pass
+    return "?lang={}".format(locale)
+
+
+def _page_help(title, locale):
+    descriptions = _PAGE_HELP.get(str(title))
+    if not descriptions and str(title).startswith("Job "):
+        descriptions = {
+            "en": "Inspect per-host state, output, errors, cancellation status, and retries for this job.",
+            "ru": "Проверяйте состояние по серверам, вывод, ошибки, отмену и повторные запуски этой задачи.",
+        }
+    if not descriptions:
         return ""
-    return '<details class="page-help"><summary>About this page</summary><p>{}</p></details>'.format(
-        html.escape(description)
+    return '<details class="page-help"><summary>{}</summary><p>{}</p></details>'.format(
+        html.escape(_SHELL_I18N[locale]["about"]), html.escape(descriptions.get(locale) or descriptions["en"])
     )
 
 
 def _html(title, body, config=None, notice=None):
+    locale = _dashboard_locale(config)
+    words = _SHELL_I18N[locale]
+    build = _build_info(config)
     refresh = ""
     refresh_seconds = int((config or {}).get("dashboard", {}).get("refresh_seconds") or 0)
     if refresh_seconds > 0:
@@ -520,49 +754,77 @@ def _html(title, body, config=None, notice=None):
     except (ImportError, RuntimeError):
         pass
     initials = "".join(part[:1] for part in username.replace(".", " ").split()[:2]).upper() or "AD"
+    field_help_script = """
+(function () {{
+  var help = {field_help};
+  document.querySelectorAll('input[name], select[name], textarea[name]').forEach(function (field) {{
+    var description = help[field.name];
+    if (!description || field.type === 'hidden') return;
+    field.title = field.title || description;
+    var label = field.closest('label');
+    if (label && !label.querySelector('.field-help')) {{
+      var marker = document.createElement('span');
+      marker.className = 'field-help'; marker.textContent = 'i'; marker.title = description;
+      marker.setAttribute('aria-label', description); label.appendChild(marker);
+    }}
+  }});
+}})();
+""".format(field_help=json.dumps(_FIELD_HELP[locale], ensure_ascii=False).replace("</", "<\\/"))
     return """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
+<html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
 <script>{theme_bootstrap_script}</script>
 <style>{css}</style></head><body>
 <div class="app-shell">
   <aside class="sidebar">
-    <a class="brand" href="/" aria-label="Isolate dashboard home">
+    <a class="brand" href="/" aria-label="Isolate dashboard">
       <span class="brand-mark">IS</span>
-      <span class="brand-copy">Isolate <small>Bastion control</small></span>
+      <span class="brand-copy">Isolate <small>{bastion_control}</small></span>
     </a>
-    <nav class="primary-nav" aria-label="Primary navigation">
-      <div class="nav-section"><span class="nav-label">Operations</span>
-        <a class="nav-link" href="/">Summary</a><a class="nav-link" href="/jobs">Jobs &amp; runbooks</a><a class="nav-link" href="/alerts">Alert center</a><a class="nav-link" href="/sessions/active">Active sessions</a><a class="nav-link" href="/history">History</a><a class="nav-link" href="/inventory">Inventory</a>
+    <nav class="primary-nav" aria-label="{primary_nav}">
+      <div class="nav-section"><span class="nav-label">{operations}</span>
+        <a class="nav-link" href="/">{summary}</a><a class="nav-link" href="/jobs">{jobs}</a><a class="nav-link" href="/alerts">{alerts}</a><a class="nav-link" href="/sessions/active">{active_sessions}</a><a class="nav-link" href="/history">{history}</a><a class="nav-link" href="/inventory">{inventory}</a>
       </div>
-      <div class="nav-section"><span class="nav-label">Access control</span>
-        <a class="nav-link" href="/access">Requests</a><a class="nav-link" href="/grants">Grants</a><a class="nav-link" href="/policy/matrix">Access matrix</a><a class="nav-link" href="/policy/simulate">Policy simulator</a>
+      <div class="nav-section"><span class="nav-label">{access_control}</span>
+        <a class="nav-link" href="/access">{requests}</a><a class="nav-link" href="/grants">{grants}</a><a class="nav-link" href="/packages">{packages}</a><a class="nav-link" href="/policy/matrix">{matrix}</a><a class="nav-link" href="/policy/simulate">{simulator}</a>
       </div>
-      <div class="nav-section"><span class="nav-label">Platform</span>
-        <a class="nav-link" href="/policy/gitops">GitOps</a><a class="nav-link" href="/users">Users</a><a class="nav-link" href="/notifications">Notifications</a>
+      <div class="nav-section"><span class="nav-label">{platform}</span>
+        <a class="nav-link" href="/policy/gitops">{gitops}</a><a class="nav-link" href="/users">{users}</a><a class="nav-link" href="/notifications">{notifications}</a><a class="nav-link" href="/docs">{documentation}</a>
       </div>
     </nav>
+    <div class="build-info"><strong>v{version}</strong>{revision} &middot; schema {schema}<br>Python {python}</div>
     <div class="sidebar-footer">
       <span class="user-avatar">{initials}</span>
-      <span class="user-copy"><span class="user-name">{username}</span><a class="logout-link" href="/logout">Sign out</a></span>
+      <span class="user-copy"><span class="user-name">{username}</span><a class="logout-link" href="/logout">{sign_out}</a></span>
     </div>
   </aside>
   <main class="main">
-    <header class="topbar"><div><span class="topbar-kicker">Isolate v2</span><span class="topbar-title">Operations console</span></div><div class="topbar-actions"><div class="theme-switch" aria-label="Color theme"><button type="button" data-theme-choice="light" aria-pressed="false">Day</button><button type="button" data-theme-choice="dark" aria-pressed="false">Night</button></div><div class="runtime-state"><span class="status-dot"></span>Secured by Keycloak</div></div></header>
+    <header class="topbar"><div><span class="topbar-kicker">Isolate v2</span><span class="topbar-title">{operations_console}</span></div><div class="topbar-actions"><div class="locale-switch" aria-label="{language}"><a class="{en_active}" href="{en_url}">EN</a><a class="{ru_active}" href="{ru_url}">RU</a></div><div class="theme-switch" aria-label="{theme}"><button type="button" data-theme-choice="light" aria-pressed="false">{day}</button><button type="button" data-theme-choice="dark" aria-pressed="false">{night}</button></div><div class="runtime-state"><span class="status-dot"></span>{secured}</div></div></header>
     <div class="content">{notice}{page_help}{body}</div>
   </main>
 </div>
-<script>{active_nav_script}</script>
+<script>{active_nav_script}{field_help_script}</script>
 </body></html>""".format(
+        locale=locale,
         refresh=refresh,
         title=html.escape(str(title)),
         theme_bootstrap_script=_THEME_BOOTSTRAP_SCRIPT,
         css=_DASHBOARD_CSS,
         initials=html.escape(initials),
         username=html.escape(username),
+        version=html.escape(str(build.get("version") or "unknown")),
+        revision=html.escape(str(build.get("revision_short") or "unknown")),
+        schema=html.escape(str(build.get("schema_version") or "n/a")),
+        python=html.escape(str(build.get("python") or "unknown")),
         notice=notice_html,
-        page_help=_page_help(title),
+        page_help=_page_help(title, locale),
         body=body,
         active_nav_script=_ACTIVE_NAV_SCRIPT,
+        field_help_script=field_help_script,
+        en_active="active" if locale == "en" else "",
+        ru_active="active" if locale == "ru" else "",
+        en_url=html.escape(_locale_url("en"), quote=True),
+        ru_url=html.escape(_locale_url("ru"), quote=True),
+        **{key: html.escape(str(value)) for key, value in words.items()}
     )
 
 
@@ -575,7 +837,7 @@ def _table(rows, columns):
             value = row.get(key) or ""
             safe_html = key in (
                 "raw", "project_link", "history", "details", "replay", "live", "control",
-                "user_link", "edit", "actions", "progress", "source_link", "severity_badge",
+                "user_link", "package_link", "edit", "actions", "progress", "source_link", "severity_badge",
             )
             rendered = str(value) if safe_html else html.escape(str(value))
             normalized = str(value).strip().lower()
@@ -632,6 +894,147 @@ def _parse_json_object(value, field_name="JSON parameters"):
     return result
 
 
+def _parse_json_list(value, field_name="JSON value"):
+    try:
+        result = json.loads(value or "[]")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("{} is invalid: {}".format(field_name, exc)) from exc
+    if not isinstance(result, list):
+        raise ValueError("{} must be a JSON list".format(field_name))
+    return result
+
+
+def _package_form_payload(form, current=None):
+    current = current or {}
+    lifecycle = current.get("lifecycle") or {}
+    approval = current.get("approval") or {}
+    return {
+        "name": str(form.get("name") or current.get("name") or "").strip(),
+        "description": str(form.get("description") or "").strip(),
+        "status": str(form.get("status") or current.get("status") or "enabled"),
+        "access": _parse_json_list(form.get("access_json"), "package access JSON"),
+        "lifecycle": {
+            "default_ttl": str(form.get("default_ttl") or "").strip() or None,
+            "max_ttl": str(form.get("max_ttl") or "").strip() or None,
+            "permanent_allowed": form.get("permanent_allowed") == "true",
+        },
+        "approval": {
+            "required": form.get("approval_required") == "true",
+            "admin_groups": _split_values(form.get("admin_groups")),
+            "ticket_required": form.get("ticket_required") == "true",
+            "minimum_approvals": int(form.get("minimum_approvals") or approval.get("minimum_approvals") or 1),
+        },
+    }
+
+
+def _documentation_body(locale, build):
+    if locale == "ru":
+        title = "Документация Isolate"
+        lead = "Краткое практическое руководство для администраторов bastion-платформы. Примеры безопасны для чтения, но production-значения следует проверять через preview и policy simulator."
+        toc_title = "На этой странице"
+        sections = [
+            ("identity", "Identity и вход", """
+<p>Сотрудник подключается к bastion под своим Unix/AD-пользователем и выполняет <code>isolate login</code>. Device Flow открывает Keycloak в браузере, а локальный cache хранит token. Команды <code>s</code>, <code>g</code>, история и access workflow каждый раз используют только проверенные JWT claims.</p>
+<pre>isolate login
+isolate whoami
+s redis
+g 10703</pre>
+<p>Группы из редактируемого файла не считаются доверенными: подпись, issuer, audience и срок JWT проверяются через защищённый JWKS cache.</p>"""),
+            ("inventory", "Инвентарь и подключение", """
+<p>Project объединяет серверы. Host содержит адрес, имя, remote user по умолчанию, сервисы, заметку и optional VIP/privileged access hint. Поиск <code>s</code> видит только разрешённые policy серверы; <code>g</code> подключается только после точного host match.</p>
+<pre>isolate host list --project payments-prod
+isolate host show 10703
+isolate host update 10703 --services "nginx, redis" --note "API frontend"</pre>"""),
+            ("policy", "Project sets и grants", """
+<p>Project set объединяет exact projects и glob patterns. Grant связывает user/group/role с selector, remote user, sudo mode и allowed actions. Без matching grant доступ закрыт.</p>
+<pre>isolate project-set add prod-apps --project payments-prod --project-glob '*-stage'
+isolate grant add --group Support-L2 --project-set prod-apps --remote-user support --sudo-mode none
+isolate grant explain --user demo.alex --group Support-L2 --host 10703</pre>"""),
+            ("packages", "Пакеты доступа", """
+<p>Access Package — именованный шаблон, который включает несколько правил, TTL и approval route. Его можно назвать по внутреннему стандарту и назначить одновременно группам, пользователям или ролям. Назначение создаёт управляемые grants; редактировать их вручную нельзя.</p>
+<pre>isolate package create --file support-readonly.yml
+isolate package preview "Support Read-Only" --file support-readonly-v2.yml
+isolate package apply "Support Read-Only" --file support-readonly-v2.yml --yes
+isolate package assign "Support Read-Only" --group Support-L1 --group Support-L2 --ttl 7d --ticket CHG-1042 --yes
+isolate package revisions "Support Read-Only"
+isolate package rollback "Support Read-Only" --revision 1 --yes</pre>
+<p>Перед apply показывается число затронутых subjects и операций create/update/delete. Ревизии неизменяемы, поэтому rollback воспроизводим.</p>"""),
+            ("temporary", "Временный доступ", """
+<p>Если постоянного grant нет, пользователь создаёт break-glass request. Администратор получает уведомление, проверяет тикет и назначает TTL; временный grant перестаёт работать после <code>expires_at</code>.</p>
+<pre>isolate access request --project payments-prod --host 10703 --remote-user dba --sudo-mode none --reason "Incident diagnostics" --ticket INC-2048
+isolate access approve --id 42 --ttl 2h --comment "Approved for incident window"</pre>"""),
+            ("operations", "Сессии, jobs и аудит", """
+<p>History и Session Details показывают policy decision, целевой host, remote user, JSONL events и raw terminal transcript. Replay восстанавливается из raw log. Structured command events появляются только после установки target shell hooks.</p>
+<p>Jobs &amp; Runbooks запускает заранее проверенные операции по одному серверу или fleet. Произвольные команды должны включаться отдельно и ограничиваться grants, scopes, allowlist и подтверждением.</p>"""),
+            ("lifecycle", "Backup, GitOps и обновление", """
+<p>Перед релизом создайте service backup и проверьте health. GitOps для grants/project sets остаётся opt-in; при <code>enforce_git</code> ручные policy mutations блокируются.</p>
+<pre>sudo /opt/auth/scripts/isolate-backup.sh create
+git pull --ff-only
+sudo bash /opt/auth/scripts/fix-perms.sh
+curl -fsS http://127.0.0.1:8080/health</pre>
+<p>Для бесшовного обновления запускайте два dashboard экземпляра за reverse proxy и выводите старый instance после успешной health-проверки нового. Активные SSH-сессии wrapper не следует перезапускать принудительно.</p>"""),
+        ]
+    else:
+        title = "Isolate Documentation"
+        lead = "A practical guide for bastion administrators. Examples are safe to read, but production values should be reviewed through preview and the policy simulator."
+        toc_title = "On this page"
+        sections = [
+            ("identity", "Identity and sign-in", """
+<p>An employee enters the bastion with their own Unix/AD account and runs <code>isolate login</code>. Device Flow opens Keycloak in a browser, while the local cache stores tokens. <code>s</code>, <code>g</code>, history, and access workflows authorize only verified JWT claims.</p>
+<pre>isolate login
+isolate whoami
+s redis
+g 10703</pre>
+<p>Editable cached groups are never trusted. JWT signature, issuer, audience, and expiration are checked through the protected JWKS cache.</p>"""),
+            ("inventory", "Inventory and connections", """
+<p>A project groups hosts. A host stores its address, name, default remote user, services, notes, and optional VIP or privileged-access guidance. <code>s</code> returns only policy-visible hosts; <code>g</code> connects only after an exact host match.</p>
+<pre>isolate host list --project payments-prod
+isolate host show 10703
+isolate host update 10703 --services "nginx, redis" --note "API frontend"</pre>"""),
+            ("policy", "Project sets and grants", """
+<p>A project set combines exact projects and glob patterns. A grant maps a user, group, or role to a selector, remote user, sudo mode, and allowed actions. Access is denied without a matching grant.</p>
+<pre>isolate project-set add prod-apps --project payments-prod --project-glob '*-stage'
+isolate grant add --group Support-L2 --project-set prod-apps --remote-user support --sudo-mode none
+isolate grant explain --user demo.alex --group Support-L2 --host 10703</pre>"""),
+            ("packages", "Access packages", """
+<p>An Access Package is a named template containing several access rules, lifecycle limits, and an approval route. Use any internal name and assign it to Keycloak users, groups, or roles. Assignments materialize managed grants that cannot be edited directly.</p>
+<pre>isolate package create --file support-readonly.yml
+isolate package preview "Support Read-Only" --file support-readonly-v2.yml
+isolate package apply "Support Read-Only" --file support-readonly-v2.yml --yes
+isolate package assign "Support Read-Only" --group Support-L1 --group Support-L2 --ttl 7d --ticket CHG-1042 --yes
+isolate package revisions "Support Read-Only"
+isolate package rollback "Support Read-Only" --revision 1 --yes</pre>
+<p>Preview reports affected subjects and grant create/update/delete operations. Revisions are immutable, making rollback reproducible.</p>"""),
+            ("temporary", "Temporary access", """
+<p>When no permanent grant exists, a user creates a break-glass request. An administrator receives a notification, reviews the ticket, and approves a TTL. The temporary grant stops matching after <code>expires_at</code>.</p>
+<pre>isolate access request --project payments-prod --host 10703 --remote-user dba --sudo-mode none --reason "Incident diagnostics" --ticket INC-2048
+isolate access approve --id 42 --ttl 2h --comment "Approved for incident window"</pre>"""),
+            ("operations", "Sessions, jobs, and audit", """
+<p>History and Session Details expose policy decisions, target host, remote user, JSONL events, and raw terminal transcripts. Replay is generated from raw logs. Structured commands appear only when target shell hooks are installed.</p>
+<p>Jobs &amp; Runbooks executes reviewed operations on one host or a fleet. Arbitrary commands remain separately gated by grants, scopes, allowlists, and confirmation.</p>"""),
+            ("lifecycle", "Backup, GitOps, and updates", """
+<p>Create a service backup and verify health before a release. GitOps for grants and project sets is opt-in; <code>enforce_git</code> blocks manual policy mutations.</p>
+<pre>sudo /opt/auth/scripts/isolate-backup.sh create
+git pull --ff-only
+sudo bash /opt/auth/scripts/fix-perms.sh
+curl -fsS http://127.0.0.1:8080/health</pre>
+<p>For a seamless dashboard update, run two instances behind a reverse proxy and remove the old instance after the new health check passes. Do not forcibly restart active SSH wrapper sessions.</p>"""),
+        ]
+    toc = "".join('<a href="#{}">{}</a>'.format(section_id, html.escape(heading)) for section_id, heading, _ in sections)
+    content = "".join('<section class="docs-section" id="{}"><h2>{}</h2>{}</section>'.format(
+        section_id, html.escape(heading), content
+    ) for section_id, heading, content in sections)
+    build_labels = ("Версия", "Ревизия", "Собрано", "Python", "Schema", "Uptime") if locale == "ru" else ("Version", "Revision", "Built", "Python", "Schema", "Uptime")
+    values = (
+        build.get("version") or "unknown", build.get("revision") or "unknown", build.get("built_at") or "unknown",
+        build.get("python") or "unknown", build.get("schema_version") or "n/a", "{}s".format(build.get("uptime_seconds") or 0),
+    )
+    build_html = "".join('<div><strong>{}</strong>{}</div>'.format(html.escape(str(label)), html.escape(str(value))) for label, value in zip(build_labels, values))
+    return '<h1>{}</h1><p class="page-lead">{}</p><div class="docs-layout"><div class="docs-main"><section class="docs-section"><h2>{}</h2><div class="build-grid">{}</div></section>{}</div><aside class="docs-toc"><strong>{}</strong>{}</aside></div>'.format(
+        html.escape(title), html.escape(lead), "Сборка" if locale == "ru" else "Build", build_html, content, html.escape(toc_title), toc
+    )
+
+
 def _host_form_values(form, partial=False):
     mapping = {
         "project": "project_name",
@@ -665,6 +1068,7 @@ def create_app(config=None):
     config = config or load_config()
     app = Flask(__name__)
     app.secret_key = _secret_key(config)
+    app.extensions["isolate_build_info"] = get_build_info(config, _DASHBOARD_STARTED_AT)
     oauth = OAuth(app)
 
     issuer = (config.get("keycloak", {}).get("issuer") or "").rstrip("/")
@@ -1961,6 +2365,192 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         ])
         return _html("Notifications", body, config=config)
 
+    @app.route("/packages", methods=["GET", "POST"])
+    def packages():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        notice = None
+        if request.method == "POST":
+            validate_csrf()
+            action = request.form.get("action")
+            try:
+                require_mutation_confirmation()
+                require_manual_policy_edit()
+                if not config.get("access_packages", {}).get("enabled", True):
+                    raise AccessPackageError("access packages are disabled")
+                if action == "create":
+                    package = create_package(
+                        redis, _package_form_payload(request.form), actor=admin.get("username"),
+                        max_rules=config.get("access_packages", {}).get("max_rules", 50),
+                    )
+                    notice = {"level": "success", "text": "Access package created: {}".format(package["name"])}
+                elif action == "assign":
+                    package = get_package(redis, request.form.get("package"))
+                    if package is None:
+                        raise AccessPackageError("access package was not found")
+                    allowed_admins = set((package.get("approval") or {}).get("admin_groups") or [])
+                    if allowed_admins and not allowed_admins.intersection(admin.get("groups") or []):
+                        raise AccessPackageError("your Keycloak groups cannot assign this package")
+                    names = _split_values(request.form.get("name"))
+                    maximum = int(config.get("access_packages", {}).get("max_assignments_per_operation") or 100)
+                    if not names or len(names) > maximum:
+                        raise AccessPackageError("provide between 1 and {} subject names".format(maximum))
+                    for name in names:
+                        assign_package(
+                            redis, package["id"], request.form.get("subject"), name,
+                            actor=admin.get("username"), ttl=str(request.form.get("ttl") or "").strip() or None,
+                            permanent=request.form.get("permanent") == "true", ticket=request.form.get("ticket"),
+                        )
+                    notice = {"level": "success", "text": "Package assigned to {} subject(s)".format(len(names))}
+                elif action == "unassign":
+                    assignment, deleted = unassign_package(redis, request.form.get("id"), actor=admin.get("username"))
+                    notice = {"level": "success", "text": "Assignment {} revoked; {} managed grant(s) removed".format(assignment["id"], deleted)}
+                else:
+                    raise AccessPackageError("unknown package action")
+                audit_admin("package_{}".format(action), admin, "applied", {"package": request.form.get("package")})
+            except (AccessPackageError, ValueError) as exc:
+                audit_admin("package_{}".format(action or "mutation"), admin, "denied")
+                notice = {"level": "error", "text": str(exc)}
+
+        package_rows = []
+        for package in list_packages(redis):
+            row = dict(package)
+            row["rules"] = len(package.get("access") or [])
+            row["package_link"] = '<a href="/packages/{}">open</a>'.format(urllib.parse.quote(str(package["id"]), safe=""))
+            package_rows.append(row)
+        assignments = list_assignments(redis)
+        for row in assignments:
+            row["expires"] = _format_ts(row.get("expires_at")) or "permanent"
+            row["package_link"] = '<a href="/packages/{}">{}</a>'.format(
+                urllib.parse.quote(str(row.get("package_id") or ""), safe=""), html.escape(str(row.get("package_name") or ""))
+            )
+        token = html.escape(csrf_token())
+        example = html.escape(json.dumps([{
+            "id": "support-prod", "project_set": "prod-apps", "remote_user": "support",
+            "sudo_mode": "none", "allowed_actions": ["ssh", "runbook"],
+        }], indent=2))
+        body = "<h1>Access Packages</h1>" + _table(package_rows, [
+            ("id", "id"), ("name", "name"), ("status", "status"), ("revision", "revision"),
+            ("rules", "rules"), ("description", "description"), ("package_link", "details"),
+        ])
+        body += """
+<h2>Create package</h2><form method="post">
+<input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="create">
+<p><label>Name <input name="name" required placeholder="Support Read-Only"></label><label>Status <select name="status"><option>enabled</option><option>disabled</option></select></label></p>
+<p><label>Description <input name="description" size="72" placeholder="Read-only production access for support teams"></label></p>
+<p><label>Access rules <textarea name="access_json" rows="10" cols="92" required>{example}</textarea></label></p>
+<p><label>Default TTL <input name="default_ttl" placeholder="7d" size="8"></label><label>Max TTL <input name="max_ttl" placeholder="30d" size="8"></label><label><input type="checkbox" name="permanent_allowed" value="true"> Permanent allowed</label></p>
+<p><label><input type="checkbox" name="approval_required" value="true"> Approval required</label><label>Admin groups <input name="admin_groups" placeholder="DevSecOps, OS-admin"></label><label><input type="checkbox" name="ticket_required" value="true"> Ticket required</label><label>Minimum approvals <input type="number" name="minimum_approvals" min="1" value="1" size="5"></label></p>
+<p><label><input type="checkbox" name="confirm" value="true" required> Confirm</label><button>Create package</button></p></form>
+<h2>Assign package</h2><form method="post" class="inline">
+<input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="assign">
+<input name="package" placeholder="package id or name" required><select name="subject"><option>group</option><option>user</option><option>role</option></select>
+<input name="name" placeholder="one or comma-separated subjects" required size="34"><input name="ttl" placeholder="7d" size="8"><input name="ticket" placeholder="CHG-1042">
+<label><input type="checkbox" name="permanent" value="true"> Permanent</label><label><input type="checkbox" name="confirm" value="true" required> Confirm</label><button>Assign</button></form>
+<h2>Assignments</h2>{assignments}
+<h2>Revoke assignment</h2><form method="post" class="inline"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="unassign"><input name="id" placeholder="assignment id" required><label><input type="checkbox" name="confirm" value="true" required> Confirm</label><button class="button-danger">Unassign</button></form>
+""".format(token=token, example=example, assignments=_table(assignments, [
+            ("id", "id"), ("package_link", "package"), ("subject", "subject"), ("name", "name"),
+            ("status", "status"), ("expires", "expires"), ("ticket", "ticket"), ("grant_ids", "grants"),
+        ]))
+        return _html("Access Packages", body, config=config, notice=notice)
+
+    @app.route("/packages/<package_id>", methods=["GET", "POST"])
+    def package_details(package_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        package = get_package(redis, package_id)
+        if package is None:
+            abort(404)
+        notice = None
+        preview = None
+        if request.method == "POST":
+            validate_csrf()
+            action = request.form.get("action")
+            try:
+                if action == "preview":
+                    payload = _package_form_payload(request.form, current=package)
+                    preview = preview_package_update(
+                        redis, package["id"], payload, actor=admin.get("username"),
+                        max_rules=config.get("access_packages", {}).get("max_rules", 50),
+                    )
+                    notice = {"level": "info", "text": "Preview completed; no changes were applied"}
+                elif action == "update":
+                    require_mutation_confirmation()
+                    require_manual_policy_edit()
+                    payload = _package_form_payload(request.form, current=package)
+                    package, _ = update_package(
+                        redis, package["id"], payload, actor=admin.get("username"),
+                        expected_revision=request.form.get("expected_revision"),
+                        max_rules=config.get("access_packages", {}).get("max_rules", 50),
+                    )
+                    audit_admin("package_update", admin, "applied", {"package_id": package["id"], "revision": package["revision"]})
+                    notice = {"level": "success", "text": "Package updated and assignments synchronized"}
+                elif action == "rollback":
+                    require_mutation_confirmation()
+                    require_manual_policy_edit()
+                    package, _ = rollback_package(
+                        redis, package["id"], int(request.form.get("revision")), actor=admin.get("username"),
+                        expected_revision=request.form.get("expected_revision"),
+                    )
+                    audit_admin("package_rollback", admin, "applied", {"package_id": package["id"], "revision": package["revision"]})
+                    notice = {"level": "success", "text": "Package rollback created revision {}".format(package["revision"])}
+                else:
+                    raise AccessPackageError("unknown package action")
+            except (AccessPackageError, ValueError) as exc:
+                audit_admin("package_{}".format(action or "mutation"), admin, "denied", {"package_id": package_id})
+                notice = {"level": "error", "text": str(exc)}
+        token = html.escape(csrf_token())
+        lifecycle = package.get("lifecycle") or {}
+        approval = package.get("approval") or {}
+        checked = lambda value: " checked" if value else ""
+        selected = lambda value, expected: " selected" if value == expected else ""
+        body = '<p><a href="/packages">Back to packages</a></p><h1>{}</h1>'.format(html.escape(str(package["name"])))
+        body += '<dl class="key-value"><dt>ID</dt><dd>{}</dd><dt>Revision</dt><dd>{}</dd><dt>Updated by</dt><dd>{}</dd><dt>Updated</dt><dd>{}</dd></dl>'.format(
+            html.escape(str(package["id"])), html.escape(str(package["revision"])), html.escape(str(package.get("updated_by") or "")), html.escape(_format_ts(package.get("updated_at")))
+        )
+        if preview:
+            body += '<div class="panel"><h2>Preview</h2><p><strong>{}</strong> affected subjects, <strong>{}</strong> grant changes; revision {} to {}.</p><pre>{}</pre></div>'.format(
+                preview["affected_subjects"], preview["grant_change_count"], preview["from_revision"], preview["to_revision"], html.escape(json.dumps(preview["assignments"], indent=2, sort_keys=True))
+            )
+        body += """
+<h2>Edit and preview</h2><form method="post">
+<input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="expected_revision" value="{revision}">
+<p><label>Name <input name="name" value="{name}" required></label><label>Status <select name="status"><option{enabled}>enabled</option><option{disabled}>disabled</option></select></label></p>
+<p><label>Description <input name="description" value="{description}" size="72"></label></p>
+<p><label>Access rules <textarea name="access_json" rows="14" cols="92" required>{access}</textarea></label></p>
+<p><label>Default TTL <input name="default_ttl" value="{default_ttl}" size="8"></label><label>Max TTL <input name="max_ttl" value="{max_ttl}" size="8"></label><label><input type="checkbox" name="permanent_allowed" value="true"{permanent}> Permanent allowed</label></p>
+<p><label><input type="checkbox" name="approval_required" value="true"{required}> Approval required</label><label>Admin groups <input name="admin_groups" value="{admin_groups}"></label><label><input type="checkbox" name="ticket_required" value="true"{ticket_required}> Ticket required</label><label>Minimum approvals <input type="number" name="minimum_approvals" min="1" value="{minimum_approvals}" size="5"></label></p>
+<p><button name="action" value="preview" class="button-secondary">Preview</button><label><input type="checkbox" name="confirm" value="true"> Confirm apply</label><button name="action" value="update">Apply revision</button></p></form>
+<h2>Revision history</h2>{revisions}
+<h2>Rollback</h2><form method="post" class="inline"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="expected_revision" value="{revision}"><input type="hidden" name="action" value="rollback"><input type="number" name="revision" min="1" placeholder="revision" required><label><input type="checkbox" name="confirm" value="true" required> Confirm</label><button class="button-danger">Create rollback revision</button></form>
+""".format(
+            token=token, revision=html.escape(str(package["revision"])), name=html.escape(str(package["name"])),
+            description=html.escape(str(package.get("description") or "")), access=html.escape(json.dumps(package.get("access") or [], indent=2, sort_keys=True)),
+            enabled=selected(package.get("status"), "enabled"), disabled=selected(package.get("status"), "disabled"),
+            default_ttl=html.escape(str(lifecycle.get("default_ttl") or "")), max_ttl=html.escape(str(lifecycle.get("max_ttl") or "")),
+            permanent=checked(lifecycle.get("permanent_allowed")), required=checked(approval.get("required")),
+            admin_groups=html.escape(", ".join(approval.get("admin_groups") or [])), ticket_required=checked(approval.get("ticket_required")),
+            minimum_approvals=html.escape(str(approval.get("minimum_approvals") or 1)),
+            revisions=_table(list_package_revisions(redis, package["id"]), [
+                ("revision", "revision"), ("status", "status"), ("updated_by", "updated_by"),
+                ("updated_at", "updated_at"), ("rolled_back_from", "rollback source"),
+            ]),
+        )
+        return _html("Access Packages", body, config=config, notice=notice)
+
+    @app.route("/docs")
+    def documentation():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        locale = _dashboard_locale(config)
+        return _html("Documentation", _documentation_body(locale, _build_info(config)), config=config)
+
     @app.route("/grants", methods=["GET", "POST"])
     def grants():
         admin = require_admin()
@@ -1996,6 +2586,10 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
                         replaced = False
                         for index, current in enumerate(bundle["grants"]):
                             if str(current.get("id")) == grant_id:
+                                if current.get("managed_by") == "access_package":
+                                    raise ValueError("grant {} is managed by access package {}; edit the package instead".format(
+                                        grant_id, current.get("package_name") or current.get("package_id")
+                                    ))
                                 bundle["grants"][index] = grant
                                 replaced = True
                                 break
@@ -2005,6 +2599,11 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
                         bundle["grants"].append(grant)
                 elif action == "grant_remove":
                     grant_id = str(request.form.get("id") or "").strip()
+                    current = next((row for row in bundle["grants"] if str(row.get("id")) == grant_id), None)
+                    if current and current.get("managed_by") == "access_package":
+                        raise ValueError("grant {} is managed by access package {}; unassign it through Access Packages".format(
+                            grant_id, current.get("package_name") or current.get("package_id")
+                        ))
                     before = len(bundle["grants"])
                     bundle["grants"] = [row for row in bundle["grants"] if str(row.get("id")) != grant_id]
                     if len(bundle["grants"]) == before:
@@ -2019,6 +2618,8 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
                     for grant in bundle["grants"]:
                         if str(grant.get("id")) not in grant_ids:
                             continue
+                        if grant.get("managed_by") == "access_package":
+                            raise ValueError("bulk editing package-managed grants is not allowed")
                         matched.add(str(grant.get("id")))
                         actions = set(grant.get("allowed_actions") or ["ssh"])
                         if mode == "add":
@@ -2078,7 +2679,12 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         edit_grant = get_grant_record(redis, request.args.get("edit_grant")) if request.args.get("edit_grant") else None
         edit_set = next((row for row in sets if row.get("name") == request.args.get("edit_set")), None)
         for row in grant_rows:
-            row["edit"] = '<a href="/grants?edit_grant={}">edit</a>'.format(urllib.parse.quote(str(row.get("id") or ""), safe=""))
+            if row.get("managed_by") == "access_package":
+                row["edit"] = '<a href="/packages/{}">managed package</a>'.format(
+                    urllib.parse.quote(str(row.get("package_id") or ""), safe="")
+                )
+            else:
+                row["edit"] = '<a href="/grants?edit_grant={}">edit</a>'.format(urllib.parse.quote(str(row.get("id") or ""), safe=""))
         for row in sets:
             row["edit"] = '<a href="/grants?edit_set={}">edit</a>'.format(urllib.parse.quote(str(row.get("name") or ""), safe=""))
         token = html.escape(csrf_token())

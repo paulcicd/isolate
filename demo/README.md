@@ -27,6 +27,15 @@ docker compose -f demo/docker-compose.yml --profile tools run --rm smoke
 docker compose -f demo/docker-compose.yml exec -T dashboard python3 /opt/auth/demo/smoke-dashboard.py
 ```
 
+Если стандартные host-порты заняты, задайте альтернативные внешние порты. Внутренние endpoints demo останутся прежними:
+
+```bash
+ISOLATE_DEMO_KEYCLOAK_PORT=28080 \
+ISOLATE_DEMO_DASHBOARD_PORT=28081 \
+ISOLATE_DEMO_SSH_PORT=12222 \
+docker compose -f demo/docker-compose.yml up -d --build
+```
+
 Первый build и старт Keycloak могут занять несколько минут. Состояние сервисов:
 
 ```bash
@@ -124,6 +133,10 @@ g 10002
 Откройте `http://localhost:18081` и войдите как `alice` / `demo123`. Только группа `Demo-DevOps` входит в `dashboard.admin_groups`; вход `bob` завершится `403`.
 
 В dashboard можно проверить:
+
+- `Access Packages`: reusable профили, назначения пользователям/группам/ролям, preview и rollback ревизий;
+- `Documentation`: практические примеры на английском и русском языках;
+- build metadata в sidebar и расширенную информацию о версии на странице документации;
 
 - inventory из пяти hosts, service metadata и VIP marker;
 - grants и project sets;

@@ -179,7 +179,8 @@ def _current_maps(redis):
     bundle = export_bundle(redis)
     grants_by_id = {str(row["id"]): row for row in bundle["grants"]}
     grants_by_identity = {
-        grant_identity(row): row for row in bundle["grants"] if not row.get("temporary")
+        grant_identity(row): row for row in bundle["grants"]
+        if not row.get("temporary") and row.get("managed_by") != "access_package"
     }
     sets_by_name = {row["name"]: row for row in bundle["project_sets"]}
     return grants_by_id, grants_by_identity, sets_by_name
@@ -198,6 +199,8 @@ def plan_bundle(redis, bundle, prune=False):
         desired_id = desired.get("id")
         current = current_by_id.get(str(desired_id)) if desired_id is not None else None
         if current is not None and current.get("temporary") and not desired.get("temporary"):
+            current = None
+        if current is not None and current.get("managed_by") == "access_package" and desired.get("managed_by") != "access_package":
             current = None
         if current is None:
             current = current_by_identity.get(grant_identity(desired))
@@ -221,11 +224,20 @@ def plan_bundle(redis, bundle, prune=False):
             changes["project_set_update"].append({"before": current, "after": desired})
 
     if prune:
+        protected_package_sets = {
+            str(row.get("project_set")) for row in current_by_id.values()
+            if row.get("managed_by") == "access_package" and row.get("project_set")
+        }
         changes["grant_remove"] = [
             row for grant_id, row in current_by_id.items()
-            if grant_id not in desired_grant_ids and not row.get("temporary")
+            if grant_id not in desired_grant_ids
+            and not row.get("temporary")
+            and row.get("managed_by") != "access_package"
         ]
-        changes["project_set_remove"] = [row for name, row in current_sets.items() if name not in desired_set_names]
+        changes["project_set_remove"] = [
+            row for name, row in current_sets.items()
+            if name not in desired_set_names and name not in protected_package_sets
+        ]
     return changes
 
 

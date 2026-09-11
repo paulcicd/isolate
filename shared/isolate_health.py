@@ -27,6 +27,7 @@ def validate_config(config, check_paths=False):
     keycloak = section("keycloak")
     logging_cfg = section("logging")
     dashboard = section("dashboard")
+    access_packages = section("access_packages")
     mcp = section("mcp")
     command_execution = section("command_execution")
     runbooks = section("runbooks")
@@ -102,6 +103,18 @@ def validate_config(config, check_paths=False):
             errors.append("dashboard.jobs_max_results must be greater than zero")
     except (TypeError, ValueError):
         errors.append("dashboard.jobs_max_results must be an integer")
+    if str(dashboard.get("default_locale") or "en").lower() not in ("en", "ru"):
+        errors.append("dashboard.default_locale must be en or ru")
+
+    if not isinstance(access_packages.get("enabled", True), bool):
+        errors.append("access_packages.enabled must be a boolean")
+    for name, default, maximum in (("max_rules", 50, 500), ("max_assignments_per_operation", 100, 1000)):
+        try:
+            value = int(access_packages.get(name, default))
+            if not 1 <= value <= maximum:
+                errors.append("access_packages.{} must be between 1 and {}".format(name, maximum))
+        except (TypeError, ValueError):
+            errors.append("access_packages.{} must be an integer".format(name))
 
     try:
         max_fleet_hosts = int(runbooks.get("max_fleet_hosts", 100))

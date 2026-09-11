@@ -41,6 +41,19 @@ from isolate_identity import (
 from isolate_history import HistoryAccessDenied, format_history_table, read_history
 from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, update_host
 from isolate_notifications import NotificationError, notify_access_event
+from isolate_packages import (
+    AccessPackageError,
+    assign_package,
+    create_package,
+    get_package,
+    list_assignments,
+    list_package_revisions,
+    list_packages,
+    preview_package_update,
+    rollback_package,
+    unassign_package,
+    update_package,
+)
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
 from isolate_health import run_health_checks, validate_config
 from isolate_policy_bundle import (
@@ -499,6 +512,222 @@ def _require_access_admin(config):
     return identity
 
 
+def _load_package_file(path):
+    if not path:
+        raise AccessPackageError("package file is required")
+    with open(path, "r", encoding="utf-8") as package_f:
+        text = package_f.read()
+    try:
+        if path.endswith(".json"):
+            payload = json.loads(text)
+        else:
+            import yaml
+
+            payload = yaml.safe_load(text)
+    except (ImportError, ValueError) as exc:
+        raise AccessPackageError("cannot parse package file: {}".format(exc)) from exc
+    if not isinstance(payload, dict):
+        raise AccessPackageError("package file must contain an object")
+    return payload
+
+
+def _package_admin(config):
+    if not config.get("access_packages", {}).get("enabled", True):
+        raise AccessPackageError("access packages are disabled")
+    return _require_access_admin(config)
+
+
+def _check_package_approval_admin(package, identity):
+    groups = set(identity.get("groups") or [])
+    allowed = set((package.get("approval") or {}).get("admin_groups") or [])
+    if allowed and not groups.intersection(allowed):
+        raise AccessPackageError("package assignment requires one of its approval admin groups")
+
+
+def cmd_package_list(args, config):
+    rows = list_packages(redis_client(config), status=args.status)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    print("id    status    rev  rules  name")
+    for row in rows:
+        print("{:<5} {:<9} {:<4} {:<6} {}".format(
+            row.get("id"), row.get("status"), row.get("revision"), len(row.get("access") or []), row.get("name")
+        ))
+
+
+def cmd_package_show(args, config):
+    try:
+        package = get_package(redis_client(config), args.package)
+    except AccessPackageError as exc:
+        print("package show failed: {}".format(exc), file=sys.stderr)
+        return 2
+    if package is None:
+        print("Access package not found: {}".format(args.package), file=sys.stderr)
+        return 2
+    print(json.dumps(package, indent=2, sort_keys=True))
+
+
+def cmd_package_create(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    try:
+        identity = _package_admin(config)
+        record = create_package(
+            redis_client(config),
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package create failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_package_preview(args, config):
+    try:
+        identity = _package_admin(config)
+        result = preview_package_update(
+            redis_client(config),
+            args.package,
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package preview failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_package_update(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package update requires --yes; run package preview first", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        package, assignments = update_package(
+            redis_client(config),
+            args.package,
+            _load_package_file(args.file),
+            actor=identity.get("username"),
+            expected_revision=args.expected_revision,
+            max_rules=config.get("access_packages", {}).get("max_rules", 50),
+        )
+    except (AccessDenied, IdentityError, OSError, AccessPackageError) as exc:
+        print("package update failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"package": package, "assignment_sync": assignments}, indent=2, sort_keys=True))
+
+
+def _package_subjects(args):
+    subjects = []
+    for subject in ("user", "group", "role"):
+        subjects.extend((subject, name) for name in (getattr(args, subject, None) or []))
+    if not subjects:
+        raise AccessPackageError("at least one --user, --group, or --role is required")
+    return subjects
+
+
+def cmd_package_assign(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package assign requires --yes", file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    try:
+        identity = _package_admin(config)
+        package = get_package(redis, args.package)
+        if package is None:
+            raise AccessPackageError("access package was not found")
+        _check_package_approval_admin(package, identity)
+        subjects = _package_subjects(args)
+        max_subjects = int(config.get("access_packages", {}).get("max_assignments_per_operation") or 100)
+        if len(subjects) > max_subjects:
+            raise AccessPackageError("assignment operation exceeds configured subject limit")
+        results = []
+        for subject, name in subjects:
+            assignment, changes = assign_package(
+                redis,
+                package["id"],
+                subject,
+                name,
+                actor=identity.get("username"),
+                ttl=args.ttl,
+                permanent=args.permanent,
+                ticket=args.ticket,
+            )
+            results.append({"assignment": assignment, "grant_changes": changes})
+    except (AccessDenied, IdentityError, ValueError, AccessPackageError) as exc:
+        print("package assign failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(results, indent=2, sort_keys=True))
+
+
+def cmd_package_assignments(args, config):
+    try:
+        rows = list_assignments(
+            redis_client(config),
+            package=args.package,
+            subject=args.subject,
+            name=args.name,
+            include_expired=args.all,
+        )
+    except AccessPackageError as exc:
+        print("package assignments failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def cmd_package_unassign(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package unassign requires --yes", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        assignment, deleted = unassign_package(redis_client(config), args.id, actor=identity.get("username"))
+    except (AccessDenied, IdentityError, AccessPackageError) as exc:
+        print("package unassign failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"assignment": assignment, "grants_deleted": deleted}, indent=2, sort_keys=True))
+
+
+def cmd_package_revisions(args, config):
+    try:
+        rows = list_package_revisions(redis_client(config), args.package)
+    except AccessPackageError as exc:
+        print("package revisions failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(rows, indent=2, sort_keys=True))
+
+
+def cmd_package_rollback(args, config):
+    if _manual_policy_mutation_blocked(config):
+        return 2
+    if not args.yes:
+        print("package rollback requires --yes", file=sys.stderr)
+        return 2
+    try:
+        identity = _package_admin(config)
+        package, assignments = rollback_package(
+            redis_client(config),
+            args.package,
+            args.revision,
+            actor=identity.get("username"),
+            expected_revision=args.expected_revision,
+        )
+    except (AccessDenied, IdentityError, AccessPackageError) as exc:
+        print("package rollback failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps({"package": package, "assignment_sync": assignments}, indent=2, sort_keys=True))
+
+
 def cmd_policy_add(args, config):
     if _manual_policy_mutation_blocked(config):
         return 2
@@ -755,6 +984,12 @@ def cmd_grant_revoke(args, config):
         return 2
     redis = redis_client(config)
     if args.id:
+        grant = get_grant_record(redis, args.id)
+        if grant and grant.get("managed_by") == "access_package":
+            print("Grant {} is managed by access package {}; unassign or update the package instead".format(
+                args.id, grant.get("package_name") or grant.get("package_id")
+            ), file=sys.stderr)
+            return 2
         deleted = redis.delete("grant_{}".format(args.id))
         print("Grants revoked: {}".format(deleted))
         return 0 if deleted else 2
@@ -765,6 +1000,7 @@ def cmd_grant_revoke(args, config):
         print(str(exc), file=sys.stderr)
         return 2
     deleted = 0
+    package_managed = 0
     for key in redis.keys("grant_*"):
         grant = json.loads(decode(redis.get(key)))
         if grant.get("subject") != subject or grant.get("name") != name:
@@ -777,8 +1013,13 @@ def cmd_grant_revoke(args, config):
             continue
         if args.host and grant.get("host") != args.host:
             continue
+        if grant.get("managed_by") == "access_package":
+            package_managed += 1
+            continue
         deleted += redis.delete(key)
     print("Grants revoked: {}".format(deleted))
+    if package_managed:
+        print("Package-managed grants skipped: {}; use isolate package unassign/update".format(package_managed), file=sys.stderr)
     return 0 if deleted else 2
 
 
@@ -803,6 +1044,11 @@ def cmd_grant_show(args, config):
     grant = get_grant_record(redis, args.id)
     if grant is None:
         print("Grant not found: {}".format(args.id), file=sys.stderr)
+        return 2
+    if grant.get("managed_by") == "access_package":
+        print("Grant {} is managed by access package {}; update the package instead".format(
+            args.id, grant.get("package_name") or grant.get("package_id")
+        ), file=sys.stderr)
         return 2
     print(json.dumps(grant, indent=2, sort_keys=True))
 
@@ -1477,6 +1723,70 @@ def build_parser():
     grant_explain.add_argument("--project")
     grant_explain.add_argument("--host")
     grant_explain.set_defaults(func=cmd_grant_explain)
+
+    package = sub.add_parser("package")
+    package_sub = package.add_subparsers(dest="package_command", required=True)
+
+    package_list = package_sub.add_parser("list")
+    package_list.add_argument("--status", choices=["enabled", "disabled"])
+    package_list.add_argument("--json", action="store_true")
+    package_list.set_defaults(func=cmd_package_list)
+
+    package_show = package_sub.add_parser("show")
+    package_show.add_argument("package")
+    package_show.set_defaults(func=cmd_package_show)
+
+    package_create = package_sub.add_parser("create")
+    package_create.add_argument("--file", required=True)
+    package_create.set_defaults(func=cmd_package_create)
+
+    package_preview = package_sub.add_parser("preview")
+    package_preview.add_argument("package")
+    package_preview.add_argument("--file", required=True)
+    package_preview.set_defaults(func=cmd_package_preview)
+
+    for command_name in ("update", "apply"):
+        package_update = package_sub.add_parser(command_name)
+        package_update.add_argument("package")
+        package_update.add_argument("--file", required=True)
+        package_update.add_argument("--expected-revision", type=int)
+        package_update.add_argument("--yes", action="store_true")
+        package_update.set_defaults(func=cmd_package_update)
+
+    package_assign = package_sub.add_parser("assign")
+    package_assign.add_argument("package")
+    package_assign.add_argument("--user", action="append")
+    package_assign.add_argument("--group", action="append")
+    package_assign.add_argument("--role", action="append")
+    package_assign.add_argument("--ticket")
+    duration = package_assign.add_mutually_exclusive_group()
+    duration.add_argument("--ttl")
+    duration.add_argument("--permanent", action="store_true")
+    package_assign.add_argument("--yes", action="store_true")
+    package_assign.set_defaults(func=cmd_package_assign)
+
+    package_assignments = package_sub.add_parser("assignments")
+    package_assignments.add_argument("--package")
+    package_assignments.add_argument("--subject", choices=["user", "group", "role"])
+    package_assignments.add_argument("--name")
+    package_assignments.add_argument("--all", action="store_true")
+    package_assignments.set_defaults(func=cmd_package_assignments)
+
+    package_unassign = package_sub.add_parser("unassign")
+    package_unassign.add_argument("--id", required=True)
+    package_unassign.add_argument("--yes", action="store_true")
+    package_unassign.set_defaults(func=cmd_package_unassign)
+
+    package_revisions = package_sub.add_parser("revisions")
+    package_revisions.add_argument("package")
+    package_revisions.set_defaults(func=cmd_package_revisions)
+
+    package_rollback = package_sub.add_parser("rollback")
+    package_rollback.add_argument("package")
+    package_rollback.add_argument("--revision", type=int, required=True)
+    package_rollback.add_argument("--expected-revision", type=int)
+    package_rollback.add_argument("--yes", action="store_true")
+    package_rollback.set_defaults(func=cmd_package_rollback)
 
     host = sub.add_parser("host")
     host_sub = host.add_subparsers(dest="host_command", required=True)
