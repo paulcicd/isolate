@@ -2475,6 +2475,31 @@ class SessionReplayTest(unittest.TestCase):
             self.assertEqual(replay["duration"], 0.5)
             self.assertEqual(replay["chunks"][0]["t"], 0.0)
             self.assertIn("whoami", replay["plain"])
+            self.assertIn("support", replay["readable"])
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    def test_replay_parses_timestamps_after_chunks_without_newlines(self):
+        tmpdir = os.path.join(ROOT, ".tmp-replay-inline-{}".format(uuid.uuid4().hex))
+        raw_path = os.path.join(tmpdir, "raw.log")
+        try:
+            os.makedirs(tmpdir)
+            with open(raw_path, "wb") as raw_f:
+                raw_f.write(
+                    b"1789368669.000000\ns"
+                    b"1789368669.100000\nu"
+                    b"1789368669.200000\nd"
+                    b"1789368669.300000\no\r\n"
+                    b"1789368670.000000\n\033]0;root@host\a\033[31mroot#\033[0m "
+                )
+
+            replay = parse_raw_replay(raw_path)
+
+            self.assertIsNone(replay["error"])
+            self.assertEqual(len(replay["chunks"]), 5)
+            self.assertEqual(replay["plain"], "sudo\r\n\033]0;root@host\a\033[31mroot#\033[0m ")
+            self.assertEqual(replay["readable"], "sudo\nroot# ")
+            self.assertNotIn("178936", replay["plain"])
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
 
@@ -2689,6 +2714,41 @@ class OperationsConvenienceFeaturesTest(unittest.TestCase):
 
 
 class DashboardTest(unittest.TestCase):
+    def test_users_page_formats_last_seen_timestamp(self):
+        tmpdir = os.path.join(ROOT, ".tmp-dashboard-users-{}".format(uuid.uuid4().hex))
+        try:
+            try:
+                app = isolate_web.create_app({
+                    "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                    "access": {"default_ttl": "2h", "max_ttl": "24h"},
+                    "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                    "logging": {"base_path": tmpdir},
+                })
+            except ImportError as exc:
+                self.skipTest(str(exc))
+            session_dir = os.path.join(tmpdir, "alice", "session-1")
+            os.makedirs(session_dir)
+            events = [{
+                "event": "ssh_start", "ts": 1789368648.795354, "username": "alice",
+                "connection_id": "conn-1", "session_id": "session-1",
+            }]
+            with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as session_f:
+                for event in events:
+                    session_f.write(json.dumps(event) + "\n")
+            app.config["TESTING"] = True
+            with mock.patch.object(isolate_web, "redis_client", return_value=FakeRedis()):
+                client = app.test_client()
+                with client.session_transaction() as sess:
+                    sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                response = client.get("/users")
+
+            text = response.get_data(as_text=True)
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(isolate_web._format_ts(1789368648.795354), text)
+            self.assertNotIn("1789368648.795354", text)
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
     def test_dashboard_admin_check(self):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
         self.assertTrue(is_dashboard_admin({"groups": ["DevOps"]}, config))
@@ -2990,6 +3050,8 @@ class DashboardTest(unittest.TestCase):
             self.assertIn("/replay/conn-1", details_text)
             self.assertIn("Commands", details_text)
             self.assertIn("whoami", details_text)
+            self.assertIn(isolate_web._format_ts(12.0), details_text)
+            self.assertNotIn(">12.0<", details_text)
 
             events = client.get("/session/conn-1/events.json")
             self.assertEqual(events.status_code, 200)
@@ -3002,7 +3064,7 @@ class DashboardTest(unittest.TestCase):
             replay_page = client.get("/replay/conn-1")
             replay_text = replay_page.get_data(as_text=True)
             self.assertIn('id="scrubber"', replay_text)
-            self.assertIn("Plain transcript", replay_text)
+            self.assertIn("Readable text", replay_text)
             self.assertIn("replay.json", replay_text)
             self.assertIn('/static/vendor/xterm/xterm.mjs', replay_text)
             static_response = client.get('/static/vendor/xterm/xterm.mjs')
@@ -3034,7 +3096,13 @@ class DashboardTest(unittest.TestCase):
                     "session_id": "session-1", "project": "prod", "host_id": "1", "raw_log_path": raw_path,
                 }) + "\n")
             redis = FakeRedis()
-            mark_session_start(redis, "conn-live", {"username": "alice", "project": "prod", "raw_log_path": raw_path})
+            redis.set("server_1", json.dumps({
+                "server_id": "1", "project_name": "prod", "server_name": "api-primary",
+                "server_ip": "10.0.0.1", "server_port": "22", "server_user": "support",
+            }))
+            mark_session_start(redis, "conn-live", {
+                "username": "alice", "project": "prod", "host_id": "1", "raw_log_path": raw_path,
+            })
             app.config["TESTING"] = True
             with mock.patch.object(isolate_web, "redis_client", return_value=redis):
                 client = app.test_client()
@@ -3046,6 +3114,10 @@ class DashboardTest(unittest.TestCase):
                 self.assertIn("active", live.get_json()["plain"])
                 page = client.get("/session/conn-live/live").get_data(as_text=True)
                 self.assertIn("xterm.mjs", page)
+                self.assertIn("Readable text", page)
+                active_page = client.get("/sessions/active").get_data(as_text=True)
+                self.assertIn("api-primary", active_page)
+                self.assertIn("host name", active_page)
                 response = client.post("/sessions/conn-live/terminate", data={
                     "csrf_token": "csrf", "confirm": "true", "reason": "security incident",
                 })

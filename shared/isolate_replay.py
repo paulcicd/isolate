@@ -9,7 +9,27 @@ import re
 from isolate_history import _load_events, _row_from_events
 
 
-TIMESTAMP_RE = re.compile(r"(?m)^(\d+\.\d{6})\r?\n")
+# The wrapper prefixes every PTY read with a timestamp. A read does not have to
+# end with a newline, so the next timestamp can immediately follow its payload.
+TIMESTAMP_RE = re.compile(r"(?<![\d.])(\d{4,12}\.\d{6})\r?\n")
+OSC_RE = re.compile(r"\x1b\].*?(?:\x07|\x1b\\)", re.DOTALL)
+CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def readable_terminal_text(text):
+    """Return a best-effort text view while keeping xterm replay authoritative."""
+    text = OSC_RE.sub("", str(text or ""))
+    text = CSI_RE.sub("", text)
+    output = []
+    for char in text:
+        if char == "\b":
+            if output and output[-1] != "\n":
+                output.pop()
+        elif char == "\r":
+            continue
+        elif char in ("\n", "\t") or ord(char) >= 32:
+            output.append(char)
+    return "".join(output)
 
 
 def _iter_session_files(base_path):
@@ -75,7 +95,7 @@ def _safe_raw_log_path(session_path, candidate):
 
 def parse_raw_replay(raw_log_path, max_bytes=None, tail=False):
     if not raw_log_path or not os.path.exists(raw_log_path):
-        return {"duration": 0, "chunks": [], "plain": "", "error": "raw log not found"}
+        return {"duration": 0, "chunks": [], "plain": "", "readable": "", "error": "raw log not found"}
     try:
         with open(raw_log_path, "rb") as raw_f:
             if tail and max_bytes:
@@ -84,11 +104,17 @@ def parse_raw_replay(raw_log_path, max_bytes=None, tail=False):
             data = raw_f.read(int(max_bytes)) if max_bytes else raw_f.read()
             text = data.decode("utf-8", errors="replace")
     except OSError as exc:
-        return {"duration": 0, "chunks": [], "plain": "", "error": str(exc)}
+        return {"duration": 0, "chunks": [], "plain": "", "readable": "", "error": str(exc)}
 
     matches = list(TIMESTAMP_RE.finditer(text))
     if not matches:
-        return {"duration": 0, "chunks": [], "plain": text, "error": "raw log does not contain replay timestamps"}
+        return {
+            "duration": 0,
+            "chunks": [],
+            "plain": text,
+            "readable": readable_terminal_text(text),
+            "error": "raw log does not contain replay timestamps",
+        }
 
     chunks = []
     first_ts = None
@@ -103,7 +129,14 @@ def parse_raw_replay(raw_log_path, max_bytes=None, tail=False):
         end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
         chunks.append({"t": round(ts - first_ts, 6), "data": text[start:end]})
     duration = chunks[-1]["t"] if chunks else 0
-    return {"duration": duration, "chunks": chunks, "plain": "".join(chunk["data"] for chunk in chunks), "error": None}
+    plain = "".join(chunk["data"] for chunk in chunks)
+    return {
+        "duration": duration,
+        "chunks": chunks,
+        "plain": plain,
+        "readable": readable_terminal_text(plain),
+        "error": None,
+    }
 
 
 def events_json(events):

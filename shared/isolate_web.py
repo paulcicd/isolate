@@ -1687,10 +1687,16 @@ def create_app(config=None):
         admin = require_admin()
         if not isinstance(admin, dict):
             return admin
-        rows = list_active_sessions(redis_client(config))
+        redis = redis_client(config)
+        rows = list_active_sessions(redis)
         token = csrf_token()
         termination_enabled = config.get("session_control", {}).get("terminate_enabled", False)
         for row in rows:
+            if not row.get("server_name") and row.get("host_id"):
+                host_record = get_host(redis, row.get("host_id"))
+                if host_record is not None:
+                    row["server_name"] = host_record.get("server_name")
+            row["started"] = _format_ts(row.get("started_at"))
             connection_id = html.escape(str(row.get("connection_id") or ""))
             username = str(row.get("username") or "")
             row["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
@@ -1704,8 +1710,8 @@ def create_app(config=None):
   <button type="submit">Terminate</button>
 </form>""".format(connection_id=connection_id, token=html.escape(token))
         return _html("Active Sessions", "<h1>Active Sessions</h1>" + _table(rows, [
-            ("started_at", "started"), ("duration_seconds", "duration_s"), ("user_link", "user"),
-            ("project", "project"), ("host_id", "host"), ("target_host", "target"),
+            ("started", "started"), ("duration_seconds", "duration_s"), ("user_link", "user"),
+            ("project", "project"), ("host_id", "host"), ("server_name", "host name"), ("target_host", "target"),
             ("remote_user", "remote_user"), ("connection_id", "connection_id"), ("live", "view"), ("control", "control")
         ]), config=config)
 
@@ -2093,6 +2099,13 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
         if details is None:
             abort(404)
         summary = details.get("summary") or {}
+        if not summary.get("server_name") and summary.get("host_id"):
+            try:
+                host_record = get_host(redis_client(config), summary.get("host_id"))
+            except Exception:
+                host_record = None
+            if host_record is not None:
+                summary["server_name"] = host_record.get("server_name")
         raw_link = ""
         replay_link = ""
         replay_json_link = ""
@@ -2112,7 +2125,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             replay_json_link = '<a href="/replay/{}.json">replay.json</a>'.format(html.escape(str(connection_id)))
         summary_rows = [
             {"key": key, "value": summary.get(key)}
-            for key in ("time", "username", "project", "host_id", "target", "remote_user", "result", "connection_id", "session_id")
+            for key in ("time", "username", "project", "host_id", "server_name", "target", "remote_user", "result", "connection_id", "session_id")
         ]
         event_rows = []
         command_rows = []
@@ -2120,7 +2133,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             if event.get("event") == "command":
                 command_rows.append(
                     {
-                        "ts": event.get("ts"),
+                        "time": _format_ts(event.get("ts")),
                         "cwd": event.get("cwd"),
                         "command": event.get("command"),
                         "exit_code": event.get("exit_code"),
@@ -2130,7 +2143,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
                 continue
             event_rows.append(
                 {
-                    "ts": event.get("ts"),
+                    "time": _format_ts(event.get("ts")),
                     "event": event.get("event"),
                     "project": event.get("project"),
                     "host_id": event.get("host_id"),
@@ -2143,10 +2156,10 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
         body += "<h2>Summary</h2>" + _table(summary_rows, [("key", "field"), ("value", "value")])
         if command_rows:
             body += "<h2>Commands</h2>" + _table(command_rows, [
-                ("ts", "ts"), ("cwd", "cwd"), ("command", "command"), ("exit_code", "exit"), ("shell", "shell")
+                ("time", "time"), ("cwd", "cwd"), ("command", "command"), ("exit_code", "exit"), ("shell", "shell")
             ])
         body += "<h2>Timeline</h2>" + _table(event_rows, [
-            ("ts", "ts"), ("event", "event"), ("project", "project"), ("host_id", "host"),
+            ("time", "time"), ("event", "event"), ("project", "project"), ("host_id", "host"),
             ("remote_user", "remote_user"), ("exit_code", "exit")
         ])
         return _html("Session Details", body, config=config)
@@ -2187,6 +2200,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             "duration": replay_data.get("duration"),
             "chunks": replay_data.get("chunks") or [],
             "plain": replay_data.get("plain") or "",
+            "readable": replay_data.get("readable") or "",
             "error": replay_data.get("error"),
         })
 
@@ -2198,19 +2212,28 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
         connection_id_safe = html.escape(str(connection_id))
         body = """
 <h1>Live Session</h1>
-<p><a href="/session/{connection_id}">details</a> <span id="state">loading</span></p>
+<p><a href="/session/{connection_id}">details</a> <span id="state">loading</span>
+  <label><input type="checkbox" id="readableToggle"> Readable text</label></p>
 <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 <div id="terminal" style="background:#111;padding:12px;height:70vh;"></div>
+<pre id="readable" style="display:none;max-height:70vh;overflow:auto;"></pre>
 <script type="module">
 import {{ Terminal }} from "/static/vendor/xterm/xterm.mjs";
 const terminal = new Terminal({{rows: 50, cols: 180, scrollback: 5000, disableStdin: true, convertEol: false, theme: {{background: "#111111"}}}});
 terminal.open(document.getElementById("terminal"));
+const terminalElement = document.getElementById("terminal");
+const readableElement = document.getElementById("readable");
+document.getElementById("readableToggle").onchange = (event) => {{
+  terminalElement.style.display = event.target.checked ? "none" : "block";
+  readableElement.style.display = event.target.checked ? "block" : "none";
+}};
 async function refreshLive() {{
   const response = await fetch("/session/{connection_id}/live.json", {{cache: "no-store"}});
   if (!response.ok) {{ document.getElementById("state").textContent = "unavailable"; return; }}
   const data = await response.json();
   terminal.reset();
   terminal.write((data.chunks || []).map(chunk => chunk.data).join("") || data.plain || "");
+  readableElement.textContent = data.readable || data.plain || "";
   document.getElementById("state").textContent = data.active ? "active" : "completed";
   if (data.active) setTimeout(refreshLive, 2000);
 }}
@@ -2243,7 +2266,7 @@ refreshLive();
         if details is None:
             abort(404)
         replay_data = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
-        plain = html.escape(replay_data.get("plain") or "")
+        readable = html.escape(replay_data.get("readable") or replay_data.get("plain") or "")
         error = replay_data.get("error")
         default_speed = html.escape(str(config.get("replay", {}).get("default_speed", 1)))
         body = """
@@ -2254,13 +2277,13 @@ refreshLive();
   <button id="pause">Pause</button>
   <button id="reset">Reset</button>
   <select id="speed"><option value="0.5">0.5x</option><option value="1">1x</option><option value="2">2x</option><option value="5">5x</option></select>
-  <label><input type="checkbox" id="plainToggle"> Plain transcript</label>
+  <label><input type="checkbox" id="plainToggle"> Readable text</label>
   <span id="clock">0.00 / 0.00</span>
 </p>
 <input id="scrubber" type="range" min="0" max="0" step="0.01" value="0" style="width:100%;">
 <link rel="stylesheet" href="/static/vendor/xterm/xterm.css">
 <div id="terminal" class="terminal" style="background:#111;padding:12px;height:62vh;"></div>
-<pre id="fallback" style="display:none;">{plain}</pre>
+<pre id="fallback" style="display:none;max-height:62vh;overflow:auto;">{readable}</pre>
 <script type="module">
 import {{ Terminal }} from "/static/vendor/xterm/xterm.mjs";
 let chunks = [];
@@ -2321,7 +2344,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
   if (!chunks.length) {{ terminalElement.style.display = "none"; fallback.style.display = "block"; }}
 }});
 </script>
-""".format(connection_id=html.escape(str(connection_id)), plain=plain, default_speed=default_speed)
+""".format(connection_id=html.escape(str(connection_id)), readable=readable, default_speed=default_speed)
         if error:
             body = '<div class="notice warning">{}</div>'.format(html.escape(str(error))) + body
         return _html("Session Replay", body, config=config)
@@ -2439,9 +2462,10 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
             profile["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
             profile["active"] = "yes" if username in active_users else ""
             profile["groups_display"] = ", ".join(profile.get("groups") or [])
+            profile["last_seen_display"] = _format_ts(profile.get("last_seen"))
         export_links = '<p><a href="/export/users?format=csv">Download CSV</a> &middot; <a href="/export/users?format=json">Download JSON</a></p>'
         return _html("Users", "<h1>Users</h1>" + export_links + _table(profiles, [
-            ("user_link", "user"), ("groups_display", "groups"), ("last_seen", "last_seen"),
+            ("user_link", "user"), ("groups_display", "groups"), ("last_seen_display", "last_seen"),
             ("connection_count", "connections"), ("active", "active"),
         ]), config=config)
 

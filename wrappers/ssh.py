@@ -368,7 +368,9 @@ def _redis_client(config):
 def run_command(argv, raw_log_path, audit, metadata, config=None):
 
     LOGGER.debug(argv)
-    audit.event("ssh_start", argv=argv, raw_log_path=raw_log_path, **metadata)
+    metadata = dict(metadata)
+    metadata["raw_log_path"] = raw_log_path
+    audit.event("ssh_start", argv=argv, **metadata)
     started = time.time()
     redis = None
     control_state = {"checked_at": 0.0, "heartbeat_at": 0.0, "terminated": False}
@@ -377,7 +379,6 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
         try:
             redis = _redis_client(config)
             metadata["wrapper_pid"] = os.getpid()
-            metadata["raw_log_path"] = raw_log_path
             record = mark_session_start(
                 redis,
                 metadata["connection_id"],
@@ -447,7 +448,12 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
         msg = 'Exit code: {1}{0}{2}'.format(exit_code, term_colors['red'], term_colors['reset'])
         msg = '\n  {0}\n'.format(msg)
         LOGGER.warning(msg)
-    audit.event("ssh_end", exit_code=exit_code, duration=round(time.time() - started, 3), raw_log_path=raw_log_path, **metadata)
+    audit.event(
+        "ssh_end",
+        exit_code=exit_code,
+        duration=round(time.time() - started, 3),
+        **metadata
+    )
     if redis is not None and metadata.get("connection_id"):
         try:
             mark_session_end(redis, metadata["connection_id"], exit_code=exit_code)
