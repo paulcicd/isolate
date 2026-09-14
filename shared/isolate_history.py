@@ -5,6 +5,7 @@
 import datetime
 import json
 import os
+from collections import Counter
 
 
 class HistoryAccessDenied(Exception):
@@ -204,3 +205,42 @@ def list_user_profiles(base_path):
     for username, profile in profiles.items():
         profile["connection_count"] = len(connections.get(username) or set())
     return sorted(profiles.values(), key=lambda row: row.get("last_seen") or 0, reverse=True)
+
+
+def user_activity_summary(base_path, username, limit=10, active_sessions=None, grants=None, access_requests=None):
+    """Build a compact activity view from existing audit and authorization data."""
+    identity = {"username": str(username), "groups": ["__activity_reader__"]}
+    rows = read_history(
+        base_path,
+        identity,
+        user=str(username),
+        limit=max(1, int(limit)),
+        admin_groups=["__activity_reader__"],
+    )
+    profiles = {row.get("username"): row for row in list_user_profiles(base_path)}
+    profile = profiles.get(str(username), {
+        "username": str(username), "groups": [], "roles": [], "connection_count": 0, "last_seen": 0,
+    })
+    project_counts = Counter(str(row.get("project") or "unknown") for row in rows)
+    failed = sum(1 for row in rows if str(row.get("result") or "").startswith("exit=") and row.get("result") != "exit=0")
+    active = [row for row in (active_sessions or []) if row.get("username") == username]
+    subject_pairs = {("user", str(username))}
+    subject_pairs.update(("group", group) for group in profile.get("groups") or [])
+    subject_pairs.update(("role", role) for role in profile.get("roles") or [])
+    effective_grants = [row for row in (grants or []) if (row.get("subject"), row.get("name")) in subject_pairs]
+    requests = [row for row in (access_requests or []) if row.get("requester") == username]
+    return {
+        "profile": profile,
+        "metrics": {
+            "connections": int(profile.get("connection_count") or len(rows)),
+            "recent_failures": failed,
+            "active_sessions": len(active),
+            "grant_candidates": len(effective_grants),
+            "access_requests": len(requests),
+        },
+        "top_projects": [{"project": name, "connections": count} for name, count in project_counts.most_common(5)],
+        "recent_sessions": rows,
+        "active_sessions": active,
+        "grants": effective_grants,
+        "access_requests": sorted(requests, key=lambda row: int(row.get("created_at") or 0), reverse=True)[:10],
+    }

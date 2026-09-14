@@ -137,8 +137,10 @@ g 10002
 - `Access Packages`: reusable профили, назначения пользователям/группам/ролям, preview и rollback ревизий;
 - `Documentation`: практические примеры на английском и русском языках;
 - build metadata в sidebar и расширенную информацию о версии на странице документации;
-
 - inventory из пяти hosts, service metadata и VIP marker;
+- maintenance state и cached connectivity status в inventory;
+- operational announcements, отображаемые также в `s/g`;
+- CSV/JSON exports и расширенную activity-страницу пользователя;
 - grants и project sets;
 - policy simulator;
 - активные и завершённые sessions;

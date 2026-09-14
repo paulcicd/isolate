@@ -28,8 +28,11 @@ from isolate_identity import (
     save_identity,
     save_token_cache,
 )
-from isolate_history import HistoryAccessDenied, read_history
-from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, format_hosts_table, get_host, list_hosts, update_host
+from isolate_history import HistoryAccessDenied, read_history, user_activity_summary
+from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, format_hosts_table, get_host, is_host_in_maintenance, list_hosts, update_host
+from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
+from isolate_connectivity import check_host, get_last_check, save_check
+from isolate_exports import flatten_access_matrix, render_export
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, matching_grants, resolve_grant, resolve_policy
 from isolate_replay import find_session, parse_raw_replay
@@ -2601,6 +2604,90 @@ class SessionReplayTest(unittest.TestCase):
                 session_f.write("{}\n".format(json.dumps(event, sort_keys=True)))
 
 
+class OperationsConvenienceFeaturesTest(unittest.TestCase):
+    def test_maintenance_is_compatible_and_expires_automatically(self):
+        redis = FakeRedis()
+        redis.set("server_10001", json.dumps({
+            "server_id": 10001, "project_name": "prod", "server_name": "api",
+            "server_ip": "192.0.2.10", "server_user": "support",
+        }))
+        legacy = get_host(redis, "10001")
+        self.assertFalse(legacy["maintenance_active"])
+        updated = update_host(redis, "10001", {
+            "maintenance_enabled": True, "maintenance_until": 4102444800, "maintenance_reason": "CHG-100",
+        }, updated_by="admin")
+        self.assertTrue(is_host_in_maintenance(updated, now=1000))
+        self.assertFalse(is_host_in_maintenance(updated, now=4102444801))
+        self.assertEqual(updated["maintenance_marker"], "MAINT")
+
+    def test_announcements_are_scoped_active_and_removable(self):
+        redis = FakeRedis()
+        global_notice = create_announcement(redis, "Global notice", "admin", expires_at=2000)
+        project_notice = create_announcement(redis, "Payments maintenance", "admin", project="payments", severity="warning", expires_at=2000)
+        create_announcement(redis, "Other project", "admin", project="search", expires_at=2000)
+        rows = list_announcements(redis, project="payments", host="10001", active_only=True, now=1000)
+        self.assertEqual({row["id"] for row in rows}, {global_notice["id"], project_notice["id"]})
+        self.assertEqual(delete_announcement(redis, project_notice["id"])["deleted"], True)
+        with self.assertRaises(AnnouncementError):
+            create_announcement(redis, "", "admin")
+
+    def test_connectivity_check_is_non_interactive_and_cached(self):
+        redis = FakeRedis()
+        connection = SimpleNamespace(close=lambda: None)
+        completed = SimpleNamespace(returncode=0, stdout=b"", stderr=b"")
+        host = {"server_id": "10001", "project_name": "prod", "server_name": "api", "server_ip": "192.0.2.10", "server_port": 22, "server_user": "support"}
+        runner = mock.Mock(return_value=completed)
+        result = check_host(
+            host, {"ssh": {"binary": "/usr/bin/ssh"}}, timeout=2, ssh_auth=True,
+            connector=mock.Mock(return_value=connection),
+            resolver=mock.Mock(return_value=[(None, None, None, None, ("192.0.2.10", 22))]), runner=runner,
+        )
+        self.assertTrue(result["ok"])
+        argv = runner.call_args.args[0]
+        self.assertIn("BatchMode=yes", argv)
+        self.assertEqual(argv[-2:], ["support@192.0.2.10", "true"])
+        save_check(redis, result, ttl=600)
+        self.assertEqual(get_last_check(redis, "10001")["ssh"], "ok")
+
+    def test_json_csv_and_matrix_exports_preserve_structured_values(self):
+        rows = [{"id": "1", "groups": ["DevOps", "DBA"], "note": "hello,world"}]
+        csv_text, csv_type = render_export(rows, "csv")
+        json_text, json_type = render_export(rows, "json")
+        self.assertEqual(csv_type, "text/csv")
+        self.assertIn('"[""DevOps"", ""DBA""]"', csv_text)
+        self.assertIn("hello,world", csv_text)
+        self.assertEqual(json_type, "application/json")
+        self.assertEqual(json.loads(json_text)[0]["groups"], ["DevOps", "DBA"])
+        flat = flatten_access_matrix({
+            "projects": ["prod"],
+            "rows": [{"subject": "group", "name": "DevOps", "cells": {"prod": {"state": "allowed", "allowed_hosts": 1, "total_hosts": 1, "remote_users": ["support"], "sudo_modes": ["none"], "actions": ["ssh"]}}}],
+        })
+        self.assertEqual(flat[0]["remote_users"], ["support"])
+
+    def test_user_activity_summary_joins_audit_and_access_data(self):
+        tmpdir = tempfile.mkdtemp(prefix="isolate-activity-")
+        try:
+            session_dir = os.path.join(tmpdir, "demo.alex", "session-1")
+            os.makedirs(session_dir)
+            events = [
+                {"event": "policy_selected", "ts": 1000, "username": "demo.alex", "groups": ["DevOps"], "project": "prod", "host_id": "10001", "connection_id": "conn-1"},
+                {"event": "ssh_end", "ts": 1001, "username": "demo.alex", "project": "prod", "host_id": "10001", "connection_id": "conn-1", "exit_code": 1},
+            ]
+            with open(os.path.join(session_dir, "session.jsonl"), "w", encoding="utf-8") as output:
+                for event in events:
+                    output.write(json.dumps(event) + "\n")
+            result = user_activity_summary(
+                tmpdir, "demo.alex", active_sessions=[{"username": "demo.alex"}],
+                grants=[{"subject": "group", "name": "DevOps"}], access_requests=[{"requester": "demo.alex", "created_at": 1}],
+            )
+            self.assertEqual(result["metrics"]["connections"], 1)
+            self.assertEqual(result["metrics"]["recent_failures"], 1)
+            self.assertEqual(result["metrics"]["active_sessions"], 1)
+            self.assertEqual(result["top_projects"][0]["project"], "prod")
+        finally:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 class DashboardTest(unittest.TestCase):
     def test_dashboard_admin_check(self):
         config = {"dashboard": {"admin_groups": ["DevOps"]}}
@@ -3075,6 +3162,46 @@ class DashboardTest(unittest.TestCase):
             self.assertIn("Blast radius preview", preview.get_data(as_text=True))
         finally:
             shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+    def test_dashboard_announcements_exports_and_maintenance_inventory(self):
+        try:
+            app = isolate_web.create_app({
+                "dashboard": {"admin_groups": ["DevOps"], "public_url": "http://bastion.example.org"},
+                "access": {"admin_groups": ["DevOps"]},
+                "announcements": {"enabled": True, "max_active": 10},
+                "connectivity": {"default_timeout": 1, "result_ttl": 600},
+                "keycloak": {"issuer": "http://keycloak", "client_id": "isolate"},
+                "logging": {"base_path": "/tmp/no-history"},
+            })
+        except ImportError as exc:
+            self.skipTest(str(exc))
+        redis = FakeRedis()
+        redis.set("server_10001", json.dumps({
+            "server_id": 10001, "project_name": "prod", "server_name": "api", "server_ip": "192.0.2.10",
+            "server_port": 22, "server_user": "support", "maintenance_enabled": True,
+            "maintenance_until": 4102444800, "maintenance_reason": "CHG-100",
+        }))
+        app.config["TESTING"] = True
+        with mock.patch.object(isolate_web, "redis_client", return_value=redis):
+            client = app.test_client()
+            with client.session_transaction() as sess:
+                sess["identity"] = {"username": "admin", "groups": ["DevOps"]}
+                sess["csrf_token"] = "csrf"
+            created = client.post("/announcements", data={
+                "csrf_token": "csrf", "action": "add", "confirm": "true", "text": "Deploy window",
+                "project": "prod", "severity": "warning", "ttl": "2h",
+            })
+            inventory = client.get("/inventory")
+            csv_export = client.get("/export/inventory?format=csv")
+            json_export = client.get("/export/inventory?format=json")
+        self.assertEqual(created.status_code, 200)
+        self.assertIn("Deploy window", created.get_data(as_text=True))
+        self.assertIn("MAINT", inventory.get_data(as_text=True))
+        self.assertIn("CHG-100", inventory.get_data(as_text=True))
+        self.assertEqual(csv_export.status_code, 200)
+        self.assertIn("attachment; filename=isolate-inventory.csv", csv_export.headers["Content-Disposition"])
+        self.assertEqual(json.loads(json_export.get_data(as_text=True))[0]["server_id"], "10001")
 
 
 class NotificationTest(unittest.TestCase):

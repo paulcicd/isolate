@@ -38,6 +38,20 @@ build:
   version: 2.1.0-demo
   revision: demo-source
 
+maintenance:
+  enforce: true
+  bypass_groups:
+    - OS-admin
+
+connectivity:
+  default_timeout: 3
+  max_hosts_per_check: 100
+  result_ttl: 3600
+
+announcements:
+  enabled: true
+  max_active: 100
+
 access_packages:
   enabled: true
   max_rules: 50

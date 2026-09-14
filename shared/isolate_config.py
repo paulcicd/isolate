@@ -76,6 +76,19 @@ DEFAULT_CONFIG = {
         "default_limit": 10,
         "max_limit": 100,
     },
+    "maintenance": {
+        "enforce": True,
+        "bypass_groups": [],
+    },
+    "connectivity": {
+        "default_timeout": 3,
+        "max_hosts_per_check": 100,
+        "result_ttl": 3600,
+    },
+    "announcements": {
+        "enabled": True,
+        "max_active": 100,
+    },
     "access": {
         "admin_groups": [],
         "default_ttl": "2h",
@@ -242,6 +255,7 @@ DEFAULT_CONFIG = {
             "job_*",
             "dashboard_alert_state_*",
             "access_package_*",
+            "announcement_*",
             "ssh_config_*",
             "complete_hosts_*",
             "offset_*",

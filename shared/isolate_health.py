@@ -33,6 +33,9 @@ def validate_config(config, check_paths=False):
     runbooks = section("runbooks")
     command_audit = section("command_audit")
     session_control = section("session_control")
+    maintenance = section("maintenance")
+    connectivity = section("connectivity")
+    announcements = section("announcements")
     policy_as_code = section("policy_as_code")
     backup = section("backup")
 
@@ -105,6 +108,27 @@ def validate_config(config, check_paths=False):
         errors.append("dashboard.jobs_max_results must be an integer")
     if str(dashboard.get("default_locale") or "en").lower() not in ("en", "ru"):
         errors.append("dashboard.default_locale must be en or ru")
+
+    if not isinstance(maintenance.get("enforce", True), bool):
+        errors.append("maintenance.enforce must be a boolean")
+    if not isinstance(maintenance.get("bypass_groups", []), list):
+        errors.append("maintenance.bypass_groups must be a list")
+    for name, default, minimum, maximum in (
+        ("default_timeout", 3, 1, 30), ("max_hosts_per_check", 100, 1, 1000), ("result_ttl", 3600, 60, 86400),
+    ):
+        try:
+            value = int(connectivity.get(name, default))
+            if not minimum <= value <= maximum:
+                errors.append("connectivity.{} must be between {} and {}".format(name, minimum, maximum))
+        except (TypeError, ValueError):
+            errors.append("connectivity.{} must be an integer".format(name))
+    if not isinstance(announcements.get("enabled", True), bool):
+        errors.append("announcements.enabled must be a boolean")
+    try:
+        if not 1 <= int(announcements.get("max_active", 100)) <= 1000:
+            errors.append("announcements.max_active must be between 1 and 1000")
+    except (TypeError, ValueError):
+        errors.append("announcements.max_active must be an integer")
 
     if not isinstance(access_packages.get("enabled", True), bool):
         errors.append("access_packages.enabled must be a boolean")

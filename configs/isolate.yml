@@ -42,6 +42,20 @@ build:
   revision: null
   built_at: null
 
+maintenance:
+  # Connections to hosts in maintenance are denied unless the verified identity belongs to a bypass group.
+  enforce: true
+  bypass_groups: []
+
+connectivity:
+  default_timeout: 3
+  max_hosts_per_check: 100
+  result_ttl: 3600
+
+announcements:
+  enabled: true
+  max_active: 100
+
 access_packages:
   enabled: true
   max_rules: 50
@@ -217,6 +231,7 @@ backup:
     - job_*
     - dashboard_alert_state_*
     - access_package_*
+    - announcement_*
     - ssh_config_*
     - complete_hosts_*
     - offset_*

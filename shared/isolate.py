@@ -10,6 +10,8 @@ import os
 import sys
 import time
 
+from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
+
 from isolate_access import (
     AccessDenied,
     approve_access_request,
@@ -38,8 +40,10 @@ from isolate_identity import (
     refresh_jwks_cache,
     save_token_cache,
 )
-from isolate_history import HistoryAccessDenied, format_history_table, read_history
+from isolate_history import HistoryAccessDenied, format_history_table, is_history_admin, list_user_profiles, read_history, user_activity_summary
 from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, update_host
+from isolate_connectivity import ConnectivityError, check_host, get_last_check, save_check
+from isolate_exports import ExportError, flatten_access_matrix, render_export
 from isolate_notifications import NotificationError, notify_access_event
 from isolate_packages import (
     AccessPackageError,
@@ -69,7 +73,8 @@ from isolate_policy_bundle import (
 )
 from isolate_gitops import create_approval_attestation, GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, sync_git_policy
 from isolate_redis import create_redis_client
-from isolate_sessions import SessionControlError, get_session, request_session_termination
+from isolate_sessions import SessionControlError, get_session, list_active_sessions, request_session_termination
+from isolate_dashboard_data import build_access_matrix
 
 
 def redis_client(config):
@@ -1167,6 +1172,9 @@ def cmd_host_update(args, config):
         "privileged_access_url": args.privileged_url,
         "privileged_access_hint": args.privileged_hint,
         "proxy_id": args.proxy_id,
+        "maintenance_enabled": getattr(args, "maintenance", None),
+        "maintenance_until": getattr(args, "maintenance_until", None),
+        "maintenance_reason": getattr(args, "maintenance_reason", None),
     }
     try:
         host = update_host(redis, args.server_id, updates, updated_by=os.getenv("USER") or os.getenv("USERNAME"))
@@ -1177,6 +1185,181 @@ def cmd_host_update(args, config):
         print("Host not found: {}".format(args.server_id), file=sys.stderr)
         return 2
     print(json.dumps(host, indent=2, sort_keys=True))
+
+
+def cmd_host_maintenance(args, config):
+    redis = redis_client(config)
+    host = get_host(redis, args.server_id)
+    if host is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    if args.clear:
+        updates = {"maintenance_enabled": False, "maintenance_until": None, "maintenance_reason": ""}
+    else:
+        if not args.reason:
+            print("host maintenance failed: --reason is required", file=sys.stderr)
+            return 2
+        try:
+            until = int(time.time()) + parse_duration(args.until) if args.until else None
+        except ValueError as exc:
+            print("host maintenance failed: {}".format(exc), file=sys.stderr)
+            return 2
+        updates = {"maintenance_enabled": True, "maintenance_until": until, "maintenance_reason": args.reason}
+    try:
+        result = update_host(redis, args.server_id, updates, updated_by=_effective_username())
+    except (HostValidationError, ValueError) as exc:
+        print("host maintenance failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def cmd_host_check(args, config):
+    redis = redis_client(config)
+    if not args.server_id and not args.project:
+        print("host check failed: server_id or --project is required", file=sys.stderr)
+        return 2
+    if args.server_id and args.project:
+        print("host check failed: use either server_id or --project", file=sys.stderr)
+        return 2
+    rows = [get_host(redis, args.server_id)] if args.server_id else list_hosts(redis, project=args.project)
+    rows = [row for row in rows if row is not None]
+    if not rows:
+        print("No hosts found", file=sys.stderr)
+        return 2
+    max_hosts = int(config.get("connectivity", {}).get("max_hosts_per_check", 100))
+    if len(rows) > max_hosts:
+        print("host check refused: {} hosts exceeds configured maximum {}".format(len(rows), max_hosts), file=sys.stderr)
+        return 2
+    results = []
+    for host in rows:
+        try:
+            result = check_host(
+                host, config, timeout=args.timeout or config.get("connectivity", {}).get("default_timeout", 3),
+                ssh_auth=args.ssh, remote_user=args.user,
+            )
+            save_check(redis, result, ttl=config.get("connectivity", {}).get("result_ttl", 3600))
+            results.append(result)
+        except (ConnectivityError, ValueError) as exc:
+            results.append({"host_id": str(host.get("server_id") or ""), "ok": False, "error": str(exc)})
+    if args.json:
+        print(json.dumps(results, indent=2, sort_keys=True))
+    else:
+        print("host    tcp     ssh          duration  error")
+        for row in results:
+            print("{:<7} {:<7} {:<12} {:<9} {}".format(
+                row.get("host_id") or "", row.get("tcp") or "failed", row.get("ssh") or "not-checked",
+                "{}ms".format(row.get("duration_ms") or 0), row.get("error") or "",
+            ))
+    return 0 if all(row.get("ok") for row in results) else 2
+
+
+def cmd_announcement_list(args, config):
+    rows = list_announcements(redis_client(config), project=args.project, host=args.host, active_only=args.active)
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print("id    severity  project          host      expires       text")
+        for row in rows:
+            print("{:<5} {:<9} {:<16} {:<9} {:<13} {}".format(
+                row.get("id"), row.get("severity"), row.get("project") or "*", row.get("host") or "*",
+                row.get("expires_at") or "never", row.get("text"),
+            ))
+
+
+def cmd_announcement_add(args, config):
+    try:
+        if not config.get("announcements", {}).get("enabled", True):
+            raise AnnouncementError("announcements are disabled")
+        identity = _require_access_admin(config)
+        redis = redis_client(config)
+        if len(list_announcements(redis, active_only=True)) >= int(config.get("announcements", {}).get("max_active", 100)):
+            raise AnnouncementError("active announcement limit reached")
+        expires_at = int(time.time()) + parse_duration(args.ttl) if args.ttl else None
+        record = create_announcement(
+            redis, args.text, identity.get("username"), project=args.project, host=args.host,
+            severity=args.severity, expires_at=expires_at,
+        )
+    except (AccessDenied, IdentityError, AnnouncementError, ValueError) as exc:
+        print("announcement add failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_announcement_remove(args, config):
+    try:
+        _require_access_admin(config)
+        result = delete_announcement(redis_client(config), args.id)
+    except (AccessDenied, IdentityError, AnnouncementError) as exc:
+        print("announcement remove failed: {}".format(exc), file=sys.stderr)
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+def _export_rows(kind, args, config):
+    redis = redis_client(config)
+    if kind == "inventory":
+        return list_hosts(redis, project=args.project, query=args.query)
+    if kind == "grants":
+        return list_grant_records(redis, project=args.project)
+    if kind == "users":
+        return list_user_profiles(config["logging"]["base_path"])
+    if kind == "history":
+        identity = load_verified_identity(config)
+        return read_history(
+            config["logging"]["base_path"], identity, query=args.query, user=args.user, project=args.project,
+            host=args.host, limit=min(args.limit, int(config.get("history", {}).get("max_limit", 100))),
+            admin_groups=config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+        )
+    if kind == "access-matrix":
+        matrix = build_access_matrix(load_grants(redis), load_project_sets(redis), list_hosts(redis), defaults={**config.get("policy", {}), **config.get("ssh", {})})
+        return flatten_access_matrix(matrix)
+    raise ExportError("unknown export kind: {}".format(kind))
+
+
+def cmd_export(args, config):
+    try:
+        rows = _export_rows(args.kind, args, config)
+        content, _ = render_export(rows, args.format)
+        if args.output == "-":
+            sys.stdout.write(content)
+        else:
+            _write_private_file(args.output, content)
+            print("Exported {} rows to {}".format(len(rows), args.output))
+    except (ExportError, IdentityError, HistoryAccessDenied, OSError, ValueError) as exc:
+        print("export failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_user_activity(args, config):
+    try:
+        identity = load_verified_identity(config)
+    except IdentityError as exc:
+        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
+        return 2
+    username = args.username or identity.get("username")
+    admin_groups = config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or []
+    if username != identity.get("username") and not is_history_admin(identity, admin_groups):
+        print("user activity denied: other users are visible only to admins", file=sys.stderr)
+        return 2
+    redis = redis_client(config)
+    result = user_activity_summary(
+        config["logging"]["base_path"], username, limit=args.limit,
+        active_sessions=list_active_sessions(redis), grants=list_grant_records(redis),
+        access_requests=list_access_requests(redis),
+    )
+    if args.json:
+        print(json.dumps(result, indent=2, sort_keys=True))
+        return 0
+    metrics = result["metrics"]
+    print("User: {}".format(username))
+    print("Connections: {}  Active: {}  Recent failures: {}  Grants: {}  Requests: {}".format(
+        metrics["connections"], metrics["active_sessions"], metrics["recent_failures"],
+        metrics["grant_candidates"], metrics["access_requests"],
+    ))
+    if result["top_projects"]:
+        print("Top projects: {}".format(", ".join("{} ({})".format(row["project"], row["connections"]) for row in result["top_projects"])))
+    if result["recent_sessions"]:
+        print(format_history_table(result["recent_sessions"]))
 
 
 def cmd_grant_explain(args, config):
@@ -1815,7 +1998,27 @@ def build_parser():
     host_update.add_argument("--privileged-url")
     host_update.add_argument("--privileged-hint")
     host_update.add_argument("--proxy-id")
+    host_update.add_argument("--maintenance", type=_str2bool)
+    host_update.add_argument("--maintenance-until", type=int)
+    host_update.add_argument("--maintenance-reason")
     host_update.set_defaults(func=cmd_host_update)
+
+    host_maintenance = host_sub.add_parser("maintenance")
+    host_maintenance.add_argument("server_id")
+    maintenance_action = host_maintenance.add_mutually_exclusive_group(required=True)
+    maintenance_action.add_argument("--until", help="duration such as 30m, 2h, or 1d")
+    maintenance_action.add_argument("--clear", action="store_true")
+    host_maintenance.add_argument("--reason")
+    host_maintenance.set_defaults(func=cmd_host_maintenance)
+
+    host_check = host_sub.add_parser("check")
+    host_check.add_argument("server_id", nargs="?")
+    host_check.add_argument("--project")
+    host_check.add_argument("--timeout", type=int)
+    host_check.add_argument("--ssh", action="store_true", help="also perform non-interactive public-key authentication")
+    host_check.add_argument("--user", help="remote user for --ssh")
+    host_check.add_argument("--json", action="store_true")
+    host_check.set_defaults(func=cmd_host_check)
 
     session = sub.add_parser("session")
     session_sub = session.add_subparsers(dest="session_command", required=True)
@@ -1838,6 +2041,44 @@ def build_parser():
     history.add_argument("--limit", type=int)
     history.add_argument("--json", action="store_true")
     history.set_defaults(func=cmd_history)
+
+    export = sub.add_parser("export")
+    export.add_argument("kind", choices=["inventory", "grants", "history", "users", "access-matrix"])
+    export.add_argument("--format", choices=["json", "csv"], default="json")
+    export.add_argument("--output", default="-")
+    export.add_argument("--project")
+    export.add_argument("--host")
+    export.add_argument("--user")
+    export.add_argument("--query")
+    export.add_argument("--limit", type=int, default=100)
+    export.set_defaults(func=cmd_export)
+
+    announcement = sub.add_parser("announcement")
+    announcement_sub = announcement.add_subparsers(dest="announcement_command", required=True)
+    announcement_list = announcement_sub.add_parser("list")
+    announcement_list.add_argument("--project")
+    announcement_list.add_argument("--host")
+    announcement_list.add_argument("--active", action="store_true")
+    announcement_list.add_argument("--json", action="store_true")
+    announcement_list.set_defaults(func=cmd_announcement_list)
+    announcement_add = announcement_sub.add_parser("add")
+    announcement_add.add_argument("--text", required=True)
+    announcement_add.add_argument("--project")
+    announcement_add.add_argument("--host")
+    announcement_add.add_argument("--severity", choices=["info", "warning", "critical"], default="info")
+    announcement_add.add_argument("--ttl")
+    announcement_add.set_defaults(func=cmd_announcement_add)
+    announcement_remove = announcement_sub.add_parser("remove")
+    announcement_remove.add_argument("--id", required=True)
+    announcement_remove.set_defaults(func=cmd_announcement_remove)
+
+    user = sub.add_parser("user")
+    user_sub = user.add_subparsers(dest="user_command", required=True)
+    user_activity = user_sub.add_parser("activity")
+    user_activity.add_argument("username", nargs="?")
+    user_activity.add_argument("--limit", type=int, default=10)
+    user_activity.add_argument("--json", action="store_true")
+    user_activity.set_defaults(func=cmd_user_activity)
 
     command_log = sub.add_parser("command-log")
     command_log_sub = command_log.add_subparsers(dest="command_log_command", required=True)

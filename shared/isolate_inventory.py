@@ -41,7 +41,19 @@ def normalize_host(host):
     row["privileged_access_provider"] = str(row.get("privileged_access_provider") or "").strip()
     row["privileged_access_url"] = str(row.get("privileged_access_url") or "").strip()
     row["privileged_access_hint"] = str(row.get("privileged_access_hint") or "").strip()
+    row["maintenance_enabled"] = bool(row.get("maintenance_enabled"))
+    row["maintenance_until"] = int(row.get("maintenance_until") or 0) or None
+    row["maintenance_reason"] = str(row.get("maintenance_reason") or "").strip()
+    row["maintenance_active"] = is_host_in_maintenance(row)
+    row["maintenance_marker"] = "MAINT" if row["maintenance_active"] else ""
     return row
+
+
+def is_host_in_maintenance(host, now=None):
+    if not bool((host or {}).get("maintenance_enabled")):
+        return False
+    until = int((host or {}).get("maintenance_until") or 0)
+    return not until or until > int(now if now is not None else time.time())
 
 
 def host_revision(host):
@@ -94,6 +106,8 @@ def host_matches_query(host, query):
         "privileged_access_provider",
         "privileged_access_url",
         "privileged_access_hint",
+        "maintenance_marker",
+        "maintenance_reason",
     )
     return any(query_l in str(host.get(field) or "").lower() for field in fields)
 
@@ -139,6 +153,18 @@ def validate_host_updates(redis, updates):
         if len(note) > 2048:
             raise HostValidationError("note value is too long")
         normalized["server_note"] = note
+    if updates.get("maintenance_enabled") is not None:
+        normalized["maintenance_enabled"] = bool(updates["maintenance_enabled"])
+    if updates.get("maintenance_until") is not None:
+        until = int(updates["maintenance_until"] or 0)
+        if until < 0:
+            raise HostValidationError("maintenance until must be a Unix timestamp or zero")
+        normalized["maintenance_until"] = until or None
+    if updates.get("maintenance_reason") is not None:
+        reason = str(updates["maintenance_reason"] or "").strip()
+        if len(reason) > 1024:
+            raise HostValidationError("maintenance reason is too long")
+        normalized["maintenance_reason"] = reason
     for source, target in (
         ("privileged_access_provider", "privileged_access_provider"),
         ("privileged_access_url", "privileged_access_url"),
@@ -231,6 +257,9 @@ def create_host(redis, values, updated_by=None):
         "privileged_access_provider": normalized.get("privileged_access_provider", ""),
         "privileged_access_url": normalized.get("privileged_access_url", ""),
         "privileged_access_hint": normalized.get("privileged_access_hint", ""),
+        "maintenance_enabled": normalized.get("maintenance_enabled", False),
+        "maintenance_until": normalized.get("maintenance_until"),
+        "maintenance_reason": normalized.get("maintenance_reason", ""),
         "proxy_id": normalized.get("proxy_id"),
         "geoip_asn": None,
         "updated_by": updated_by or "unknown",
@@ -249,6 +278,7 @@ def format_hosts_table(rows):
         ("server_ip", "ip", 16),
         ("server_name", "name", 20),
         ("server_vip_marker", "vip", 4),
+        ("maintenance_marker", "state", 6),
         ("server_user", "user", 12),
         ("server_services", "services", 32),
     ]

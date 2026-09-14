@@ -19,6 +19,8 @@ from isolate_config import load_config
 from isolate_identity import IdentityError, load_verified_identity, local_identity
 from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
+from isolate_announcements import list_announcements
+from isolate_inventory import is_host_in_maintenance
 
 
 LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
@@ -197,6 +199,9 @@ class IsolateRedisHosts(object):
             project_set = json.loads(project_set_data)
             project_sets[project_set['name']] = project_set
         return project_sets
+
+    def get_announcements(self):
+        return list_announcements(self.redis, active_only=True)
 
     def put_projects_list(self):
         self.redis.set('projects_list', ' '.join(self.projects))
@@ -391,6 +396,26 @@ class ServerConnection(object):
 
     def start(self):
         self._validate()
+        host_meta = self.search_results[0] if len(self.search_results) == 1 else {}
+        self.helper.print_announcements([host_meta])
+        bypass_groups = set(self.helper.config.get("maintenance", {}).get("bypass_groups") or [])
+        identity_groups = set(self.helper.identity.get("groups") or [])
+        if (
+            self.helper.config.get("maintenance", {}).get("enforce", True)
+            and is_host_in_maintenance(host_meta)
+            and not bypass_groups.intersection(identity_groups)
+        ):
+            reason = host_meta.get("maintenance_reason") or "scheduled maintenance"
+            until = host_meta.get("maintenance_until")
+            self.helper.audit.event(
+                "maintenance_denied", project=host_meta.get("project_name"), host_id=host_meta.get("server_id"),
+                reason=reason, maintenance_until=until,
+            )
+            self.helper.print_p("Connection denied: host is in maintenance mode.", stderr=True)
+            self.helper.print_p("Reason: {}".format(reason), stderr=True)
+            if until:
+                self.helper.print_p("Maintenance until: {}".format(until), stderr=True)
+            sys.exit(2)
         try:
             self.resolve()
         except PolicyDenied as exc:
@@ -573,7 +598,7 @@ class AuthHelper(object):
         self.ISOLATE_COLORS = str2bool(os.getenv('ISOLATE_COLORS', False))
 
         # Search Print Line: fields names and order, not template
-        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker server_services').strip().split(' ')
+        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker maintenance_marker server_services').strip().split(' ')
 
     def _load_data(self):
         self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
@@ -759,8 +784,39 @@ class AuthHelper(object):
         host['server_services'] = host.get('server_services') or ''
         host['server_note'] = host.get('server_note') or ''
         host['server_vip_marker'] = 'VIP' if host.get('server_vip') else ''
+        host['maintenance_marker'] = 'MAINT' if is_host_in_maintenance(host) else ''
 
         return host
+
+    def print_announcements(self, hosts=None):
+        if not self.config.get('announcements', {}).get('enabled', True):
+            return
+        if not hasattr(self.db, 'get_announcements'):
+            return
+        hosts = [host for host in (hosts or []) if host]
+        rows = []
+        seen = set()
+        for record in self.db.get_announcements():
+            scoped_project = record.get('project')
+            scoped_host = str(record.get('host') or '')
+            if hosts:
+                if not any(
+                    (not scoped_project or scoped_project == host.get('project_name'))
+                    and (not scoped_host or scoped_host == str(host.get('server_id') or ''))
+                    for host in hosts
+                ):
+                    continue
+            elif scoped_project or scoped_host:
+                continue
+            if record.get('id') in seen:
+                continue
+            seen.add(record.get('id'))
+            rows.append(record)
+        if not rows:
+            return
+        self.print_p('\nAnnouncements:')
+        for record in rows:
+            self.print_p('  [{}] {}'.format(str(record.get('severity') or 'info').upper(), record.get('text')))
 
     def print_hosts(self, hosts, **kwargs):
         title = kwargs.get('title', True)  # Print project title by default
@@ -868,6 +924,7 @@ def main():
             search_results = helper.search(' '.join(args.sargs))
 
         helper.print_hosts(search_results)
+        helper.print_announcements(search_results)
 
     elif args.action[0] == 'go':
 

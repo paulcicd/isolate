@@ -12,12 +12,15 @@ import urllib.parse
 from isolate import get_grant_record, list_grant_records, load_grants, load_project_sets, redis_client, update_grant_record
 from isolate_audit import prepare_and_dispatch
 from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, set_notification_status
+from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
 from isolate_build import get_build_info
 from isolate_config import load_config
-from isolate_history import list_user_profiles, read_history
+from isolate_history import list_user_profiles, read_history, user_activity_summary
 from isolate_health import run_health_checks
 from isolate_identity import normalize_claims
 from isolate_inventory import HostValidationError, bulk_update_hosts, create_host, get_host, list_hosts, update_host
+from isolate_connectivity import ConnectivityError, check_host, get_last_check, save_check
+from isolate_exports import ExportError, flatten_access_matrix, render_export
 from isolate_dashboard_data import (
     DashboardDataError,
     build_access_matrix,
@@ -542,7 +545,7 @@ _THEME_BOOTSTRAP_SCRIPT = """
 _SHELL_I18N = {
     "en": {
         "operations": "Operations", "summary": "Summary", "jobs": "Jobs & runbooks", "alerts": "Alert center",
-        "active_sessions": "Active sessions", "history": "History", "inventory": "Inventory",
+        "active_sessions": "Active sessions", "history": "History", "inventory": "Inventory", "announcements": "Announcements",
         "access_control": "Access control", "requests": "Requests", "grants": "Grants", "packages": "Access packages",
         "matrix": "Access matrix", "simulator": "Policy simulator", "platform": "Platform", "gitops": "GitOps",
         "users": "Users", "notifications": "Notifications", "documentation": "Documentation", "sign_out": "Sign out",
@@ -552,7 +555,7 @@ _SHELL_I18N = {
     },
     "ru": {
         "operations": "Операции", "summary": "Обзор", "jobs": "Задачи и ранбуки", "alerts": "Центр алертов",
-        "active_sessions": "Активные сессии", "history": "История", "inventory": "Инвентарь",
+        "active_sessions": "Активные сессии", "history": "История", "inventory": "Инвентарь", "announcements": "Объявления",
         "access_control": "Управление доступом", "requests": "Запросы", "grants": "Гранты", "packages": "Пакеты доступа",
         "matrix": "Матрица доступа", "simulator": "Симулятор политик", "platform": "Платформа", "gitops": "GitOps",
         "users": "Пользователи", "notifications": "Уведомления", "documentation": "Документация", "sign_out": "Выйти",
@@ -595,6 +598,10 @@ _PAGE_HELP = {
     "Inventory": {
         "en": "Browse bastion-managed hosts, service metadata, VIP markers, and privileged access guidance. Host changes are audited.",
         "ru": "Просматривайте серверы, сервисы, VIP-метки и инструкции по привилегированному доступу. Изменения аудируются.",
+    },
+    "Announcements": {
+        "en": "Publish time-limited operational notices globally or for a project or host. Notices appear in terminal search and before connection.",
+        "ru": "Публикуйте временные операционные уведомления глобально, для проекта или сервера. Они отображаются в поиске и перед подключением.",
     },
     "Session Details": {
         "en": "Inspect one connection's identity, policy decision, commands, timestamps, exit status, raw log, and replay artifacts.",
@@ -664,6 +671,8 @@ _FIELD_HELP = {
         "revision": "Immutable package revision used for rollback.", "permanent": "Create an assignment without expiration when the package permits it.",
         "ip": "Target IPv4/IPv6 address or validated hostname.", "port": "Target SSH port.",
         "services": "Free-form searchable service inventory.", "note": "Short operational note shown in inventory.",
+        "maintenance_reason": "Reason shown while new connections are paused.", "maintenance_until": "Unix timestamp when maintenance expires; empty means no deadline.",
+        "severity": "Visual priority of an operational announcement.",
         "policy_action": "Capability evaluated by the production policy resolver.", "confirm": "Explicitly acknowledge this audited mutation.",
     },
     "ru": {
@@ -686,6 +695,8 @@ _FIELD_HELP = {
         "revision": "Неизменяемая ревизия пакета для rollback.", "permanent": "Назначение без срока, если это разрешено пакетом.",
         "ip": "IPv4/IPv6 или валидированное имя целевого сервера.", "port": "SSH-порт целевого сервера.",
         "services": "Свободное searchable-описание сервисов.", "note": "Краткая операционная заметка в inventory.",
+        "maintenance_reason": "Причина приостановки новых подключений.", "maintenance_until": "Unix timestamp завершения maintenance; пусто означает без срока.",
+        "severity": "Визуальный приоритет операционного объявления.",
         "policy_action": "Действие, проверяемое production policy resolver.", "confirm": "Явное подтверждение аудируемого изменения.",
     },
 }
@@ -782,7 +793,7 @@ def _html(title, body, config=None, notice=None):
     </a>
     <nav class="primary-nav" aria-label="{primary_nav}">
       <div class="nav-section"><span class="nav-label">{operations}</span>
-        <a class="nav-link" href="/">{summary}</a><a class="nav-link" href="/jobs">{jobs}</a><a class="nav-link" href="/alerts">{alerts}</a><a class="nav-link" href="/sessions/active">{active_sessions}</a><a class="nav-link" href="/history">{history}</a><a class="nav-link" href="/inventory">{inventory}</a>
+        <a class="nav-link" href="/">{summary}</a><a class="nav-link" href="/jobs">{jobs}</a><a class="nav-link" href="/alerts">{alerts}</a><a class="nav-link" href="/sessions/active">{active_sessions}</a><a class="nav-link" href="/history">{history}</a><a class="nav-link" href="/inventory">{inventory}</a><a class="nav-link" href="/announcements">{announcements}</a>
       </div>
       <div class="nav-section"><span class="nav-label">{access_control}</span>
         <a class="nav-link" href="/access">{requests}</a><a class="nav-link" href="/grants">{grants}</a><a class="nav-link" href="/packages">{packages}</a><a class="nav-link" href="/policy/matrix">{matrix}</a><a class="nav-link" href="/policy/simulate">{simulator}</a>
@@ -944,7 +955,10 @@ g 10703</pre>
 <p>Project объединяет серверы. Host содержит адрес, имя, remote user по умолчанию, сервисы, заметку и optional VIP/privileged access hint. Поиск <code>s</code> видит только разрешённые policy серверы; <code>g</code> подключается только после точного host match.</p>
 <pre>isolate host list --project payments-prod
 isolate host show 10703
-isolate host update 10703 --services "nginx, redis" --note "API frontend"</pre>"""),
+isolate host update 10703 --services "nginx, redis" --note "API frontend"
+isolate host maintenance 10703 --until 2h --reason "CHG-1042"
+isolate host check 10703 --ssh</pre>
+<p>Maintenance mode блокирует новые подключения, но не завершает активные сессии. Группы обхода задаются явно в config.</p>"""),
             ("policy", "Project sets и grants", """
 <p>Project set объединяет exact projects и glob patterns. Grant связывает user/group/role с selector, remote user, sudo mode и allowed actions. Без matching grant доступ закрыт.</p>
 <pre>isolate project-set add prod-apps --project payments-prod --project-glob '*-stage'
@@ -965,7 +979,11 @@ isolate package rollback "Support Read-Only" --revision 1 --yes</pre>
 isolate access approve --id 42 --ttl 2h --comment "Approved for incident window"</pre>"""),
             ("operations", "Сессии, jobs и аудит", """
 <p>History и Session Details показывают policy decision, целевой host, remote user, JSONL events и raw terminal transcript. Replay восстанавливается из raw log. Structured command events появляются только после установки target shell hooks.</p>
-<p>Jobs &amp; Runbooks запускает заранее проверенные операции по одному серверу или fleet. Произвольные команды должны включаться отдельно и ограничиваться grants, scopes, allowlist и подтверждением.</p>"""),
+<p>Jobs &amp; Runbooks запускает заранее проверенные операции по одному серверу или fleet. Произвольные команды должны включаться отдельно и ограничиваться grants, scopes, allowlist и подтверждением.</p>
+<pre>isolate announcement add --project payments-prod --severity warning --ttl 2h --text "Deploy window"
+isolate user activity demo.alex
+isolate export history --format csv --output history.csv</pre>
+<p>Announcements видны в <code>s</code> и перед <code>g</code>. Inventory, History, Users и Access Matrix поддерживают выгрузки CSV/JSON.</p>"""),
             ("lifecycle", "Backup, GitOps и обновление", """
 <p>Перед релизом создайте service backup и проверьте health. GitOps для grants/project sets остаётся opt-in; при <code>enforce_git</code> ручные policy mutations блокируются.</p>
 <pre>sudo /opt/auth/scripts/isolate-backup.sh create
@@ -990,7 +1008,10 @@ g 10703</pre>
 <p>A project groups hosts. A host stores its address, name, default remote user, services, notes, and optional VIP or privileged-access guidance. <code>s</code> returns only policy-visible hosts; <code>g</code> connects only after an exact host match.</p>
 <pre>isolate host list --project payments-prod
 isolate host show 10703
-isolate host update 10703 --services "nginx, redis" --note "API frontend"</pre>"""),
+isolate host update 10703 --services "nginx, redis" --note "API frontend"
+isolate host maintenance 10703 --until 2h --reason "CHG-1042"
+isolate host check 10703 --ssh</pre>
+<p>Maintenance mode blocks new connections without terminating active sessions. Bypass groups must be configured explicitly.</p>"""),
             ("policy", "Project sets and grants", """
 <p>A project set combines exact projects and glob patterns. A grant maps a user, group, or role to a selector, remote user, sudo mode, and allowed actions. Access is denied without a matching grant.</p>
 <pre>isolate project-set add prod-apps --project payments-prod --project-glob '*-stage'
@@ -1011,7 +1032,11 @@ isolate package rollback "Support Read-Only" --revision 1 --yes</pre>
 isolate access approve --id 42 --ttl 2h --comment "Approved for incident window"</pre>"""),
             ("operations", "Sessions, jobs, and audit", """
 <p>History and Session Details expose policy decisions, target host, remote user, JSONL events, and raw terminal transcripts. Replay is generated from raw logs. Structured commands appear only when target shell hooks are installed.</p>
-<p>Jobs &amp; Runbooks executes reviewed operations on one host or a fleet. Arbitrary commands remain separately gated by grants, scopes, allowlists, and confirmation.</p>"""),
+<p>Jobs &amp; Runbooks executes reviewed operations on one host or a fleet. Arbitrary commands remain separately gated by grants, scopes, allowlists, and confirmation.</p>
+<pre>isolate announcement add --project payments-prod --severity warning --ttl 2h --text "Deploy window"
+isolate user activity demo.alex
+isolate export history --format csv --output history.csv</pre>
+<p>Announcements appear in <code>s</code> and before <code>g</code>. Inventory, History, Users, and Access Matrix provide CSV/JSON downloads.</p>"""),
             ("lifecycle", "Backup, GitOps, and updates", """
 <p>Create a service backup and verify health before a release. GitOps for grants and project sets is opt-in; <code>enforce_git</code> blocks manual policy mutations.</p>
 <pre>sudo /opt/auth/scripts/isolate-backup.sh create
@@ -1048,13 +1073,15 @@ def _host_form_values(form, partial=False):
         "privileged_url": "privileged_access_url",
         "privileged_hint": "privileged_access_hint",
         "proxy_id": "proxy_id",
+        "maintenance_until": "maintenance_until",
+        "maintenance_reason": "maintenance_reason",
     }
     result = {}
     for source, target in mapping.items():
         value = form.get(source)
         if value not in (None, "") or (not partial and source in form):
             result[target] = value
-    for source, target in (("vip", "server_vip"), ("nosudo", "server_nosudo")):
+    for source, target in (("vip", "server_vip"), ("nosudo", "server_nosudo"), ("maintenance", "maintenance_enabled")):
         value = _optional_bool(form.get(source))
         if value is not None:
             result[target] = value
@@ -1063,7 +1090,7 @@ def _host_form_values(form, partial=False):
 
 def create_app(config=None):
     from authlib.integrations.flask_client import OAuth
-    from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
+    from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
 
     config = config or load_config()
     app = Flask(__name__)
@@ -1259,6 +1286,7 @@ def create_app(config=None):
         redis = redis_client(config)
         active = list_active_sessions(redis)
         pending = list_access_requests(redis, status="pending")
+        notices = list_announcements(redis, active_only=True)
         recent = read_history(config["logging"]["base_path"], admin, limit=10, admin_groups=config.get("dashboard", {}).get("admin_groups") or [])
         body = """
 <h1>Operations Overview</h1>
@@ -1267,8 +1295,9 @@ def create_app(config=None):
 <div class="metric"><strong>{}</strong><span class="muted">active sessions</span><br><a class="metric-link" href="/sessions/active">Review sessions</a></div>
 <div class="metric"><strong>{}</strong><span class="muted">pending access requests</span><br><a class="metric-link" href="/access?status=pending">Review requests</a></div>
 <div class="metric"><strong>{}</strong><span class="muted">recent connections</span><br><a class="metric-link" href="/history">Open history</a></div>
+<div class="metric"><strong>{}</strong><span class="muted">active announcements</span><br><a class="metric-link" href="/announcements?active=1">Review notices</a></div>
 </div>
-""".format(len(active), len(pending), len(recent))
+""".format(len(active), len(pending), len(recent), len(notices))
         body += '<div class="section-heading"><h2>Recent Activity</h2><a href="/history">View all history</a></div>'
         if recent:
             recent_rows = []
@@ -1619,6 +1648,7 @@ def create_app(config=None):
                 ))
             matrix_rows += "<tr>{}</tr>".format("".join(cells))
         body = """<h1>Access Matrix</h1><p class="page-lead">Effective group, role, and user access across projects, calculated with the production policy resolver.</p>
+<p><a href="/export/access-matrix?format=csv">Download CSV</a> &middot; <a href="/export/access-matrix?format=json">Download JSON</a></p>
 <form class="inline" method="get"><input name="subject" value="{subject_query}" placeholder="group or user"><select name="project"><option value="">all projects</option>{project_options}</select><button>Filter</button></form>
 <div class="matrix-wrap"><table class="matrix"><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table></div>""".format(
             subject_query=html.escape(request.args.get("subject", "")),
@@ -1729,11 +1759,47 @@ def create_app(config=None):
                     urllib.parse.quote(str(row.get("username") or ""), safe=""),
                     urllib.parse.quote(str(row.get("connection_id") or row.get("session_id") or ""), safe=""),
                 )
-        return _html("History", "<h1>History</h1>" + _table(rows, [
+        export_links = '<p><a href="/export/history?format=csv">Download CSV</a> &middot; <a href="/export/history?format=json">Download JSON</a></p>'
+        return _html("History", "<h1>History</h1>" + export_links + _table(rows, [
             ("time", "time"), ("user_link", "user"), ("project", "project"), ("host_id", "host"),
             ("server_name", "host name"), ("target", "target"), ("remote_user", "remote_user"),
             ("result", "result"), ("details", "details"), ("raw", "raw")
         ]), config=config)
+
+    @app.route("/export/<kind>")
+    def export_data(kind):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        output_format = request.args.get("format", "csv")
+        if kind == "inventory":
+            rows = list_hosts(redis, project=request.args.get("project"), query=request.args.get("q"))
+        elif kind == "grants":
+            rows = list_grant_records(redis, project=request.args.get("project"))
+        elif kind == "users":
+            rows = list_user_profiles(config["logging"]["base_path"])
+        elif kind == "history":
+            rows = read_history(
+                config["logging"]["base_path"], admin, query=request.args.get("q"), user=request.args.get("user"),
+                project=request.args.get("project"), host=request.args.get("host"), limit=min(int(request.args.get("limit", 100)), 1000),
+                admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
+            )
+        elif kind == "access-matrix":
+            matrix = build_access_matrix(
+                load_grants(redis), load_project_sets(redis), list_hosts(redis),
+                defaults={**config.get("policy", {}), **config.get("ssh", {})},
+            )
+            rows = flatten_access_matrix(matrix)
+        else:
+            abort(404)
+        try:
+            content, mimetype = render_export(rows, output_format)
+        except ExportError:
+            abort(400)
+        response = Response(content, mimetype=mimetype)
+        response.headers["Content-Disposition"] = "attachment; filename=isolate-{}.{}".format(kind, output_format)
+        return response
 
     @app.route("/access", methods=["GET", "POST"])
     def access():
@@ -1829,9 +1895,17 @@ def create_app(config=None):
                     changed = [str(host_id) for host_id in host_ids]
                     notice = {"level": "info", "text": "Updated hosts: {}".format(", ".join(changed))}
                     audit_admin("host_bulk_update", admin, "applied", {"host_ids": changed, "count": len(changed)})
+                elif action == "connectivity_check":
+                    host = get_host(redis, request.form.get("host_id"))
+                    if host is None:
+                        raise ValueError("host not found")
+                    result = check_host(host, config, timeout=config.get("connectivity", {}).get("default_timeout", 3))
+                    save_check(redis, result, ttl=config.get("connectivity", {}).get("result_ttl", 3600))
+                    notice = {"level": "info" if result.get("ok") else "warning", "text": "Host {}: {}".format(host.get("server_id"), "reachable" if result.get("ok") else result.get("error"))}
+                    audit_admin("host_connectivity_check", admin, "completed", {"host_id": host.get("server_id"), "ok": result.get("ok")})
                 else:
                     raise ValueError("unknown inventory action")
-            except (HostValidationError, ValueError) as exc:
+            except (ConnectivityError, HostValidationError, ValueError) as exc:
                 audit_admin("inventory_mutation", admin, "denied", {"action": action})
                 notice = {"level": "error", "text": str(exc)}
         project = request.args.get("project") or None
@@ -1844,8 +1918,12 @@ def create_app(config=None):
             )
             row["history"] = '<a href="/history?host={}">history</a>'.format(html.escape(str(row.get("server_id") or "")))
             row["details"] = '<a href="/inventory/{}/edit">edit</a>'.format(html.escape(str(row.get("server_id") or "")))
+            last_check = get_last_check(redis, row.get("server_id"))
+            row["connectivity"] = "unknown" if not last_check else ("reachable" if last_check.get("ok") else "failed")
+            row["control"] = '<form method="post" class="inline"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="action" value="connectivity_check"><input type="hidden" name="host_id" value="{}"><input type="hidden" name="confirm" value="true"><button type="submit">Check</button></form>'.format(html.escape(csrf_token()), html.escape(str(row.get("server_id") or "")))
         body = """
 <h1>Inventory</h1>
+<p><a href="/export/inventory?format=csv">Download CSV</a> &middot; <a href="/export/inventory?format=json">Download JSON</a></p>
 <form method="get">
   <input name="project" value="{project}" placeholder="project">
   <input name="q" value="{query}" placeholder="search">
@@ -1866,6 +1944,7 @@ def create_app(config=None):
   <input name="host_ids" placeholder="10001,10002" required><input name="project" placeholder="new project">
   <input name="user" placeholder="new remote user"><input name="services" placeholder="new services">
   <select name="vip"><option value="">keep VIP</option><option value="true">VIP</option><option value="false">not VIP</option></select>
+  <select name="maintenance"><option value="">keep maintenance</option><option value="true">maintenance</option><option value="false">available</option></select>
   <label><input type="checkbox" name="confirm" value="true" required> confirm</label><button type="submit">Apply</button>
 </form>
 """.format(
@@ -1876,8 +1955,9 @@ def create_app(config=None):
         body += _table(rows, [
             ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
             ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services", "services"),
+            ("maintenance_marker", "state"), ("maintenance_reason", "maintenance reason"),
             ("server_note", "note"), ("privileged_access_provider", "privileged"), ("privileged_access_hint", "hint"),
-            ("history", "history"), ("details", "edit")
+            ("connectivity", "connectivity"), ("control", "check"), ("history", "history"), ("details", "edit")
         ])
         return _html("Inventory", body, config=config, notice=notice)
 
@@ -1920,6 +2000,8 @@ def create_app(config=None):
 <p>Note <input name="note" value="{note}" size="80"></p>
 <p>VIP <select name="vip"><option value="false">false</option><option value="true" {vip_selected}>true</option></select>
 No sudo <select name="nosudo"><option value="false">false</option><option value="true" {nosudo_selected}>true</option></select></p>
+<p>Maintenance <select name="maintenance"><option value="false">false</option><option value="true" {maintenance_selected}>true</option></select>
+Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input name="maintenance_reason" value="{maintenance_reason}" size="60"></p>
 <p>Provider <input name="privileged_provider" value="{provider}"> URL <input name="privileged_url" value="{provider_url}" size="45"></p>
 <p>Privileged hint <input name="privileged_hint" value="{provider_hint}" size="80"> Proxy ID <input name="proxy_id" value="{proxy_id}"></p>
 <label><input type="checkbox" name="confirm" value="true" required> confirm update</label>
@@ -1934,8 +2016,73 @@ No sudo <select name="nosudo"><option value="false">false</option><option value=
             nosudo_selected="selected" if host.get("server_nosudo") else "", provider=html.escape(str(host.get("privileged_access_provider") or "")),
             provider_url=html.escape(str(host.get("privileged_access_url") or "")), provider_hint=html.escape(str(host.get("privileged_access_hint") or "")),
             proxy_id=html.escape(str(host.get("proxy_id") or "")),
+            maintenance_selected="selected" if host.get("maintenance_enabled") else "",
+            maintenance_until=html.escape(str(host.get("maintenance_until") or "")),
+            maintenance_reason=html.escape(str(host.get("maintenance_reason") or "")),
         )
         return _html("Edit Host", body, config=config, notice=notice)
+
+    @app.route("/announcements", methods=["GET", "POST"])
+    def announcements():
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        notice = None
+        if request.method == "POST":
+            validate_csrf()
+            action = request.form.get("action")
+            try:
+                require_mutation_confirmation()
+                if action == "add":
+                    active_count = len(list_announcements(redis, active_only=True))
+                    maximum = int(config.get("announcements", {}).get("max_active", 100))
+                    if active_count >= maximum:
+                        raise AnnouncementError("active announcement limit reached")
+                    ttl = parse_duration(request.form.get("ttl")) if request.form.get("ttl") else None
+                    record = create_announcement(
+                        redis, request.form.get("text"), admin.get("username"),
+                        project=request.form.get("project") or None, host=request.form.get("host") or None,
+                        severity=request.form.get("severity") or "info",
+                        expires_at=int(time.time()) + ttl if ttl else None,
+                    )
+                    audit_admin("announcement_add", admin, "applied", {"announcement_id": record.get("id")})
+                    notice = {"level": "info", "text": "Announcement published"}
+                elif action == "remove":
+                    result = delete_announcement(redis, request.form.get("id"))
+                    audit_admin("announcement_remove", admin, "applied", {"announcement_id": result.get("id")})
+                    notice = {"level": "info", "text": "Announcement removed"}
+                else:
+                    raise AnnouncementError("unknown announcement action")
+            except (AnnouncementError, ValueError) as exc:
+                audit_admin("announcement_mutation", admin, "denied", {"action": action})
+                notice = {"level": "error", "text": str(exc)}
+        rows = list_announcements(
+            redis, project=request.args.get("project") or None, host=request.args.get("host") or None,
+            active_only=request.args.get("active") == "1",
+        )
+        token = html.escape(csrf_token())
+        for row in rows:
+            row["scope"] = "host:{}".format(row.get("host")) if row.get("host") else ("project:{}".format(row.get("project")) if row.get("project") else "global")
+            row["status"] = "active" if not row.get("expires_at") or int(row.get("expires_at")) > int(time.time()) else "expired"
+            row["actions"] = '<form method="post" class="inline"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="action" value="remove"><input type="hidden" name="id" value="{}"><input type="hidden" name="confirm" value="true"><button type="submit">Remove</button></form>'.format(token, html.escape(str(row.get("id") or "")))
+        body = """
+<h1>Announcements</h1>
+<form method="post" class="inline">
+  <input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="add">
+  <input name="text" placeholder="Operational notice" size="50" required>
+  <input name="project" placeholder="project"><input name="host" placeholder="host id">
+  <select name="severity"><option value="info">info</option><option value="warning">warning</option><option value="critical">critical</option></select>
+  <input name="ttl" placeholder="2h" size="6"><label><input type="checkbox" name="confirm" value="true" required> confirm</label>
+  <button type="submit">Publish</button>
+</form>
+<p><a href="/announcements?active=1">Active only</a> &middot; <a href="/announcements">All</a></p>
+""".format(token=token)
+        body += _table(rows, [
+            ("id", "id"), ("status", "status"), ("severity", "severity"), ("scope", "scope"),
+            ("text", "text"), ("created_by", "author"), ("expires_at", "expires"), ("actions", "actions"),
+        ])
+        return _html("Announcements", body, config=config, notice=notice)
 
     @app.route("/session/<connection_id>")
     def session_details(connection_id):
@@ -2292,7 +2439,8 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
             profile["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
             profile["active"] = "yes" if username in active_users else ""
             profile["groups_display"] = ", ".join(profile.get("groups") or [])
-        return _html("Users", "<h1>Users</h1>" + _table(profiles, [
+        export_links = '<p><a href="/export/users?format=csv">Download CSV</a> &middot; <a href="/export/users?format=json">Download JSON</a></p>'
+        return _html("Users", "<h1>Users</h1>" + export_links + _table(profiles, [
             ("user_link", "user"), ("groups_display", "groups"), ("last_seen", "last_seen"),
             ("connection_count", "connections"), ("active", "active"),
         ]), config=config)
@@ -2314,7 +2462,28 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         subjects.update(("group", group) for group in profile.get("groups") or [])
         subjects.update(("role", role) for role in profile.get("roles") or [])
         grants = [row for row in list_grant_records(redis) if (row.get("subject"), row.get("name")) in subjects]
-        body = "<h1>User {}</h1><pre>{}</pre>".format(html.escape(username), html.escape(json.dumps(profile, indent=2, sort_keys=True)))
+        activity = user_activity_summary(
+            config["logging"]["base_path"], username, limit=20, active_sessions=active,
+            grants=list_grant_records(redis), access_requests=list_access_requests(redis),
+        )
+        metrics = activity.get("metrics") or {}
+        body = """
+<h1>User {username}</h1>
+<div class="grid">
+  <div class="metric"><strong>{connections}</strong><span class="muted">connections</span></div>
+  <div class="metric"><strong>{active}</strong><span class="muted">active sessions</span></div>
+  <div class="metric"><strong>{failures}</strong><span class="muted">recent failures</span></div>
+  <div class="metric"><strong>{grants}</strong><span class="muted">grant candidates</span></div>
+  <div class="metric"><strong>{requests}</strong><span class="muted">access requests</span></div>
+</div>
+<h2>Identity observed in audit</h2><pre>{profile}</pre>
+<h2>Top projects</h2>{top_projects}
+""".format(
+            username=html.escape(username), connections=metrics.get("connections", 0), active=metrics.get("active_sessions", 0),
+            failures=metrics.get("recent_failures", 0), grants=metrics.get("grant_candidates", 0), requests=metrics.get("access_requests", 0),
+            profile=html.escape(json.dumps(profile, indent=2, sort_keys=True)),
+            top_projects=_table(activity.get("top_projects") or [], [("project", "project"), ("connections", "connections")]),
+        )
         body += "<h2>Effective grant candidates</h2>" + _table(grants, [
             ("id", "id"), ("subject", "subject"), ("name", "name"), ("project", "project"),
             ("project_set", "project_set"), ("project_glob", "glob"), ("host", "host"),
@@ -2326,6 +2495,10 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         body += "<h2>Recent sessions</h2>" + _table(history_rows, [
             ("time", "time"), ("project", "project"), ("host_id", "host"), ("target", "target"),
             ("remote_user", "remote_user"), ("result", "result"),
+        ])
+        body += "<h2>Recent access requests</h2>" + _table(activity.get("access_requests") or [], [
+            ("id", "id"), ("status", "status"), ("project", "project"), ("host", "host"),
+            ("remote_user", "remote_user"), ("ticket", "ticket"), ("created_at", "created"),
         ])
         return _html("User Details", body, config=config)
 
@@ -2701,7 +2874,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         def selected(value, expected):
             return " selected" if value == expected else ""
         git_notice = "<p><strong>Enforced GitOps:</strong> policy is read-only here.</p>" if config.get("policy_as_code", {}).get("enforce_git", False) else ""
-        body = "<h1>Grants</h1>" + git_notice + _table(grant_rows, [
+        body = '<h1>Grants</h1><p><a href="/export/grants?format=csv">Download CSV</a> &middot; <a href="/export/grants?format=json">Download JSON</a></p>' + git_notice + _table(grant_rows, [
             ("id", "id"), ("subject", "subject"), ("name", "name"), ("project", "project"),
             ("project_set", "project_set"), ("project_glob", "project_glob"), ("remote_user", "remote_user"),
             ("sudo_mode", "sudo"), ("allowed_actions", "actions"), ("edit", "edit")

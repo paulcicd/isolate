@@ -766,6 +766,84 @@ VIP and privileged access fields are informational. They do not change grants by
 
 If a VIP host is denied by policy and privileged access metadata is configured, `g` prints a hint with the external provider and URL.
 
+### Maintenance Mode
+
+Temporarily pause new connections to an inventory host without removing it or changing grants:
+
+```bash
+isolate host maintenance 10004 --until 2h --reason "CHG-1042 database migration"
+isolate host maintenance 10004 --clear
+```
+
+`s` marks an active maintenance host as `MAINT`. `g` prints the reason and refuses a new connection. Existing SSH sessions are not terminated. Maintenance expires automatically when `maintenance_until` is reached. Emergency bypass groups must be explicitly configured:
+
+```yaml
+maintenance:
+  enforce: true
+  bypass_groups:
+    - OS-admin
+```
+
+Legacy host records have no maintenance fields and remain available exactly as before.
+
+### Connectivity Diagnostics
+
+Check DNS resolution and the target TCP port without opening an interactive shell:
+
+```bash
+isolate host check 10004
+isolate host check --project kube-prod --timeout 5
+```
+
+Add a non-interactive public-key authentication probe when required:
+
+```bash
+isolate host check 10004 --ssh
+isolate host check 10004 --ssh --user support --json
+```
+
+The SSH probe always uses `BatchMode=yes`, disables TTY allocation, honors the configured SSH file and host-key policy, and executes only `true`. Results are cached briefly as `host_check_<server_id>` for dashboard display; these operational cache keys are not part of backups.
+
+### Operational Announcements
+
+Publish a global, project, or host-specific notice. Active notices are shown by `s` and immediately before `g` starts a connection:
+
+```bash
+isolate announcement add --text "Bastion maintenance at 22:00" --severity info --ttl 4h
+isolate announcement add --project kube-prod --text "Deploy window is active" --severity warning --ttl 2h
+isolate announcement add --host 10004 --text "Do not restart etcd" --severity critical --ttl 30m
+isolate announcement list --active
+isolate announcement remove --id 7
+```
+
+Creating and removing announcements requires membership in `access.admin_groups`. Records use `announcement_*` Redis keys and are included in service backups.
+
+### Portable Exports
+
+Inventory, grants, history, observed users, and the effective access matrix can be exported to JSON or CSV:
+
+```bash
+isolate export inventory --format csv --output inventory.csv
+isolate export grants --project kube-prod --format json --output grants.json
+isolate export history --user demo.alex --format csv --output history.csv
+isolate export users --format json
+isolate export access-matrix --format csv --output access-matrix.csv
+```
+
+History export keeps the existing self/admin visibility rules. Dashboard administrators can download the same datasets from authenticated `/export/<kind>` routes.
+
+### User Activity Summary
+
+Users can inspect their own recent activity; configured history/dashboard admins can inspect another user:
+
+```bash
+isolate user activity
+isolate user activity demo.alex
+isolate user activity demo.alex --limit 25 --json
+```
+
+The summary joins already available audit data: observed groups and roles, active/recent sessions, failure count, top projects, matching grant candidates, and break-glass requests. It does not create a second identity source and never trusts editable local groups.
+
 ### Show Host
 
 ```bash
@@ -1753,18 +1831,20 @@ Routes:
 - `/session/<connection_id>`: session details and timeline.
 - `/session/<connection_id>/events.json`: session JSONL events.
 - `/inventory`: searchable inventory, host creation, editing, and validated bulk updates.
+- `/announcements`: global/project/host operational notices with severity and TTL.
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
 - `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
 - `/packages`: create and assign reusable access profiles; package details provide preview, revision apply, and rollback.
 - `/policy/simulate`: visual allow/deny simulator using the production resolver.
 - `/policy/matrix`: effective `user/group/role x project` access, policy findings, and blast-radius preview.
 - `/policy/gitops`: signed Git policy status, drift/blast-radius refresh, sync, and rollback.
-- `/users` and `/user/<username>`: observed groups, candidate grants, active sessions, and history.
+- `/users` and `/user/<username>`: observed groups, activity metrics, top projects, grants, requests, active sessions, and history.
 - `/notifications`: configured sinks and delivery results for access requests and session alerts.
 - `/docs`: bilingual English/Russian operator documentation with practical examples and build information.
 - `/replay/<connection_id>`: xterm.js ANSI terminal replay.
 - `/replay/<connection_id>.json`: parsed replay chunks.
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
+- `/export/<inventory|grants|history|users|access-matrix>`: authenticated CSV or JSON download.
 
 The dashboard is admin-only. If a user is authenticated but does not belong to `dashboard.admin_groups`, the dashboard returns HTTP 403.
 
