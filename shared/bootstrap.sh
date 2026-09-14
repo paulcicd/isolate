@@ -4,6 +4,13 @@ ISOLATE_DATA_ROOT="${ISOLATE_DATA_ROOT:-/opt/auth}";
 ISOLATE_SHARED="${ISOLATE_DATA_ROOT}/shared";
 ISOLATE_HELPER="${ISOLATE_SHARED}/helper.py";
 ISOLATE_CLI="${ISOLATE_SHARED}/isolate.py";
+if [ -z "${ISOLATE_PYTHON:-}" ]; then
+    if [ -x "${ISOLATE_DATA_ROOT}/.venv/bin/python3" ]; then
+        ISOLATE_PYTHON="${ISOLATE_DATA_ROOT}/.venv/bin/python3";
+    else
+        ISOLATE_PYTHON="$(command -v python3)";
+    fi
+fi
 ISOLATE_DEPLOY_LOCK="${ISOLATE_DATA_ROOT}/.deploy";
 ISOLATE_COLORS=true;
 ISOLATE_DEFAULT_PROJECT="${ISOLATE_DEFAULT_PROJECT:-main}";
@@ -13,6 +20,7 @@ export ISOLATE_DATA_ROOT;
 export ISOLATE_SHARED;
 export ISOLATE_HELPER;
 export ISOLATE_CLI;
+export ISOLATE_PYTHON;
 export ISOLATE_COLORS;
 export ISOLATE_DEPLOY_LOCK;
 export ISOLATE_COLORS;
@@ -61,7 +69,7 @@ redis-dev () {
 }
 
 isolate () {
-    "${ISOLATE_CLI}" "${@}";
+    "${ISOLATE_PYTHON}" "${ISOLATE_CLI}" "${@}";
 }
 
 deploy_lock () {
@@ -114,7 +122,7 @@ g () {
         return
     elif [[ $# -gt 0 ]] ; then
         deploy_lock
-        auth_callback "${ISOLATE_HELPER}" go "${@}";
+        auth_callback "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" go "${@}";
     fi
 }
 
@@ -124,18 +132,18 @@ s () {
         return
     elif [[ $# -gt 0 ]] ; then
         deploy_lock
-        "${ISOLATE_HELPER}" search "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" search "${@}";
     fi
 }
 
 p () {
     deploy_lock
-    "${ISOLATE_HELPER}" projects;
+    "${ISOLATE_PYTHON}" "${ISOLATE_HELPER}" projects;
 }
 
 f () {
     deploy_lock
-    "${ISOLATE_CLI}" history "${@}";
+    "${ISOLATE_PYTHON}" "${ISOLATE_CLI}" history "${@}";
 }
 
 auth-add-user () {
@@ -153,7 +161,7 @@ auth-add-host () {
         echo -e "\\n  Usage: auth-add-host --project <project_name> --server-name <server_name> --ip 1.2.3.4 --port 22 --user root --nosudo --services 'nginx, redis' --note 'VIP frontend' --vip --privileged-provider Warpgate --privileged-url https://bastion.example.org \\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-host" "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-host" "${@}";
     fi
 }
 
@@ -162,7 +170,7 @@ auth-dump-host () {
         echo -e "\\n  Usage: auth-dump-host <server_id>\\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-host" --server-id "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-host" --server-id "${@}";
     fi
 }
 
@@ -171,7 +179,7 @@ auth-del-host () {
         echo -e "\\n  Usage: auth-del-host <server_id>\\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-host" --server-id "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-host" --server-id "${@}";
     fi
 }
 
@@ -180,7 +188,7 @@ auth-add-project-config () {
         echo -e "\\n  Usage: auth-add-project-config <project_name> --port 3222 --user root3 --nosudo \\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-project-config" --project "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "add-project-config" --project "${@}";
     fi
 }
 
@@ -189,7 +197,7 @@ auth-del-project-config () {
         echo -e "\\n  Usage: auth-del-project-config <project_name>\\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-project-config" --project "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "del-project-config" --project "${@}";
     fi
 }
 
@@ -198,6 +206,6 @@ auth-dump-project-config () {
         echo -e "\\n  Usage: auth-dump-project-config <project_name>\\n";
         return
     elif [[ $# -gt 0 ]] ; then
-        "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-project-config" --project "${@}";
+        "${ISOLATE_PYTHON}" "${ISOLATE_DATA_ROOT}/shared/auth-manager.py" "dump-project-config" --project "${@}";
     fi
 }

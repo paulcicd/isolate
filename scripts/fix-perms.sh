@@ -31,6 +31,15 @@ find "${AUTH_DATA_ROOT}" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0600
 
 chmod 0750 "${AUTH_DATA_ROOT}";
 
+# The Python runtime contains code, not deployment secrets. Keep it immutable
+# to bastion users, while preserving read/traverse access granted by directory
+# ACLs and executable entrypoints required by CLI and systemd services.
+if [ -d "${AUTH_DATA_ROOT}/.venv" ]; then
+    find "${AUTH_DATA_ROOT}/.venv" -type d -print0 | xargs -r -n60 -P 5 -0 chmod 0750
+    find "${AUTH_DATA_ROOT}/.venv" -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0640
+    find "${AUTH_DATA_ROOT}/.venv/bin" -maxdepth 1 -type f -print0 | xargs -r -n60 -P 5 -0 chmod 0750
+fi
+
 # Runtime processes run as the auth user and must be able to read configs.
 # Configs may contain secrets, so keep them readable only by auth/auth group.
 chmod 0750 "${AUTH_DATA_ROOT}/configs"
