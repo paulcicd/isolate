@@ -8,6 +8,7 @@ import re
 import time
 
 from IsolateCore import is_valid_fqdn, is_valid_ipv4_address, is_valid_ipv6_address
+from isolate_service_discovery import get_discovery, service_display
 
 
 class HostValidationError(Exception):
@@ -73,6 +74,8 @@ def list_hosts(redis, project=None, query=None):
             continue
         host = normalize_host(json.loads(decode(raw)))
         host["_revision"] = host_revision(host)
+        host["service_discovery"] = get_discovery(redis, host["server_id"])
+        host["server_services_display"] = service_display(host, host["service_discovery"])
         if project and host.get("project_name") != project:
             continue
         if query and not host_matches_query(host, query):
@@ -87,6 +90,8 @@ def get_host(redis, server_id):
         return None
     host = normalize_host(json.loads(decode(raw)))
     host["_revision"] = host_revision(host)
+    host["service_discovery"] = get_discovery(redis, host["server_id"])
+    host["server_services_display"] = service_display(host, host["service_discovery"])
     return host
 
 
@@ -101,6 +106,7 @@ def host_matches_query(host, query):
         "server_ip",
         "server_user",
         "server_services",
+        "server_services_display",
         "server_note",
         "server_vip_marker",
         "privileged_access_provider",
@@ -280,9 +286,9 @@ def format_hosts_table(rows):
         ("server_vip_marker", "vip", 4),
         ("maintenance_marker", "state", 6),
         ("server_user", "user", 12),
-        ("server_services", "services", 32),
+        ("server_services_display", "services", 32),
     ]
     lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
     for row in rows:
-        lines.append("  ".join(str(row.get(key) or "").ljust(width) for key, _, width in columns))
+        lines.append("  ".join(str(row.get(key) or (row.get("server_services") if key == "server_services_display" else "") or "").ljust(width) for key, _, width in columns))
     return "\n".join(lines)

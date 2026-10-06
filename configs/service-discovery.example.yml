@@ -1,0 +1,7 @@
+# Merge this section into /etc/isolate/isolate.yml or /opt/auth/configs/isolate.yml.
+# Requires an explicitly provisioned SSH key and trusted host keys on the bastion.
+service_discovery:
+  enabled: false
+  remote_user: isolate-discovery
+  timeout: 10
+  host_ids: [10001, 10002]

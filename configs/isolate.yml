@@ -223,6 +223,7 @@ backup:
   redis: {}
   redis_patterns:
     - server_*
+    - host_services_*
     - grant_*
     - policy_*
     - project_set_*

@@ -2714,6 +2714,87 @@ class OperationsConvenienceFeaturesTest(unittest.TestCase):
 
 
 class DashboardTest(unittest.TestCase):
+    def test_oidc_metadata_timeout_is_bounded_and_returns_503(self):
+        from requests.exceptions import Timeout
+        app = isolate_web.create_app({"dashboard": {"public_url": "https://bastion.example"}, "keycloak": {"issuer": "https://id.example", "client_id": "isolate"}, "logging": {}})
+        client = app.test_client()
+        with mock.patch("requests.sessions.Session.request", side_effect=Timeout("sensitive token data")) as request_mock:
+            with self.assertLogs(app.logger, level="WARNING") as logs:
+                response = client.get("/login")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(response.headers["Retry-After"], "10")
+        self.assertEqual(request_mock.call_args.kwargs["timeout"], (2, 3))
+        self.assertIn(response.headers["X-Request-ID"], response.get_data(as_text=True))
+        self.assertNotIn("sensitive token data", " ".join(logs.output))
+        with client.session_transaction() as session:
+            self.assertNotIn("identity", session)
+
+    def test_oidc_token_exchange_timeout_does_not_authenticate_user(self):
+        import urllib.parse
+        from requests.exceptions import Timeout
+        app = isolate_web.create_app({"dashboard": {"public_url": "https://bastion.example"}, "keycloak": {"issuer": "https://id.example", "client_id": "isolate"}, "logging": {}})
+        oauth_client = app.extensions["authlib.integrations.flask_client"].keycloak
+        oauth_client.server_metadata.update(_loaded_at=1, authorization_endpoint="https://id.example/auth", token_endpoint="https://id.example/token")
+        client = app.test_client()
+        response = client.get("/login")
+        state = urllib.parse.parse_qs(urllib.parse.urlparse(response.headers["Location"]).query)["state"][0]
+        with mock.patch("requests.sessions.Session.request", side_effect=Timeout()) as request_mock:
+            response = client.get("/auth/callback", query_string={"state": state, "code": "test-code"})
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(request_mock.call_args.kwargs["timeout"], (2, 3))
+        with client.session_transaction() as session:
+            self.assertNotIn("identity", session)
+
+    def test_oidc_jwks_timeout_is_bounded(self):
+        from requests.exceptions import Timeout
+        app = isolate_web.create_app({"dashboard": {}, "keycloak": {"issuer": "https://id.example", "client_id": "isolate"}, "logging": {}})
+        oauth_client = app.extensions["authlib.integrations.flask_client"].keycloak
+        oauth_client.server_metadata.update(_loaded_at=1, jwks_uri="https://id.example/jwks")
+        with mock.patch.object(oauth_client, "authorize_access_token", side_effect=lambda: oauth_client.fetch_jwk_set()), \
+                mock.patch("requests.sessions.Session.request", side_effect=Timeout()) as request_mock:
+            response = app.test_client().get("/auth/callback")
+        self.assertEqual(response.status_code, 503)
+        self.assertEqual(request_mock.call_args.kwargs["timeout"], (2, 3))
+
+    def test_oidc_invalid_state_and_signature_are_rejected(self):
+        from authlib.integrations.base_client import OAuthError
+        from joserfc.errors import JoseError
+        app = isolate_web.create_app({"dashboard": {}, "keycloak": {}, "logging": {}})
+        oauth_client = app.extensions["authlib.integrations.flask_client"].keycloak
+        for error in (OAuthError(error="mismatching_state"), JoseError()):
+            with self.subTest(error=type(error).__name__), mock.patch.object(oauth_client, "authorize_access_token", side_effect=error):
+                client = app.test_client()
+                response = client.get("/auth/callback")
+                self.assertEqual(response.status_code, 401)
+                with client.session_transaction() as session:
+                    self.assertNotIn("identity", session)
+
+    def test_identity_details_show_authorizing_groups_and_escape_claims(self):
+        config = {"dashboard": {"admin_groups": ["DevOps"]}, "keycloak": {}, "logging": {}}
+        app = isolate_web.create_app(config)
+        with app.test_request_context("/docs"):
+            from flask import session
+            session["identity"] = {"username": "admin", "groups": ["DevOps", "<script>"], "roles": ["reader"]}
+            text = isolate_web._html("Docs", "", config=config)
+        self.assertIn("Dashboard role: Admin", text)
+        self.assertIn("Access groups</strong>: DevOps", text)
+        self.assertIn("&lt;script&gt;", text)
+        self.assertIn("Keycloak roles</strong>: reader", text)
+
+    def test_error_response_has_traceable_request_id(self):
+        app = isolate_web.create_app({"dashboard": {}, "keycloak": {}, "logging": {}})
+        app.config["TESTING"] = False
+        @app.route("/test-error")
+        def test_error():
+            raise RuntimeError("sensitive internal details")
+        with self.assertLogs(app.logger, level="ERROR") as logs:
+            response = app.test_client().get("/test-error")
+        self.assertEqual(response.status_code, 500)
+        request_id = response.headers["X-Request-ID"]
+        self.assertIn(request_id, response.get_data(as_text=True))
+        self.assertTrue(any(request_id in line for line in logs.output))
+        self.assertNotIn("sensitive internal details", response.get_data(as_text=True))
+
     def test_users_page_formats_last_seen_timestamp(self):
         tmpdir = os.path.join(ROOT, ".tmp-dashboard-users-{}".format(uuid.uuid4().hex))
         try:

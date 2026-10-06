@@ -51,6 +51,8 @@
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-job-worker.service", dest: "/etc/systemd/system/isolate-job-worker.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.service", dest: "/etc/systemd/system/isolate-policy-sync.service" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-policy-sync.timer", dest: "/etc/systemd/system/isolate-policy-sync.timer" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-service-discovery.service", dest: "/etc/systemd/system/isolate-service-discovery.service" }
+    - { src: "{{ deploy_path }}/deploy/systemd/isolate-service-discovery.timer", dest: "/etc/systemd/system/isolate-service-discovery.timer" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-dashboard.env", dest: "/etc/default/isolate-dashboard" }
     - { src: "{{ deploy_path }}/deploy/systemd/isolate-mcp.env", dest: "/etc/default/isolate-mcp" }
     - { src: "{{ deploy_path }}/deploy/logrotate/isolate", dest: "/etc/logrotate.d/isolate" }
@@ -236,6 +238,27 @@
     state: started
     daemon_reload: yes
   when: isolate_enable_policy_sync_timer | bool
+
+- name: Installing optional service discovery units...
+  copy:
+    src: "{{ deploy_path }}/deploy/systemd/{{ item }}"
+    dest: "/etc/systemd/system/{{ item }}"
+    remote_src: yes
+    owner: root
+    group: root
+    mode: "0644"
+  loop:
+    - isolate-service-discovery.service
+    - isolate-service-discovery.timer
+  when: isolate_enable_service_discovery_timer | bool
+
+- name: Enabling optional service discovery timer...
+  systemd:
+    name: isolate-service-discovery.timer
+    enabled: yes
+    state: started
+    daemon_reload: yes
+  when: isolate_enable_service_discovery_timer | bool
 
 - name: Copying public key ...
   shell: "cat /home/{{ auth_default_user }}/.ssh/id_rsa.pub"

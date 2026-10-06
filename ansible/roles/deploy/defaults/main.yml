@@ -4,3 +4,4 @@ isolate_enable_backup_timer: false
 isolate_enable_mcp_server: false
 isolate_enable_job_worker: false
 isolate_enable_policy_sync_timer: false
+isolate_enable_service_discovery_timer: false

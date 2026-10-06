@@ -5,6 +5,7 @@
 import html
 import json
 import os
+import re
 import secrets
 import time
 import urllib.parse
@@ -238,6 +239,9 @@ a:hover { color: var(--accent-strong); text-decoration: underline; }
   padding: 14px 16px;
   border-top: 1px solid var(--sidebar-line);
 }
+.identity-details { font-size: 11px; overflow-wrap: anywhere; margin: 5px 0; }
+.identity-details summary { cursor: pointer; }
+.identity-details div { margin-top: 4px; }
 .user-avatar {
   display: grid;
   width: 34px;
@@ -758,13 +762,22 @@ def _html(title, body, config=None, notice=None):
             html.escape(notice.get("text", "")),
         )
     username = "Administrator"
+    identity = {}
     try:
         from flask import has_request_context, session
         if has_request_context() and isinstance(session.get("identity"), dict):
-            username = str(session["identity"].get("username") or username)
+            identity = session["identity"]
+            username = str(identity.get("username") or username)
     except (ImportError, RuntimeError):
         pass
     initials = "".join(part[:1] for part in username.replace(".", " ").split()[:2]).upper() or "AD"
+    admin_groups = (config or {}).get("dashboard", {}).get("admin_groups") or (config or {}).get("history", {}).get("admin_groups") or []
+    matched_groups = sorted(set(identity.get("groups") or []) & set(admin_groups))
+    labels = ("Роль Dashboard", "Группы доступа", "Группы OIDC", "Роли Keycloak") if locale == "ru" else ("Dashboard role", "Access groups", "OIDC groups", "Keycloak roles")
+    identity_details = '<details class="identity-details"><summary>{}: {}</summary>{}</details>'.format(
+        labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else "—",
+        "".join('<div><strong>{}</strong>: {}</div>'.format(html.escape(label), html.escape(", ".join(values) or "—")) for label, values in zip(labels[1:], (matched_groups, identity.get("groups") or [], identity.get("roles") or []))),
+    )
     field_help_script = """
 (function () {{
   var help = {field_help};
@@ -805,7 +818,7 @@ def _html(title, body, config=None, notice=None):
     <div class="build-info"><strong>v{version}</strong>{revision} &middot; schema {schema}<br>Python {python}</div>
     <div class="sidebar-footer">
       <span class="user-avatar">{initials}</span>
-      <span class="user-copy"><span class="user-name">{username}</span><a class="logout-link" href="/logout">{sign_out}</a></span>
+      <span class="user-copy"><span class="user-name">{username}</span>{identity_details}<a class="logout-link" href="/logout">{sign_out}</a></span>
     </div>
   </aside>
   <main class="main">
@@ -822,6 +835,7 @@ def _html(title, body, config=None, notice=None):
         css=_DASHBOARD_CSS,
         initials=html.escape(initials),
         username=html.escape(username),
+        identity_details=identity_details,
         version=html.escape(str(build.get("version") or "unknown")),
         revision=html.escape(str(build.get("revision_short") or "unknown")),
         schema=html.escape(str(build.get("schema_version") or "n/a")),
@@ -1089,8 +1103,11 @@ def _host_form_values(form, partial=False):
 
 
 def create_app(config=None):
+    from authlib.integrations.base_client import OAuthError
     from authlib.integrations.flask_client import OAuth
-    from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, send_file, session, url_for
+    from flask import Flask, Response, abort, g, jsonify, redirect, render_template_string, request, send_file, session, url_for
+    from joserfc.errors import JoseError
+    from requests.exceptions import RequestException
 
     config = config or load_config()
     app = Flask(__name__)
@@ -1098,13 +1115,33 @@ def create_app(config=None):
     app.extensions["isolate_build_info"] = get_build_info(config, _DASHBOARD_STARTED_AT)
     oauth = OAuth(app)
 
+    @app.before_request
+    def assign_request_id():
+        g.request_id = secrets.token_hex(16)
+
+    @app.after_request
+    def attach_request_id(response):
+        response.headers["X-Request-ID"] = g.request_id
+        return response
+
+    @app.errorhandler(500)
+    def internal_error(error):
+        app.logger.error("Dashboard request failed: request_id=%s method=%s path=%s", g.request_id, request.method, request.path)
+        return '<h1>Internal Server Error</h1><p>Request ID: {}</p>'.format(g.request_id), 500
+
     issuer = (config.get("keycloak", {}).get("issuer") or "").rstrip("/")
     oauth.register(
         name="keycloak",
         client_id=config.get("keycloak", {}).get("client_id"),
         client_secret=config.get("keycloak", {}).get("client_secret"),
         server_metadata_url=issuer + "/.well-known/openid-configuration",
-        client_kwargs={"scope": " ".join(config.get("keycloak", {}).get("scopes") or ["openid", "profile", "email"])},
+        client_kwargs={
+            "scope": " ".join(config.get("keycloak", {}).get("scopes") or ["openid", "profile", "email"]),
+            "default_timeout": (
+                float(config.get("keycloak", {}).get("http_connect_timeout", 2)),
+                float(config.get("keycloak", {}).get("http_read_timeout", 3)),
+            ),
+        },
     )
 
     def current_identity():
@@ -1259,11 +1296,27 @@ def create_app(config=None):
     @app.route("/login")
     def login():
         redirect_uri = config.get("dashboard", {}).get("public_url", "").rstrip("/") + url_for("callback")
-        return oauth.keycloak.authorize_redirect(redirect_uri)
+        try:
+            return oauth.keycloak.authorize_redirect(redirect_uri)
+        except RequestException as exc:
+            return identity_provider_unavailable(exc)
+
+    def identity_provider_unavailable(error):
+        app.logger.warning("OIDC provider unavailable: request_id=%s error_type=%s", g.request_id, type(error).__name__)
+        return '<h1>Sign-in temporarily unavailable</h1><p>Please retry sign-in shortly.</p><p>Request ID: {}</p>'.format(g.request_id), 503, {"Retry-After": "10"}
 
     @app.route("/auth/callback")
     def callback():
-        token = oauth.keycloak.authorize_access_token()
+        try:
+            token = oauth.keycloak.authorize_access_token()
+        except RequestException as exc:
+            return identity_provider_unavailable(exc)
+        except (OAuthError, JoseError) as exc:
+            error_code = str(getattr(exc, "error", "") or "unknown")
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", error_code):
+                error_code = "unknown"
+            app.logger.warning("OIDC sign-in rejected: request_id=%s error_type=%s error_code=%s", g.request_id, type(exc).__name__, error_code)
+            abort(401, description="Sign-in could not be verified. Please start a new sign-in.")
         claims = token.get("userinfo") or {}
         if not isinstance(claims, dict) or not claims:
             abort(401, description="Keycloak did not return verified OIDC claims")
@@ -1960,7 +2013,7 @@ def create_app(config=None):
         )
         body += _table(rows, [
             ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
-            ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services", "services"),
+            ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services_display", "services"),
             ("maintenance_marker", "state"), ("maintenance_reason", "maintenance reason"),
             ("server_note", "note"), ("privileged_access_provider", "privileged"), ("privileged_access_hint", "hint"),
             ("connectivity", "connectivity"), ("control", "check"), ("history", "history"), ("details", "edit")

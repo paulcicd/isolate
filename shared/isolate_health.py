@@ -35,9 +35,23 @@ def validate_config(config, check_paths=False):
     session_control = section("session_control")
     maintenance = section("maintenance")
     connectivity = section("connectivity")
+    service_discovery = section("service_discovery")
     announcements = section("announcements")
     policy_as_code = section("policy_as_code")
     backup = section("backup")
+
+    if not isinstance(service_discovery.get("enabled", False), bool):
+        errors.append("service_discovery.enabled must be a boolean")
+    discovery_ids = service_discovery.get("host_ids", [])
+    if not isinstance(discovery_ids, list) or any(not str(value).isdigit() for value in discovery_ids):
+        errors.append("service_discovery.host_ids must be a list of numeric host IDs")
+    if service_discovery.get("enabled") and (not discovery_ids or not service_discovery.get("remote_user")):
+        errors.append("service_discovery requires remote_user and explicit host_ids when enabled")
+    try:
+        if not 1 <= int(service_discovery.get("timeout", 10)) <= 60:
+            errors.append("service_discovery.timeout must be between 1 and 60")
+    except (TypeError, ValueError):
+        errors.append("service_discovery.timeout must be an integer")
 
     try:
         redis_port = int(redis_cfg.get("port", 6379))
@@ -57,6 +71,12 @@ def validate_config(config, check_paths=False):
         warnings.append("keycloak.issuer does not use HTTPS")
     if not keycloak.get("client_id"):
         errors.append("keycloak.client_id is required")
+    for name, default in (("http_connect_timeout", 2), ("http_read_timeout", 3)):
+        try:
+            if not 0 < float(keycloak.get(name, default)) <= 5:
+                errors.append("keycloak.{} must be greater than zero and at most 5 seconds".format(name))
+        except (TypeError, ValueError):
+            errors.append("keycloak.{} must be a number".format(name))
 
     sinks = logging_cfg.get("sinks") or []
     if not isinstance(sinks, list):

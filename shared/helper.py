@@ -21,6 +21,7 @@ from isolate_logging import SessionLogger
 from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 from isolate_announcements import list_announcements
 from isolate_inventory import is_host_in_maintenance
+from isolate_service_discovery import get_discovery, service_display
 
 
 LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
@@ -142,6 +143,7 @@ class IsolateRedisHosts(object):
             if isinstance(server_data, bytes):
                 server_data = server_data.decode('utf-8')
             server_data = json.loads(server_data)
+            server_data['server_services_display'] = service_display(server_data, get_discovery(self.redis, server_data.get('server_id')))
             self.projects.append(server_data['project_name'])
             self.hosts_dump.append(server_data)
         return self.hosts_dump
@@ -598,7 +600,7 @@ class AuthHelper(object):
         self.ISOLATE_COLORS = str2bool(os.getenv('ISOLATE_COLORS', False))
 
         # Search Print Line: fields names and order, not template
-        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker maintenance_marker server_services').strip().split(' ')
+        self.ISOLATE_SPF = os.getenv('ISOLATE_SPF', 'server_id server_ip server_name server_vip_marker maintenance_marker server_services_display').strip().split(' ')
 
     def _load_data(self):
         self.hosts_dump = sorted(self.db.get_hosts(), key=itemgetter('project_name', 'server_name'))
@@ -634,6 +636,7 @@ class AuthHelper(object):
                                        'server_id',
                                        'server_ip',
                                        'server_services',
+                                       'server_services_display',
                                        'server_note',
                                        'server_vip_marker',
                                        'privileged_access_provider',
@@ -782,6 +785,7 @@ class AuthHelper(object):
 
         host['geoip_asn'] = host.get('geoip_asn', None)
         host['server_services'] = host.get('server_services') or ''
+        host['server_services_display'] = host.get('server_services_display') or host['server_services']
         host['server_note'] = host.get('server_note') or ''
         host['server_vip_marker'] = 'VIP' if host.get('server_vip') else ''
         host['maintenance_marker'] = 'MAINT' if is_host_in_maintenance(host) else ''

@@ -3090,6 +3090,80 @@ keys access_request_*
 keys active_session_*
 ```
 
+## Running service discovery (opt-in)
+
+Merge `configs/service-discovery.example.yml` into the runtime config, select explicit
+`host_ids`, and set `enabled: true`. Provision a dedicated `remote_user` with a bastion
+SSH key and permission to list systemd units. It does not need sudo. Install trusted
+host keys first; discovery always uses strict host key checking and batch mode.
+For stronger restrictions, use a dedicated key with a forced command matching
+`LC_ALL=C systemctl list-units --type=service --state=running --plain --no-legend --no-pager`
+and disable PTY, forwarding and agent forwarding for that key.
+
+Run one refresh as the bastion account before enabling the timer:
+
+```bash
+sudo -u auth python3 /opt/auth/scripts/isolate-service-discovery.py
+sudo cp /opt/auth/deploy/systemd/isolate-service-discovery.{service,timer} /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now isolate-service-discovery.timer
+journalctl -u isolate-service-discovery.service
+```
+
+The timer scans hourly with jitter. Snapshots live in separate `host_services_*`
+Redis records. CLI host tables and Dashboard Inventory combine manual descriptions
+with discovered services, their UTC scan time, and the latest failure indicator.
+A failed scan retains the last successful list; a successful empty scan clears it.
+Discovery detects running systemd units, not every installed package, container,
+application version, or service hidden inside another namespace. Container discovery
+should use a separate restricted collector rather than granting Docker socket access.
+Default backups include `host_services_*`; add this pattern to existing customized
+backup configurations if the last scan snapshot must survive restore.
+
+## Dashboard identity and incident diagnosis
+
+The sidebar shows the effective Dashboard role, exact groups granting Dashboard
+access, all verified OIDC groups, and Keycloak realm roles. Group names come from
+the verified login claims; configure the Keycloak groups mapper to include AD-derived
+groups in the ID token. The panel cannot identify an AD group that Keycloak did not
+include. All matching admin groups are shown because access can be granted by more
+than one group.
+
+Every response includes `X-Request-ID`. An unexpected 500 shows that ID to the user
+and logs it with method/path beside Flask's traceback. Inspect the actual running
+service's logs (systemd, container, or process supervisor) to determine the cause;
+do not infer it from a successful unauthenticated `/health` check. After deployment,
+check `/health`, `/login`, a real OIDC login, and the authenticated `/` route. Verify
+that non-admin users still receive 403. Monitoring should include the authenticated
+page with a dedicated test identity and alert on HTTP 5xx rates; dependency health
+alone does not exercise page rendering. This repository does not automatically
+provision that monitor or its credentials.
+
+Dashboard OIDC calls use `keycloak.http_connect_timeout: 2` and
+`keycloak.http_read_timeout: 3` seconds for metadata, token exchange, and JWKS.
+Network failures produce 503 with a retry hint and request ID; invalid OAuth state
+or token validation produces 401. Signature verification remains required.
+Probe every DNS address of the issuer from the Dashboard service environment:
+one unreachable address combined with Requests' unlimited default timeout can
+stall sign-in until Gunicorn kills its worker. IPv6 working in curl does not imply
+Requests uses it: urllib3 tests IPv6 loopback availability. Correct outbound routing
+to the issuer's addresses and monitor metadata/JWKS availability as well as page
+rendering. Raising the Gunicorn timeout alone leaves the stalled connection intact.
+
+Keep Admin for configuration and policy mutations. A future self-service web role
+is useful for requesting temporary access and viewing one's own requests; an
+Approver role can be scoped to specific projects, and an Auditor role can be read-only.
+Each requires server-side authorization on every route and object, including exports
+and raw logs. The current panel remains admin-only; regular users can use the existing
+CLI access-request flow until those restrictions are implemented and tested.
+
+The reported duplicate `raw_log_path` SSH traceback is already fixed in the local
+wrapper: metadata holds the path once and both audit events use that metadata.
+`tests/test_ssh_wrapper.py` guards this behavior. If production still shows the
+duplicate keyword exception, compare the deployed wrapper to this version and
+deploy the fix to the actual bastion; a Dashboard reload does not update a stale
+SSH wrapper.
+
 ## Compatibility Notes
 
 - Existing `server_*` host records are still read.

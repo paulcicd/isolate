@@ -18,6 +18,12 @@ DEFAULT_CONFIG_PATHS = (
 
 DEFAULT_CONFIG = {
     "schema_version": 2,
+    "service_discovery": {
+        "enabled": False,
+        "remote_user": None,
+        "host_ids": [],
+        "timeout": 10,
+    },
     "data_root": "/opt/auth",
     "redis": {
         "host": "127.0.0.1",
@@ -33,6 +39,8 @@ DEFAULT_CONFIG = {
         "socket_timeout": 3,
     },
     "keycloak": {
+        "http_connect_timeout": 2,
+        "http_read_timeout": 3,
         "issuer": None,
         "client_id": "isolate-bastion",
         "client_secret": None,
@@ -247,6 +255,7 @@ DEFAULT_CONFIG = {
         "redis": {},
         "redis_patterns": [
             "server_*",
+            "host_services_*",
             "grant_*",
             "policy_*",
             "project_set_*",

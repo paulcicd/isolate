@@ -1,0 +1,14 @@
+[Unit]
+Description=Isolate running service inventory refresh
+After=network-online.target redis-server.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=auth
+Group=auth
+WorkingDirectory=/opt/auth/shared
+ExecStart=/usr/bin/python3 /opt/auth/scripts/isolate-service-discovery.py
+UMask=0027
+NoNewPrivileges=true
+PrivateTmp=true
