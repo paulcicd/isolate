@@ -297,7 +297,7 @@ def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, paramete
     return {"fleet_id": fleet_id, "jobs": jobs, "count": len(jobs)}
 
 
-def retry_job(redis, config, original_job_id, actor):
+def retry_job(redis, config, original_job_id, actor, current_identity=None):
     """Requeue a terminal failed job using its original identity and current policy."""
     original = get_job(redis, original_job_id)
     if original is None:
@@ -312,6 +312,10 @@ def retry_job(redis, config, original_job_id, actor):
         "groups": original.get("groups") or [],
         "roles": original.get("roles") or [],
     }
+    if current_identity is not None:
+        if current_identity.get("username") != original.get("username"):
+            raise JobError("retry identity must match the original submitter")
+        identity = dict(current_identity)
     host = get_host(redis, original.get("host_id"))
     if host is None:
         raise JobError("host no longer exists")

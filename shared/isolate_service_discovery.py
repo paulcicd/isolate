@@ -9,6 +9,7 @@ from isolate_ssh import build_ssh_argv
 
 
 REMOTE_COMMAND = "LC_ALL=C systemctl list-units --type=service --state=running --plain --no-legend --no-pager"
+DISCOVERY_HISTORY_LIMIT = 50
 
 
 def discover_services(host, config, proxy=None, runner=None):
@@ -51,13 +52,49 @@ def get_discovery(redis, host_id):
     return json.loads(raw) if raw else None
 
 
+def get_discovery_history(redis, host_id, limit=20):
+    """Return newest changes first, including the first successful baseline."""
+    count = max(0, min(int(limit), DISCOVERY_HISTORY_LIMIT))
+    snapshot = get_discovery(redis, host_id) or {}
+    history = snapshot.get("history") or []
+    return list(reversed(history[-count:])) if count else []
+
+
 def save_discovery(redis, record):
-    """Retain the last successful snapshot on failures; never alter manual inventory."""
+    """Store a bounded successful-change timeline beside the current snapshot.
+
+    The first success is a baseline, not a claim that every detected unit just
+    appeared. Failed scans retain the last successful services and timeline.
+    Unchanged successes refresh checked_at without adding duplicate changes.
+    """
     previous = get_discovery(redis, record["host_id"]) or {}
-    if not record["ok"]:
-        record = dict(previous, **record)
-    redis.set("host_services_{}".format(record["host_id"]), json.dumps(record, sort_keys=True))
-    return record
+    history = list(previous.get("history") or [])[-DISCOVERY_HISTORY_LIMIT:]
+    if record["ok"]:
+        if not isinstance(record.get("services"), (list, tuple)):
+            raise ValueError("successful discovery requires a services list")
+        services = sorted(set(record["services"]))
+        baseline = "services" not in previous
+        old_services = set(previous.get("services") or [])
+        added = sorted(set(services) - old_services) if not baseline else []
+        removed = sorted(old_services - set(services)) if not baseline else []
+        checked_at = int(record.get("checked_at") or record.get("attempted_at") or time.time())
+        if baseline or added or removed:
+            history.append({
+                "checked_at": checked_at,
+                "baseline": baseline,
+                "added": added,
+                "removed": removed,
+                "services": services,
+            })
+        saved = dict(record, services=services, checked_at=checked_at)
+        saved.pop("error", None)
+    else:
+        # Failure details must not replace evidence from the previous success.
+        failure = {key: value for key, value in record.items() if key not in ("services", "checked_at", "history")}
+        saved = dict(previous, **failure)
+    saved["history"] = history[-DISCOVERY_HISTORY_LIMIT:]
+    redis.set("host_services_{}".format(saved["host_id"]), json.dumps(saved, sort_keys=True))
+    return saved
 
 
 def service_display(host, snapshot):

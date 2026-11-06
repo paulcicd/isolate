@@ -22,6 +22,10 @@ if ! getent group auth >/dev/null 2>&1; then
 fi
 
 cd "${AUTH_DATA_ROOT}";
+if [ -f "${AUTH_DATA_ROOT}/.closed-bastion-prepared" ]; then
+    echo "ERROR: this is a root-managed closed bastion; legacy permission repair would weaken its isolation" >&2
+    exit 1
+fi
 mkdir -p keys logs cache backups backups/service spool jobs
 
 chown -R auth:auth "${AUTH_DATA_ROOT}"

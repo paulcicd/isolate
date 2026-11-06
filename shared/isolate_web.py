@@ -3,6 +3,7 @@
 """Lightweight Isolate admin dashboard."""
 
 import html
+import datetime
 import json
 import os
 import re
@@ -12,7 +13,7 @@ import urllib.parse
 
 from isolate import get_grant_record, list_grant_records, load_grants, load_project_sets, redis_client, update_grant_record
 from isolate_audit import prepare_and_dispatch
-from isolate_access import approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, set_notification_status
+from isolate_access import AccessDenied, approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, revoke_access_request, set_notification_status
 from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
 from isolate_build import get_build_info
 from isolate_config import load_config
@@ -53,6 +54,8 @@ from isolate_policy_bundle import PolicyBundleError, apply_bundle, blast_radius,
 from isolate_gitops import GitOpsError, git_policy_status, list_policy_snapshots, rollback_policy, save_policy_snapshot, sync_git_policy
 from isolate_runbooks import list_runbooks
 from isolate_sessions import SessionControlError, get_session, list_active_sessions, list_session_records, request_session_termination
+from isolate_service_discovery import get_discovery_history
+from isolate_self_service import history_filters, history_form, register_self_service
 
 
 _DASHBOARD_STARTED_AT = time.time()
@@ -61,6 +64,13 @@ _DASHBOARD_STARTED_AT = time.time()
 def is_dashboard_admin(identity, config):
     groups = config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or []
     return is_access_admin(identity, groups)
+
+
+def is_self_service_user(identity, config):
+    dashboard = config.get("dashboard", {})
+    groups = dashboard.get("self_service_groups") or []
+    return bool(identity.get("username") and dashboard.get("self_service_enabled", True)
+                and (not groups or set(identity.get("groups") or []) & set(groups)))
 
 
 def _secret_key(config):
@@ -516,7 +526,7 @@ _ACTIVE_NAV_SCRIPT = """
 document.querySelectorAll('.nav-link').forEach(function (link) {
   var href = new URL(link.href).pathname;
   var path = window.location.pathname;
-  if ((href === '/' && path === '/') || (href !== '/' && (path === href || path.indexOf(href + '/') === 0))) {
+  if (((href === '/' || href === '/me') && path === href) || (href !== '/' && href !== '/me' && (path === href || path.indexOf(href + '/') === 0))) {
     link.classList.add('active');
     link.setAttribute('aria-current', 'page');
   }
@@ -753,7 +763,7 @@ def _html(title, body, config=None, notice=None):
     build = _build_info(config)
     refresh = ""
     refresh_seconds = int((config or {}).get("dashboard", {}).get("refresh_seconds") or 0)
-    if refresh_seconds > 0:
+    if refresh_seconds > 0 and title in ("Isolate Dashboard", "Active Sessions", "Access Requests"):
         refresh = '<meta http-equiv="refresh" content="{}">'.format(refresh_seconds)
     notice_html = ""
     if notice:
@@ -775,7 +785,7 @@ def _html(title, body, config=None, notice=None):
     matched_groups = sorted(set(identity.get("groups") or []) & set(admin_groups))
     labels = ("Роль Dashboard", "Группы доступа", "Группы OIDC", "Роли Keycloak") if locale == "ru" else ("Dashboard role", "Access groups", "OIDC groups", "Keycloak roles")
     identity_details = '<details class="identity-details"><summary>{}: {}</summary>{}</details>'.format(
-        labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else "—",
+        labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else "User",
         "".join('<div><strong>{}</strong>: {}</div>'.format(html.escape(label), html.escape(", ".join(values) or "—")) for label, values in zip(labels[1:], (matched_groups, identity.get("groups") or [], identity.get("roles") or []))),
     )
     field_help_script = """
@@ -794,7 +804,26 @@ def _html(title, body, config=None, notice=None):
   }});
 }})();
 """.format(field_help=json.dumps(_FIELD_HELP[locale], ensure_ascii=False).replace("</", "<\\/"))
-    return """<!doctype html>
+    admin_view = is_dashboard_admin(identity, config or {})
+    portal_nav = '<div class="nav-section"><span class="nav-label">{}</span>{}</div>'.format(
+        "Личный кабинет" if locale == "ru" else "My workspace",
+        "".join('<a class="nav-link" href="{}">{}</a>'.format(href, html.escape(label)) for href, label in (
+            ("/me", "Мои серверы" if locale == "ru" else "My servers"),
+            ("/me/access", "Мои заявки" if locale == "ru" else "My requests"),
+            ("/me/sessions", "Мои сессии" if locale == "ru" else "My sessions"),
+            ("/me/history", "Моя история" if locale == "ru" else "My history"),
+        )),
+    )
+    admin_nav = ""
+    if admin_view:
+        for section, entries in (
+            ("operations", (("/", "summary"), ("/jobs", "jobs"), ("/alerts", "alerts"), ("/sessions/active", "active_sessions"), ("/history", "history"), ("/inventory", "inventory"), ("/announcements", "announcements"))),
+            ("access_control", (("/access", "requests"), ("/grants", "grants"), ("/packages", "packages"), ("/policy/matrix", "matrix"), ("/policy/simulate", "simulator"))),
+            ("platform", (("/policy/gitops", "gitops"), ("/users", "users"), ("/notifications", "notifications"), ("/docs", "documentation"))),
+        ):
+            admin_nav += '<div class="nav-section"><span class="nav-label">{}</span>{}</div>'.format(
+                html.escape(words[section]), "".join('<a class="nav-link" href="{}">{}</a>'.format(href, html.escape(words[label])) for href, label in entries))
+    rendered = """<!doctype html>
 <html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
 <script>{theme_bootstrap_script}</script>
 <style>{css}</style></head><body>
@@ -805,15 +834,7 @@ def _html(title, body, config=None, notice=None):
       <span class="brand-copy">Isolate <small>{bastion_control}</small></span>
     </a>
     <nav class="primary-nav" aria-label="{primary_nav}">
-      <div class="nav-section"><span class="nav-label">{operations}</span>
-        <a class="nav-link" href="/">{summary}</a><a class="nav-link" href="/jobs">{jobs}</a><a class="nav-link" href="/alerts">{alerts}</a><a class="nav-link" href="/sessions/active">{active_sessions}</a><a class="nav-link" href="/history">{history}</a><a class="nav-link" href="/inventory">{inventory}</a><a class="nav-link" href="/announcements">{announcements}</a>
-      </div>
-      <div class="nav-section"><span class="nav-label">{access_control}</span>
-        <a class="nav-link" href="/access">{requests}</a><a class="nav-link" href="/grants">{grants}</a><a class="nav-link" href="/packages">{packages}</a><a class="nav-link" href="/policy/matrix">{matrix}</a><a class="nav-link" href="/policy/simulate">{simulator}</a>
-      </div>
-      <div class="nav-section"><span class="nav-label">{platform}</span>
-        <a class="nav-link" href="/policy/gitops">{gitops}</a><a class="nav-link" href="/users">{users}</a><a class="nav-link" href="/notifications">{notifications}</a><a class="nav-link" href="/docs">{documentation}</a>
-      </div>
+      {admin_nav}{portal_nav}
     </nav>
     <div class="build-info"><strong>v{version}</strong>{revision} &middot; schema {schema}<br>Python {python}</div>
     <div class="sidebar-footer">
@@ -829,6 +850,8 @@ def _html(title, body, config=None, notice=None):
 <script>{active_nav_script}{field_help_script}</script>
 </body></html>""".format(
         locale=locale,
+        admin_nav=admin_nav,
+        portal_nav=portal_nav,
         refresh=refresh,
         title=html.escape(str(title)),
         theme_bootstrap_script=_THEME_BOOTSTRAP_SCRIPT,
@@ -851,6 +874,7 @@ def _html(title, body, config=None, notice=None):
         ru_url=html.escape(_locale_url("ru"), quote=True),
         **{key: html.escape(str(value)) for key, value in words.items()}
     )
+    return rendered
 
 
 def _table(rows, columns):
@@ -907,6 +931,12 @@ def _format_ts(value):
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(value)))
     except (TypeError, ValueError, OverflowError):
         return str(value)
+
+
+def _format_access_time(value):
+    if value in (None, ""):
+        return ""
+    return datetime.datetime.fromtimestamp(int(value), datetime.timezone.utc).isoformat()
 
 
 def _parse_json_object(value, field_name="JSON parameters"):
@@ -1089,6 +1119,7 @@ def _host_form_values(form, partial=False):
         "proxy_id": "proxy_id",
         "maintenance_until": "maintenance_until",
         "maintenance_reason": "maintenance_reason",
+        "tags": "tags",
     }
     result = {}
     for source, target in mapping.items():
@@ -1099,6 +1130,8 @@ def _host_form_values(form, partial=False):
         value = _optional_bool(form.get(source))
         if value is not None:
             result[target] = value
+    if form.get("clear_tags") == "true":
+        result["tags"] = {}
     return result
 
 
@@ -1169,7 +1202,9 @@ def create_app(config=None):
         return token
 
     def validate_csrf():
-        if request.form.get("csrf_token") != session.get("csrf_token"):
+        expected = session.get("csrf_token")
+        supplied = request.form.get("csrf_token")
+        if not expected or not supplied or not secrets.compare_digest(str(supplied), str(expected)):
             abort(403)
 
     def require_mutation_confirmation():
@@ -1183,7 +1218,7 @@ def create_app(config=None):
 
     def audit_admin(action, admin, outcome, details=None):
         record = {
-            "event": "dashboard_admin_action",
+            "event": "dashboard_user_action" if (details or {}).get("self_service") else "dashboard_admin_action",
             "action": action,
             "username": admin.get("username"),
             "keycloak_sub": admin.get("keycloak_sub"),
@@ -1217,7 +1252,7 @@ def create_app(config=None):
         return response
 
     def status_filter_links(current):
-        statuses = [("all", None), ("pending", "pending"), ("approved", "approved"), ("denied", "denied")]
+        statuses = [("all", None), ("pending", "pending"), ("approved", "approved"), ("denied", "denied"), ("cancelled", "cancelled"), ("revoked", "revoked")]
         links = []
         for label, value in statuses:
             href = "/access" if value is None else "/access?status={}".format(value)
@@ -1229,7 +1264,7 @@ def create_app(config=None):
         default_ttl = html.escape(str(access_cfg.get("default_ttl", "2h")))
         header = (
             "<th>id</th><th>status</th><th>user</th><th>project</th><th>host</th><th>ticket</th>"
-            "<th>remote_user</th><th>sudo</th><th>reason</th><th>decision</th><th>expires</th><th>grant</th><th>comments</th><th>notify</th><th>actions</th>"
+            "<th>remote_user</th><th>sudo</th><th>reason</th><th>decision</th><th>start (UTC)</th><th>requested end (UTC)</th><th>expires (UTC)</th><th>grant</th><th>comments</th><th>notify</th><th>actions</th>"
         )
         body = ""
         for row in rows:
@@ -1244,7 +1279,9 @@ def create_app(config=None):
                 html.escape(str(row.get("sudo_mode") or "")),
                 html.escape(str(row.get("reason") or "")),
                 html.escape(str(row.get("decision_reason") or "")),
-                html.escape(str(row.get("expires_at") or "")),
+                html.escape(_format_access_time(row.get("starts_at"))),
+                html.escape(_format_access_time(row.get("ends_at"))),
+                html.escape(_format_access_time(row.get("expires_at"))),
                 html.escape(str(row.get("grant_id") or "")),
                 html.escape("; ".join("{}: {}".format(c.get("username") or "", c.get("text") or "") for c in row.get("comments") or [])),
                 html.escape(str((row.get("notification_status") or {}).get("ok", ""))),
@@ -1260,6 +1297,7 @@ def create_app(config=None):
   <input type="hidden" name="id" value="{request_id}">
   <input type="hidden" name="action" value="approve">
   <input name="ttl" value="{default_ttl}" size="5" title="TTL">
+  <input name="starts_at" value="{starts_at}" placeholder="start: ISO time +timezone" size="25">
   <input name="remote_user" value="{remote_user}" placeholder="remote_user" size="10">
   <input name="sudo_mode" value="{sudo_mode}" placeholder="sudo_mode" size="8">
   <input name="comment" placeholder="comment" size="12">
@@ -1278,6 +1316,7 @@ def create_app(config=None):
                     default_ttl=default_ttl,
                     remote_user=remote_user,
                     sudo_mode=sudo_mode,
+                    starts_at=html.escape(_format_access_time(row.get("starts_at")), quote=True),
                 )
             else:
                 request_id = html.escape(str(row.get("id") or ""))
@@ -1290,6 +1329,8 @@ def create_app(config=None):
   <input name="ticket" placeholder="ticket" size="10">
   <button type="submit">Request again</button>
 </form>""".format(token=html.escape(token), request_id=request_id)
+                if row.get("status") == "approved":
+                    actions += '<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><input type="hidden" name="action" value="revoke"><input name="reason" placeholder="revocation reason"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Revoke access</button></form>'.format(html.escape(token), request_id)
             body += "<tr>{}<td>{}</td></tr>".format("".join("<td>{}</td>".format(cell) for cell in cells), actions)
         return "<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>".format(header, body)
 
@@ -1321,10 +1362,11 @@ def create_app(config=None):
         if not isinstance(claims, dict) or not claims:
             abort(401, description="Keycloak did not return verified OIDC claims")
         identity = normalize_claims(claims)
-        if not is_dashboard_admin(identity, config):
+        if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config):
             abort(403)
+        session.clear()
         session["identity"] = identity
-        return redirect(url_for("index"))
+        return redirect(url_for("index") if is_dashboard_admin(identity, config) else "/me")
 
     @app.route("/logout")
     def logout():
@@ -1333,6 +1375,9 @@ def create_app(config=None):
 
     @app.route("/")
     def index():
+        identity = current_identity()
+        if identity and not is_dashboard_admin(identity, config) and is_self_service_user(identity, config):
+            return redirect("/me")
         admin = require_admin()
         if not isinstance(admin, dict):
             return admin
@@ -1383,12 +1428,21 @@ def create_app(config=None):
                 if action == "queue_runbook":
                     parameters = _parse_json_object(request.form.get("parameters"), "runbook parameters")
                     timeout = request.form.get("timeout") or None
+                    host_ids = _split_values(request.form.get("host_ids"))
+                    project_selector = request.form.get("project") or None
+                    tag_selector = request.form.get("tags") or None
+                    if host_ids and (project_selector or tag_selector):
+                        raise JobError("use host IDs or project/tags selectors, not both")
+                    if not host_ids:
+                        if not (project_selector or tag_selector):
+                            raise JobError("an explicit host, project, or tag selector is required")
+                        host_ids = [host["server_id"] for host in list_hosts(redis, project=project_selector, tags=tag_selector)]
                     result = create_runbook_fleet(
                         redis,
                         config,
                         admin,
                         request.form.get("runbook_id"),
-                        _split_values(request.form.get("host_ids")),
+                        host_ids,
                         parameters=parameters,
                         timeout=int(timeout) if timeout else None,
                         confirmed=True,
@@ -1409,7 +1463,7 @@ def create_app(config=None):
                     notice = {"level": "success", "text": "Retried {} failed host(s) in fleet {}.".format(len(retried), fleet_id)}
                 else:
                     raise JobError("unknown jobs action")
-            except (JobError, ValueError) as exc:
+            except (JobError, HostValidationError, ValueError) as exc:
                 audit_admin("jobs_action", admin, "denied", {"error": str(exc)})
                 notice = {"level": "error", "text": str(exc)}
 
@@ -1448,7 +1502,9 @@ def create_app(config=None):
             body += """<div class="panel"><h2>Queue runbook</h2>
 <form method="post"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="queue_runbook">
 <p><label>Runbook <select name="runbook_id" required>{options}</select></label>
-<label>Host IDs <input name="host_ids" placeholder="10001, 10002" required></label>
+<label>Host IDs <input name="host_ids" placeholder="10001, 10002"></label>
+<label>Or project <input name="project" placeholder="payments-prod"></label>
+<label>Tags <input name="tags" placeholder="env=prod,owner=payments"></label>
 <label>Timeout <input name="timeout" type="number" min="1" placeholder="default"></label></p>
 <p><label>Parameters JSON <textarea name="parameters" rows="3" cols="72">{{}}</textarea></label></p>
 <p><label><input type="checkbox" name="confirm" value="true" required> confirm execution on all selected hosts</label> <button type="submit">Queue runbook</button></p>
@@ -1792,16 +1848,11 @@ def create_app(config=None):
         admin = require_admin()
         if not isinstance(admin, dict):
             return admin
-        rows = read_history(
-            config["logging"]["base_path"],
-            admin,
-            query=request.args.get("q"),
-            user=request.args.get("user"),
-            project=request.args.get("project"),
-            host=request.args.get("host"),
-            limit=int(request.args.get("limit", 50)),
-            admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
-        )
+        try:
+            rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
+                                admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
+        except ValueError as exc:
+            abort(400, description=str(exc))
         redis = redis_client(config)
         for row in rows:
             connection_id = row.get("connection_id") or row.get("session_id")
@@ -1818,8 +1869,10 @@ def create_app(config=None):
                     urllib.parse.quote(str(row.get("username") or ""), safe=""),
                     urllib.parse.quote(str(row.get("connection_id") or row.get("session_id") or ""), safe=""),
                 )
-        export_links = '<p><a href="/export/history?format=csv">Download CSV</a> &middot; <a href="/export/history?format=json">Download JSON</a></p>'
-        return _html("History", "<h1>History</h1>" + export_links + _table(rows, [
+        query = {key: value for key, value in request.args.items() if key != "format"}
+        export_links = '<p>' + " &middot; ".join('<a href="/export/history?{}">Download {}</a>'.format(
+            html.escape(urllib.parse.urlencode(dict(query, format=fmt)), quote=True), fmt.upper()) for fmt in ("csv", "json")) + '</p>'
+        return _html("History", "<h1>History</h1>" + history_form(request.args, locale=_dashboard_locale(config)) + export_links + _table(rows, [
             ("time", "time"), ("user_link", "user"), ("project", "project"), ("host_id", "host"),
             ("server_name", "host name"), ("target", "target"), ("remote_user", "remote_user"),
             ("result", "result"), ("details", "details"), ("raw", "raw")
@@ -1833,17 +1886,20 @@ def create_app(config=None):
         redis = redis_client(config)
         output_format = request.args.get("format", "csv")
         if kind == "inventory":
-            rows = list_hosts(redis, project=request.args.get("project"), query=request.args.get("q"))
+            try:
+                rows = list_hosts(redis, project=request.args.get("project"), query=request.args.get("q"), tags=request.args.get("tags") or None)
+            except HostValidationError as exc:
+                abort(400, description=str(exc))
         elif kind == "grants":
             rows = list_grant_records(redis, project=request.args.get("project"))
         elif kind == "users":
             rows = list_user_profiles(config["logging"]["base_path"])
         elif kind == "history":
-            rows = read_history(
-                config["logging"]["base_path"], admin, query=request.args.get("q"), user=request.args.get("user"),
-                project=request.args.get("project"), host=request.args.get("host"), limit=min(int(request.args.get("limit", 100)), 1000),
-                admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
-            )
+            try:
+                rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
+                                    admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
+            except ValueError as exc:
+                abort(400, description=str(exc))
         elif kind == "access-matrix":
             matrix = build_access_matrix(
                 load_grants(redis), load_project_sets(redis), list_hosts(redis),
@@ -1886,6 +1942,7 @@ def create_app(config=None):
                         sudo_mode=sudo_mode,
                         max_ttl=max_ttl,
                         comment=request.form.get("comment") or None,
+                        starts_at=request.form.get("starts_at") or None,
                     )
                     notice = notify_dashboard(redis, "access_request_approved", record, admin, extra={"grant": grant})
                     notice = notice or {"level": "info", "text": "Access request approved"}
@@ -1894,9 +1951,21 @@ def create_app(config=None):
                     notice = notify_dashboard(redis, "access_request_denied", record, admin)
                     notice = notice or {"level": "info", "text": "Access request denied"}
                 elif action == "repeat":
-                    record = repeat_access_request(redis, request_id, admin, reason=request.form.get("reason") or None, ticket=request.form.get("ticket") or None, config=config)
+                    record = repeat_access_request(redis, request_id, admin, reason=request.form.get("reason") or None, ticket=request.form.get("ticket") or None, config=config,
+                                                   admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
                     notice = notify_dashboard(redis, "access_request_created", record, admin)
                     notice = notice or {"level": "info", "text": "Access request repeated"}
+                elif action == "revoke":
+                    require_mutation_confirmation()
+                    record = revoke_access_request(redis, request_id, admin,
+                        admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [],
+                        reason=request.form.get("reason") or None)
+                    if record is None:
+                        raise ValueError("access request was not found")
+                    audit_admin("access_request_revoke", admin, "applied", {"access_request_id": request_id})
+                    notice = notify_dashboard(redis, "access_request_revoked", record, admin) or {"level": "info", "text": "Access revoked"}
+                else:
+                    raise ValueError("unknown access action")
             except Exception as exc:
                 notice = {"level": "error", "text": str(exc)}
         status = request.args.get("status")
@@ -1969,7 +2038,10 @@ def create_app(config=None):
                 notice = {"level": "error", "text": str(exc)}
         project = request.args.get("project") or None
         query = request.args.get("q") or None
-        rows = list_hosts(redis, project=project, query=query)
+        try:
+            rows = list_hosts(redis, project=project, query=query, tags=request.args.get("tags") or None)
+        except HostValidationError as exc:
+            abort(400, description=str(exc))
         for row in rows:
             row["project_link"] = '<a href="/history?project={}">{}</a>'.format(
                 html.escape(str(row.get("project_name") or "")),
@@ -1977,15 +2049,17 @@ def create_app(config=None):
             )
             row["history"] = '<a href="/history?host={}">history</a>'.format(html.escape(str(row.get("server_id") or "")))
             row["details"] = '<a href="/inventory/{}/edit">edit</a>'.format(html.escape(str(row.get("server_id") or "")))
+            row["actions"] = '<a href="/inventory/{}/services">service changes</a>'.format(urllib.parse.quote(str(row.get("server_id") or ""), safe=""))
             last_check = get_last_check(redis, row.get("server_id"))
             row["connectivity"] = "unknown" if not last_check else ("reachable" if last_check.get("ok") else "failed")
             row["control"] = '<form method="post" class="inline"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="action" value="connectivity_check"><input type="hidden" name="host_id" value="{}"><input type="hidden" name="confirm" value="true"><button type="submit">Check</button></form>'.format(html.escape(csrf_token()), html.escape(str(row.get("server_id") or "")))
         body = """
 <h1>Inventory</h1>
-<p><a href="/export/inventory?format=csv">Download CSV</a> &middot; <a href="/export/inventory?format=json">Download JSON</a></p>
+<p>{export_links}</p>
 <form method="get">
   <input name="project" value="{project}" placeholder="project">
   <input name="q" value="{query}" placeholder="search">
+  <input name="tags" value="{tags}" placeholder="env=prod,owner=payments">
   <button type="submit">Search</button>
 </form>
 <h2>Add host</h2>
@@ -1994,6 +2068,7 @@ def create_app(config=None):
   <input name="project" placeholder="project" required><input name="name" placeholder="name" required>
   <input name="ip" placeholder="IP" required><input name="port" value="22" size="5">
   <input name="user" placeholder="remote user" required><input name="services" placeholder="services">
+  <input name="tags" placeholder="env=prod,owner=payments">
   <select name="vip"><option value="false">standard</option><option value="true">VIP</option></select>
   <label><input type="checkbox" name="confirm" value="true" required> confirm</label><button type="submit">Add</button>
 </form>
@@ -2002,6 +2077,7 @@ def create_app(config=None):
   <input type="hidden" name="csrf_token" value="{csrf}"><input type="hidden" name="action" value="bulk_update">
   <input name="host_ids" placeholder="10001,10002" required><input name="project" placeholder="new project">
   <input name="user" placeholder="new remote user"><input name="services" placeholder="new services">
+  <input name="tags" placeholder="replace tags: env=prod"><label><input type="checkbox" name="clear_tags" value="true"> clear tags</label>
   <select name="vip"><option value="">keep VIP</option><option value="true">VIP</option><option value="false">not VIP</option></select>
   <select name="maintenance"><option value="">keep maintenance</option><option value="true">maintenance</option><option value="false">available</option></select>
   <label><input type="checkbox" name="confirm" value="true" required> confirm</label><button type="submit">Apply</button>
@@ -2009,12 +2085,16 @@ def create_app(config=None):
 """.format(
             project=html.escape(project or ""),
             query=html.escape(query or ""),
+            tags=html.escape(request.args.get("tags") or "", quote=True),
+            export_links=" &middot; ".join('<a href="/export/inventory?{}">Download {}</a>'.format(
+                html.escape(urllib.parse.urlencode({**request.args.to_dict(), "format": fmt}), quote=True), fmt.upper()) for fmt in ("csv", "json")),
             csrf=html.escape(csrf_token()),
         )
         body += _table(rows, [
             ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
             ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services_display", "services"),
             ("maintenance_marker", "state"), ("maintenance_reason", "maintenance reason"),
+            ("tags_display", "tags"), ("actions", "service changes"),
             ("server_note", "note"), ("privileged_access_provider", "privileged"), ("privileged_access_hint", "hint"),
             ("connectivity", "connectivity"), ("control", "check"), ("history", "history"), ("details", "edit")
         ])
@@ -2056,6 +2136,7 @@ def create_app(config=None):
 <p>Project <input name="project" value="{project}" required> Name <input name="name" value="{name}" required></p>
 <p>IP <input name="ip" value="{ip}" required> Port <input name="port" value="{port}" required> User <input name="user" value="{user}" required></p>
 <p>Services <input name="services" value="{services}" size="60"></p>
+<p>Tags <input name="tags" value="{tags}" placeholder="env=prod,owner=payments" size="60"></p>
 <p>Note <input name="note" value="{note}" size="80"></p>
 <p>VIP <select name="vip"><option value="false">false</option><option value="true" {vip_selected}>true</option></select>
 No sudo <select name="nosudo"><option value="false">false</option><option value="true" {nosudo_selected}>true</option></select></p>
@@ -2071,6 +2152,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             project=html.escape(str(host.get("project_name") or "")), name=html.escape(str(host.get("server_name") or "")),
             ip=html.escape(str(host.get("server_ip") or "")), port=html.escape(str(host.get("server_port") or 22)),
             user=html.escape(str(host.get("server_user") or "")), services=html.escape(str(host.get("server_services") or "")),
+            tags=html.escape(str(host.get("tags_display") or ""), quote=True),
             note=html.escape(str(host.get("server_note") or "")), vip_selected="selected" if host.get("server_vip") else "",
             nosudo_selected="selected" if host.get("server_nosudo") else "", provider=html.escape(str(host.get("privileged_access_provider") or "")),
             provider_url=html.escape(str(host.get("privileged_access_url") or "")), provider_hint=html.escape(str(host.get("privileged_access_hint") or "")),
@@ -3000,6 +3082,26 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
             return send_file(details["raw_log_path"], mimetype="text/plain")
         abort(404)
 
+    @app.route("/inventory/<server_id>/services")
+    def service_changes(server_id):
+        admin = require_admin()
+        if not isinstance(admin, dict):
+            return admin
+        redis = redis_client(config)
+        host = get_host(redis, server_id)
+        if host is None:
+            abort(404)
+        rows = get_discovery_history(redis, server_id, limit=50)
+        for row in rows:
+            row["time"] = _format_ts(row.get("checked_at"))
+            row["kind"] = "baseline" if row.get("baseline") else "change"
+            for key in ("added", "removed", "services"):
+                row[key] = ", ".join(row.get(key) or [])
+        body = '<h1>Service changes: {}</h1><p>Last 50 changes to running systemd units. Baseline establishes the initial state; failed scans do not create changes.</p>'.format(html.escape(host.get("server_name") or str(server_id)))
+        body += _table(rows, [("time", "time"), ("kind", "kind"), ("added", "appeared"), ("removed", "disappeared"), ("services", "running services")])
+        return _html("Service changes", body, config=config)
+
+    register_self_service(app, config, current_identity, csrf_token, validate_csrf, notify_dashboard, audit_admin)
     return app
 
 

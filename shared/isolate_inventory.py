@@ -29,6 +29,50 @@ def normalize_services(value):
     return str(value).strip()
 
 
+def normalize_tags(value):
+    """Return validated, deterministic tags from a mapping or key=value selectors.
+
+    Text forms accept comma/newline-separated pairs. An empty value clears tags;
+    duplicate keys with conflicting values are rejected rather than silently
+    changing the selected fleet.
+    """
+    if value is None or value == "":
+        return {}
+    if isinstance(value, dict):
+        pairs = list(value.items())
+    else:
+        if isinstance(value, str):
+            value = [item.strip() for item in re.split(r"[,\r\n]+", value) if item.strip()]
+        if not isinstance(value, (list, tuple, set)):
+            raise HostValidationError("tags must be a mapping or key=value pairs")
+        pairs = []
+        for item in value:
+            if not isinstance(item, str) or "=" not in item:
+                raise HostValidationError("each tag must use key=value")
+            pairs.append(item.split("=", 1))
+    if len(pairs) > 64:
+        raise HostValidationError("at most 64 tags are allowed")
+    normalized = {}
+    for key, tag_value in pairs:
+        if not isinstance(key, str) or not isinstance(tag_value, str):
+            raise HostValidationError("tag keys and values must be strings")
+        key, tag_value = key.strip(), tag_value.strip()
+        if re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/-]{0,63}", key) is None:
+            raise HostValidationError("tag keys must contain 1-64 letters, digits, or ._:/-")
+        if not tag_value or len(tag_value) > 256 or "," in tag_value or any(ord(char) < 32 or ord(char) == 127 for char in tag_value):
+            raise HostValidationError("tag values must contain 1-256 printable characters without commas")
+        if key in normalized and normalized[key] != tag_value:
+            raise HostValidationError("conflicting values for tag {}".format(key))
+        normalized[key] = tag_value
+    return dict(sorted(normalized.items()))
+
+
+def host_matches_tags(host, tags):
+    selectors = normalize_tags(tags)
+    host_tags = normalize_tags((host or {}).get("tags"))
+    return all(host_tags.get(key) == value for key, value in selectors.items())
+
+
 def normalize_host(host):
     row = dict(host)
     row["server_id"] = str(row.get("server_id") or "")
@@ -37,6 +81,8 @@ def normalize_host(host):
     row["server_ip"] = str(row.get("server_ip") or "")
     row["server_services"] = normalize_services(row.get("server_services"))
     row["server_note"] = str(row.get("server_note") or "").strip()
+    row["tags"] = normalize_tags(row.get("tags"))
+    row["tags_display"] = ", ".join("{}={}".format(key, value) for key, value in row["tags"].items())
     row["server_vip"] = bool(row.get("server_vip"))
     row["server_vip_marker"] = "VIP" if row["server_vip"] else ""
     row["privileged_access_provider"] = str(row.get("privileged_access_provider") or "").strip()
@@ -64,7 +110,8 @@ def host_revision(host):
     return hashlib.sha256(encoded).hexdigest()
 
 
-def list_hosts(redis, project=None, query=None):
+def list_hosts(redis, project=None, query=None, tags=None):
+    selectors = normalize_tags(tags)
     rows = []
     for key in redis.keys("server_*"):
         if re.match(r"^server_[0-9]+$", decode(key)) is None:
@@ -79,6 +126,8 @@ def list_hosts(redis, project=None, query=None):
         if project and host.get("project_name") != project:
             continue
         if query and not host_matches_query(host, query):
+            continue
+        if selectors and not host_matches_tags(host, selectors):
             continue
         rows.append(host)
     return sorted(rows, key=lambda row: (row.get("project_name") or "", row.get("server_name") or "", row.get("server_id") or ""))
@@ -108,6 +157,7 @@ def host_matches_query(host, query):
         "server_services",
         "server_services_display",
         "server_note",
+        "tags_display",
         "server_vip_marker",
         "privileged_access_provider",
         "privileged_access_url",
@@ -120,6 +170,8 @@ def host_matches_query(host, query):
 
 def validate_host_updates(redis, updates):
     normalized = {}
+    if updates.get("tags") is not None:
+        normalized["tags"] = normalize_tags(updates["tags"])
     if updates.get("project_name") is not None:
         project = str(updates["project_name"]).strip().lower()
         if re.match(r"^[A-Za-z,\d\-]*$", project) is None or len(project) > 48:
@@ -259,6 +311,7 @@ def create_host(redis, values, updated_by=None):
         "server_nosudo": normalized.get("server_nosudo"),
         "server_services": normalized.get("server_services", ""),
         "server_note": normalized.get("server_note", ""),
+        "tags": normalized.get("tags", {}),
         "server_vip": normalized.get("server_vip", False),
         "privileged_access_provider": normalized.get("privileged_access_provider", ""),
         "privileged_access_url": normalized.get("privileged_access_url", ""),
@@ -287,6 +340,7 @@ def format_hosts_table(rows):
         ("maintenance_marker", "state", 6),
         ("server_user", "user", 12),
         ("server_services_display", "services", 32),
+        ("tags_display", "tags", 24),
     ]
     lines = ["  ".join(label.ljust(width) for _, label, width in columns)]
     for row in rows:

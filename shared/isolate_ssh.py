@@ -71,7 +71,7 @@ def filter_extra_args(extra_args, allowed):
     allowed = set(allowed or [])
     result = []
     for arg in extra_args or []:
-        if arg not in allowed:
+        if arg not in allowed or arg == "-A":
             raise SSHArgumentError("SSH argument '{}' is not allowed".format(arg))
         result.append(arg)
     return result
@@ -79,8 +79,14 @@ def filter_extra_args(extra_args, allowed):
 
 def build_ssh_argv(config, host, extra_args=None, proxy=None, remote_command=None, send_env=None):
     ssh = config.get("binary", "/usr/bin/ssh")
-    argv = [ssh, "-e", "none", "-F", config.get("config_path", "/opt/auth/configs/defaults.conf")]
-    if config.get("allocate_tty", True):
+    argv = [ssh, "-e", "none", "-F", config.get("config_path", "/opt/auth/configs/defaults.conf"),
+            "-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no",
+            "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes"]
+    if config.get("managed_commands", False):
+        argv.extend(["-T", "-n", "-o", "StdinNull=yes", "-o", "RequestTTY=no",
+                     "-o", "RemoteCommand=none", "-o", "SessionType=default",
+                     "-o", "ForwardX11=no", "-o", "ControlMaster=no", "-o", "ControlPath=none"])
+    elif config.get("allocate_tty", True):
         argv.append("-tt")
     argv.extend(filter_extra_args(extra_args, config.get("allowed_extra_args")))
     selected_env = list(send_env or [])
@@ -96,6 +102,7 @@ def build_ssh_argv(config, host, extra_args=None, proxy=None, remote_command=Non
             proxy_argv.extend(["-l", validate_user(proxy["user"])])
         if proxy.get("port"):
             proxy_argv.extend(["-p", str(validate_port(proxy["port"]))])
+        proxy_argv.extend(["-o", "ForwardAgent=no", "-o", "ClearAllForwardings=yes", "-o", "PermitLocalCommand=no", "-o", "StrictHostKeyChecking=yes", "-o", "BatchMode=yes"])
         proxy_argv.extend([validate_host(proxy["host"]), "nc", "%h", "%p"])
         argv.extend(["-o", "ProxyCommand=" + " ".join(proxy_argv)])
 

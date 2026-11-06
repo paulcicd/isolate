@@ -204,8 +204,7 @@ def _validate_claims(claims, keycloak_config, now=None):
     if expected_audience:
         aud = claims.get("aud")
         audiences = aud if isinstance(aud, list) else [aud]
-        azp = claims.get("azp")
-        if expected_audience not in audiences and expected_audience != azp:
+        if expected_audience not in audiences:
             raise IdentityError("invalid token audience")
 
 

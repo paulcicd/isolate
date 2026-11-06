@@ -43,6 +43,9 @@ def build_access_notification(config, event_name, request_record, actor=None, ex
         "access_request_created": "Access request created",
         "access_request_approved": "Access request approved",
         "access_request_denied": "Access request denied",
+        "access_request_cancelled": "Access request cancelled",
+        "access_request_revoked": "Access request revoked",
+        "access_request_renewed": "Access renewal requested",
     }
     title = "{} #{}".format(title_by_event.get(event_name, event_name), request_id or "")
     lines = [
@@ -61,6 +64,9 @@ def build_access_notification(config, event_name, request_record, actor=None, ex
         lines.append("decision_reason: {}".format(request_record.get("decision_reason")))
     if request_record.get("expires_at"):
         lines.append("expires_at: {}".format(request_record.get("expires_at")))
+    for field in ("starts_at", "ends_at", "renewal_of", "revoke_reason"):
+        if request_record.get(field) is not None:
+            lines.append("{}: {}".format(field, request_record[field]))
     if payload.get("dashboard_url"):
         lines.append("dashboard: {}".format(payload["dashboard_url"]))
 

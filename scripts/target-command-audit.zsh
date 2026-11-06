@@ -18,15 +18,15 @@ __isolate_audit_precmd() {
   fi
   local command="$__isolate_audit_last_command"
   __isolate_audit_last_command=""
+  local remote_command="isolate command-log append" arg
+  for arg in "--connection-id=$connection_id" \
+      "--host-id=${ISOLATE_HOST_ID:-}" "--project=${ISOLATE_PROJECT:-}" \
+      "--cwd=$PWD" "--exit-code=$exit_code" "--shell=zsh" "--command=$command"; do
+    arg=${arg//\'/\'\\\'\'}
+    remote_command+=" '$arg'"
+  done
   ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=3 \
-      "$ISOLATE_AUDIT_BASTION" isolate command-log append \
-    --connection-id "$connection_id" \
-    --host-id "${ISOLATE_HOST_ID:-}" \
-    --project "${ISOLATE_PROJECT:-}" \
-    --cwd "$PWD" \
-    --exit-code "$exit_code" \
-    --shell zsh \
-      --command "$command" >/dev/null 2>&1 &!
+      -- "$ISOLATE_AUDIT_BASTION" "$remote_command" >/dev/null 2>&1 &!
   return "$exit_code"
 }
 

@@ -26,6 +26,8 @@ def _subject_matches(grant, identity):
     subject = grant.get("subject")
     name = grant.get("name")
     if subject == "user":
+        if "keycloak_sub" in grant:
+            return bool(grant["keycloak_sub"]) and grant["keycloak_sub"] == identity.get("keycloak_sub")
         return name == identity.get("username")
     if subject == "group":
         return name in (identity.get("groups") or [])
@@ -102,6 +104,7 @@ def grant_specificity(grant):
 def _matches(grant, identity, project=None, host=None, project_sets=None):
     return (
         not _is_expired(grant)
+        and not _is_not_started(grant)
         and _subject_matches(grant, identity)
         and _host_matches(grant, host)
         and _project_matches(grant, project, project_sets=project_sets)
@@ -109,7 +112,7 @@ def _matches(grant, identity, project=None, host=None, project_sets=None):
 
 
 def matching_grants(identity, project=None, host=None, grants=None, project_sets=None):
-    """Return all non-expired matching grants in resolver precedence order."""
+    """Return currently active matching grants in resolver precedence order."""
     matches = [
         grant for grant in (grants or [])
         if _matches(grant, identity, project=project, host=host, project_sets=project_sets)
@@ -122,6 +125,11 @@ def _is_expired(grant, now=None):
     if expires_at is None:
         return False
     return int(expires_at) <= int(now if now is not None else time.time())
+
+
+def _is_not_started(grant, now=None):
+    starts_at = grant.get("starts_at")
+    return starts_at is not None and int(starts_at) > int(now if now is not None else time.time())
 
 
 def resolve_grant(identity, project=None, host=None, grants=None, project_sets=None, defaults=None, action="ssh"):

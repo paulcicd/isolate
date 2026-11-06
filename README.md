@@ -32,6 +32,8 @@ All examples in this document use fictional users, groups, domains, projects, an
 - Active session registry.
 - JSONL audit logs and legacy raw SSH transcripts.
 - Lightweight Flask admin dashboard.
+- User web workspace for allowed hosts, personal sessions, history, and access requests.
+- Structured host tags, CLI runbook fleets, scheduled access windows, and service change history.
 - Safer SSH argv construction through `subprocess` arguments.
 - Permission repair workflow for Git deploys.
 - Verifiable service backups for configuration, credentials, host keys, and Redis state.
@@ -762,6 +764,29 @@ isolate host update 10004 \
 
 `isolate host update` preserves all fields that were not passed and updates `updated_by` / `updated_at`.
 
+### Structured Host Tags
+
+Hosts can carry exact string tags such as `env=prod`, `owner=payments`, and `region=nsk`:
+
+```bash
+isolate host update 10004 --tag env=prod --tag owner=payments --tag region=nsk
+isolate host list --project kube-prod --tag env=prod --tag region=nsk
+isolate export inventory --tag env=prod --format csv --output prod-hosts.csv
+isolate host update 10004 --remove-tag region
+isolate host update 10004 --clear-tags
+```
+
+Repeated `--tag key=value` selectors use exact AND matching. CLI updates merge supplied
+tags with the host's existing mapping; `--remove-tag` removes named keys and
+`--clear-tags` starts from an empty mapping. Conflicting values for the same selector
+are rejected. Tags select inventory and fleets; they do not grant access.
+
+Dashboard Inventory supports tag filtering and tag fields on create/edit forms;
+inventory CSV/JSON download links preserve the selected filters.
+Its bulk tag field replaces the complete mapping for every selected host; leave it
+blank to preserve existing tags, or use the explicit clear-tags control to remove
+them. A full host edit also replaces the tag mapping with the submitted field.
+
 VIP and privileged access fields are informational. They do not change grants by themselves. Use them to document that ordinary non-sudo SSH access stays in Isolate, while sudo/root access is handled by an external privileged access provider such as Warpgate, Teleport, PAM, or another bastion.
 
 If a VIP host is denied by policy and privileged access metadata is configured, `g` prints a hint with the external provider and URL.
@@ -1358,6 +1383,7 @@ Arguments:
 - `--reason`: required business reason or incident id.
 - `--ticket`: optional ticket id. If `access.ticket_required: true`, it must match `access.ticket_pattern`.
 - `--template`: optional request template from `access.request_templates`.
+- `--starts-at`, `--ends-at`: optional access-window boundaries, as Unix seconds or ISO 8601 timestamps with an explicit timezone.
 
 Template example:
 
@@ -1414,6 +1440,43 @@ TTL examples:
 ```
 
 `access.max_ttl` limits the maximum approval duration.
+
+### Scheduled Access Windows
+
+Request a future window without making access available immediately:
+
+```bash
+isolate access request --project payments-prod --host 10042 \
+  --remote-user dba --sudo-mode none --reason "CHG-1003 maintenance" \
+  --starts-at '2030-01-02T22:00:00+07:00' --ends-at '2030-01-02T23:00:00+07:00'
+isolate access approve --id 12 --ttl 2h
+```
+
+Replace the example dates with the intended change window. ISO timestamps must
+include `Z` or an offset such as `+07:00`; ambiguous local datetimes are rejected.
+The approver can override the start with `--starts-at`. The effective start is
+never earlier than approval time, and expiry is the earlier of the requested end
+and effective start plus approved TTL. `access.max_ttl` bounds the effective
+duration. An end before the effective start is rejected. Policy checks exclude
+grants before their start and after expiry across CLI, SSH, jobs, and dashboard.
+
+### Cancel, Revoke, And Renew
+
+```bash
+# Requester: cancel a still-pending request.
+isolate access cancel --id 12 --yes
+# Access administrator: revoke the request's issued temporary grant.
+isolate access revoke --id 13 --reason "Incident resolved" --yes
+# Requester: submit a renewal for fresh approval.
+isolate access renew --id 14 --reason "Follow-up diagnostics" --ticket INC-1004
+```
+
+Cancellation records `cancelled`; revocation removes the linked temporary grant
+and records `revoked`. Renewal of an approved request creates a new `pending`
+request linked through `renewal_of`, without extending the existing grant.
+Renewals also accept `--starts-at` and `--ends-at`. Decisions and lifecycle changes
+retain their comment timeline and notification results. Where recorded, ownership
+uses the immutable Keycloak subject; legacy records fall back to the username.
 
 ### Admin Denies
 
@@ -1571,6 +1634,23 @@ history:
 
 Ordinary users can only see their own history.
 
+### History Filters And Matching Exports
+
+```bash
+isolate history --project payments-prod --since 2026-11-01 --until 2026-11-06 --result failure
+isolate history --since '2026-11-06T00:00:00+07:00' --result exit=255 --json
+isolate export history --project payments-prod --since 2026-11-01 \
+  --until 2026-11-06 --result success --format csv --output history.csv
+```
+
+`--since` and `--until` accept Unix seconds, UTC calendar dates, or ISO 8601
+datetimes with an explicit timezone. A date-only `--until` includes the entire UTC
+day. Datetimes without an offset are rejected. Result filters include `success`
+(`exit=0`), `failure` (a nonzero recorded exit), or an exact result such as
+`exit=255`, `started`, or `selected`. Existing per-user visibility and result limits
+still apply. Dashboard History provides the same filter form and preserves its
+filters in CSV/JSON download links.
+
 ## Active Sessions
 
 The SSH wrapper writes active session state to Redis:
@@ -1707,13 +1787,74 @@ replay:
 
 ### Structured Command Audit
 
-Structured command audit is opt-in and is intentionally separate from raw PTY replay. Isolate does not try to infer commands from terminal control sequences. Instead, target hosts can install shell hooks that submit completed commands back to the bastion.
+Structured command audit is separate from raw PTY replay. Isolate does not infer commands from terminal control sequences. Choose `managed` to audit every accepted command string at the execution boundary, or keep the legacy `target-hooks` mode for partial reports from target shells.
 
-Enable it:
+#### Managed command input
+
+Enable in the trusted bastion config (`/etc/isolate/isolate.yml`), not in a user-writable config:
 
 ```yaml
 command_audit:
   enabled: true
+  mode: managed
+  max_command_length: 4096
+  command_timeout_seconds: 300
+  send_env: false
+logging:
+  base_path: /opt/auth/logs
+  sinks:
+    - type: jsonl
+      path: /opt/auth/spool/audit.jsonl
+```
+
+Run `isolate config validate --check-paths` and enable `isolate-audit-export.service` as described below. Existing `s`/`g` connections through the privileged SSH wrapper now open an `isolate>` prompt. The mode is selected by trusted configuration; a caller cannot request an unrestricted shell instead. No target hook, callback key or `AcceptEnv` changes are needed. Keycloak identity, inventory, grants and target key validation still apply, and authorization is forcibly rechecked before every submitted command is executed.
+
+Each accepted, nonempty input line is a command string. It is signed where configured and synchronously persisted with `fsync` as `command_start` **before** a child SSH process can start. A `command` event with the same `command_id` records the result afterwards. Both reach the common `/opt/auth/spool/events.jsonl` through the exporter. If signing, a configured JSONL sink, local append or synchronization fails, execution stops. Failure while saving a result closes the managed session before the next command. The local spool/session logs remain the durable source while the exporter is stopped; the common feed catches up when it resumes. Syslog remains best effort. This does not acknowledge delivery to Wazuh.
+
+For example, `printf '%s' 'hello world'; false` remains one complete submitted command, including spaces, quotes and compound shell syntax. Its final event includes:
+
+```json
+{
+  "event": "command",
+  "timestamp": "2026-10-16T13:00:00.000Z",
+  "ts": 1792155600.0,
+  "username": "engineer1",
+  "keycloak_sub": "keycloak-subject",
+  "host_id": "10042",
+  "connection_id": "connection-uuid",
+  "command_id": "command-uuid",
+  "command": "printf '%s' 'hello world'; false",
+  "exitcode": 1,
+  "exit_code": 1,
+  "exit_code_known": true,
+  "command_status": "completed",
+  "source": "isolate-managed",
+  "audit_scope": "submitted_command",
+  "audit_complete": true,
+  "result_scope": "ssh_remote_exec"
+}
+```
+
+The event also carries project, target endpoint, remote user, sudo mode, source IP, sequence, completion time and duration when available. `timestamp`/`ts` identify submission time, and `finished_at` identifies completion. Identity and host fields originate from the verified wrapper authorization rather than a target-provided environment variable. `exit_code` is retained for existing consumers; `exitcode` is its alias.
+
+Each command opens a **new** SSH exec channel and `/bin/sh -c` process with `-T`, `-n`, `StdinNull=yes` and local `DEVNULL`. There is no remote terminal or interactive stdin, and connection multiplexing is disabled. `cd` and exported variables do not persist between commands: combine dependent actions into one submitted line, such as `cd /var/log && ls -l`. Interactive editors, password prompts, nested interactive shells and multiline interactive entry are unavailable. `sudo-i` policies use noninteractive `sudo -n -i`; targets must already permit the corresponding operation. Otherwise the remote exec returns its failure status.
+
+This mode guarantees capture of each **accepted input string**, not each statement generated inside a script, child shell or application. A compound command gets its remote exec status, not an exit code for each subcommand. Program arguments and script bodies included in the submitted string are preserved. The mode is not a syscall recorder. Background processes can outlive their launching shell, and terminating SSH does not prove that detached target processes stopped.
+
+OpenSSH returns 255 for transport/authentication failures and can also return a real remote status of 255. Therefore 255, signals, cancellation, revocation and timeout produce `exitcode: null`, `exit_code_known: false`, `command_status: unknown` and a reason; the observed SSH return code is kept separately. The managed session closes on an unknown result. A crash can leave a durable `command_start` without a result: treat this as an unknown outcome, not as success or proof that execution started. See [OpenSSH exit status](https://man.openbsd.org/ssh.1#EXIT_STATUS).
+
+`exit` is an audited local session-exit action; Ctrl+D submits no fake command. Ctrl+C closes the managed session, preserving any already submitted command and reporting an unknown result if execution was interrupted. Inputs exceeding the configured limit (hard maximum 4096 characters) or containing NUL are rejected without executing either the prefix or the remainder. Rejection records contain a bounded preview and set `command_truncated`/`audit_complete` accordingly. Timeout 0 disables the per-command timeout; identity/grant/session expiry checks remain active during execution.
+
+This applies to the classic Isolate SSH wrapper. Transparent incoming ProxyJump/forwarding does not pass through this input boundary and cannot provide this guarantee; leave it disabled for a managed-only bastion. Job workers/MCP are separate execution paths. Stop pre-upgrade unrestricted sessions before claiming managed-only coverage. The closed bastion profile enables this mode while keeping contractor connections disabled until its realm and grants are ready.
+
+#### Legacy target hooks
+
+For partial target-shell reports, use:
+
+```yaml
+command_audit:
+  enabled: true
+  mode: target-hooks
   require_connection_id: true
   require_active_session: true
   completion_grace_seconds: 30
@@ -1806,6 +1947,8 @@ dashboard:
   secret_key_file: /opt/auth/keys/dashboard_secret
   refresh_seconds: 15
   default_locale: en
+  self_service_enabled: true
+  self_service_groups: []
   admin_groups:
     - Demo-DevOps
     - Demo-Security
@@ -1819,10 +1962,14 @@ https://bastion.example.org/auth/callback
 
 Routes:
 
-- `/`: summary.
+- `/`: administrator summary, or redirect to the user workspace for an eligible non-admin.
 - `/login`: Keycloak login.
 - `/auth/callback`: OIDC callback.
 - `/logout`: logout.
+- `/me`: personal workspace and policy-allowed hosts.
+- `/me/sessions`: the current user's active sessions.
+- `/me/history` and `/me/history/export`: the current user's filtered history and CSV/JSON export.
+- `/me/access`: create and track personal access requests, add comments, cancel pending requests, and request renewals.
 - `/sessions/active`: active SSH sessions, live view, and optional force termination.
 - `/jobs`: jobs/runbooks queue, fleet progress, filters, cancel, and failed-host retry.
 - `/job/<job_id>`: job authorization snapshot, execution metadata, and captured output.
@@ -1831,6 +1978,7 @@ Routes:
 - `/session/<connection_id>`: session details and timeline.
 - `/session/<connection_id>/events.json`: session JSONL events.
 - `/inventory`: searchable inventory, host creation, editing, and validated bulk updates.
+- `/inventory/<server_id>/services`: successful discovery baseline and service changes for a host.
 - `/announcements`: global/project/host operational notices with severity and TTL.
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
 - `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
@@ -1846,7 +1994,35 @@ Routes:
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 - `/export/<inventory|grants|history|users|access-matrix>`: authenticated CSV or JSON download.
 
-The dashboard is admin-only. If a user is authenticated but does not belong to `dashboard.admin_groups`, the dashboard returns HTTP 403.
+Administrative routes require membership in `dashboard.admin_groups`; authenticated
+non-admin users receive HTTP 403 on those routes, including administrative exports,
+session details/replay, raw logs, and policy mutations. Personal `/me` routes have
+their own per-user authorization and do not expose those administrator capabilities.
+
+### Personal User Workspace
+
+After Keycloak sign-in, eligible non-admin users land on `/me`. They see only
+policy-allowed hosts, their own active sessions and connection history, and their
+own access requests. They can request a scheduled access window, comment on a
+request, cancel a pending request, or create a renewal awaiting administrator
+approval. Personal history exports preserve the selected filters and omit internal
+filesystem paths. Recorded Keycloak subjects bind request, session, and history
+ownership; legacy data without a subject uses the username.
+
+`dashboard.self_service_enabled` defaults to `true`. An empty
+`dashboard.self_service_groups` permits any verified signed-in identity with a
+username to use its own workspace. Restrict it to exact Keycloak group names when
+needed:
+
+```yaml
+dashboard:
+  self_service_enabled: true
+  self_service_groups: [Demo-Operators, Demo-Contractors]
+```
+
+Set `self_service_enabled: false` to disable non-admin access to the personal workspace. These settings
+do not grant SSH access or administrator privileges; host visibility still uses
+the production grant resolver. Existing admin routes remain admin-only.
 
 Use the `EN` / `RU` control in the top bar to select the dashboard locale. The choice is stored in the authenticated Flask session. Navigation, compact per-page explanations, and input-field help are localized without changing data or policy values. Day/night theme remains a browser-local preference.
 
@@ -1858,7 +2034,9 @@ ISOLATE_BUILD_SHA=0123456789abcdef
 ISOLATE_BUILD_DATE=2026-09-10T12:00:00Z
 ```
 
-The `/`, `/sessions/active`, and `/access` pages auto-refresh when `dashboard.refresh_seconds` is greater than `0`. Set it to `0` to disable refresh.
+The administrator `/` overview, `/sessions/active`, and `/access` pages auto-refresh when
+`dashboard.refresh_seconds` is greater than `0`. Set it to `0` to disable refresh.
+History filters and self-service forms do not auto-refresh or discard unfinished input.
 
 Access approval from the dashboard supports:
 
@@ -1868,6 +2046,8 @@ Access approval from the dashboard supports:
 - ticket/user/project filters;
 - approve and deny comments;
 - repeat request action;
+- scheduled start and requested end window;
+- revocation of approved temporary access;
 - notification warnings;
 - denial reason.
 
@@ -1875,7 +2055,7 @@ Dashboard POST actions use a per-session CSRF token and explicit confirmation. H
 
 ### Jobs And Runbooks Console
 
-The console uses the existing signed asynchronous job records and worker. It does not execute commands in the Flask process. A dashboard administrator can queue an enabled typed runbook for one host or a comma-separated fleet of host IDs. Before any job is created, Isolate validates the complete fleet, runbook parameters, current Keycloak groups, effective grant action (`runbook` or `operate`), remote user, sudo mode, timeout, and configured fleet limit.
+The console uses the existing signed asynchronous job records and worker. It does not execute commands in the Flask process. A dashboard administrator can queue an enabled typed runbook for one host, a comma-separated fleet of host IDs, or hosts selected by project and exact AND-matched tags. Explicit host IDs cannot be mixed with project/tag selectors. Before any job is created, Isolate validates the complete fleet, runbook parameters, current Keycloak groups, effective grant action (`runbook` or `operate`), remote user, sudo mode, timeout, and configured fleet limit.
 
 ```yaml
 runbooks:
@@ -1888,6 +2068,40 @@ runbooks:
 ```
 
 Each fleet child remains a normal `job_*` record accepted by the existing worker and additionally carries `fleet_id`, slot, size, and attempt metadata. Fleet progress counts only the newest attempt for each host. Retry is limited to failed or timed-out jobs, verifies the original HMAC authorization signature, and re-evaluates current inventory, grants, runbook configuration, groups, remote identity, and sudo policy. Cancel and retry require CSRF plus explicit confirmation and emit dashboard admin audit events.
+
+### Jobs And Runbooks From The CLI
+
+The CLI uses the same signed queue and worker; it does not run remote commands in
+the calling process:
+
+```bash
+isolate runbook list
+isolate runbook show service-status
+isolate runbook preview service-status --host 10004 --param service=nginx
+isolate runbook run service-status --host 10004 --param service=nginx --yes
+isolate runbook preview uptime --project payments-prod --tag env=prod
+isolate runbook run uptime --tag env=prod --tag owner=payments --yes
+isolate job list --status failed --json
+isolate job show 12
+isolate job output 12
+isolate job cancel 12 --yes
+isolate job retry 12 --yes
+```
+
+Use repeated or comma-separated `--host` IDs, or a project/tag selector; explicit
+IDs cannot be mixed with dynamic selectors. Tag selectors use exact AND matching.
+An omitted selector never defaults to the whole inventory. Preview validates the
+complete selected fleet, parameters, grants, remote identities, and runbook-class
+permissions without queueing jobs. Run, cancel, and retry require `--yes`.
+
+Jobs/runbooks CLI operations require a Linux bastion. They load the root-managed
+trusted runtime configuration and bind the signed cached token to the real Unix
+account, rather than accepting execution settings or identity authority from
+`ISOLATE_CONFIG`. Users can inspect and control their own jobs; cross-user operations
+require trusted platform-administrator authorization. Own-job retry passes current
+verified identity claims and checks current policy, so the original group snapshot
+cannot retain removed group privileges. Output reads are bounded and use the
+configured jobs directory. `isolate jobs` is an alias for `isolate job`.
 
 ### Alert Center
 
@@ -2613,7 +2827,20 @@ The timer is never enabled by default. With Ansible, set `isolate_enable_policy_
 
 ## Central Audit Pipeline
 
-Per-session `/opt/auth/logs/<user>/<session_id>/session.jsonl` remains the local source for dashboard history and replay metadata. The safest complete feed is Vector/Filebeat tailing these files directly with read-only access. Central runtime sinks are an additional best-effort path and are disabled by default.
+Per-session `/opt/auth/logs/<user>/<session_id>/session.jsonl` remains the local source for dashboard history and replay metadata. For SIEM collection use the stable `/opt/auth/spool/events.jsonl` feed produced by `isolate-audit-export.service`. Do not configure the same shipper to collect the source files as well: runtime sinks and session logs may contain copies of the same event.
+
+Install on a root-managed bastion with the runtime already present:
+
+```bash
+sudo bash /opt/auth/deploy/install-audit-export.sh
+sudo systemctl status isolate-audit-export.service
+```
+
+The exporter reads session JSONL and, if enabled, the runtime `audit.jsonl` spool (including numbered and gzip rotations). It discovers new files every two seconds and starts each new source at the beginning. Persistent SQLite positions and a content digest index in `/var/lib/isolate/audit-export` prevent ordinary rereads and duplicate exports. Source offsets commit only after the output has been flushed with `fsync`. An output or database failure stops the service and systemd restarts it. A malformed/oversized source record blocks that source at its last checkpoint and produces a journal error; other sources continue. Monitor these errors and repair the source rather than silently dropping it.
+
+New runtime events receive `event_id` before signing. The exporter preserves event contents and signatures, including legacy records. After a crash between output `fsync` and checkpoint commit, an event can be exported again with the same `event_id`; downstream deduplication, where needed, is separate. Keep the state directory across service restarts and upgrades. The digest index grows with exported events; include it in disk monitoring. Deleting it causes retained sources to be replayed.
+
+Run the exporter as `auth`, with read access to session directories and exclusive write access to the output/state. Do not grant interactive users write access to the common feed or the signing key. Exporting an unsigned event does not verify or authenticate its origin. The exporter cannot recover files that were removed by retention before it read them; monitor service health, disk space, input retention and SIEM queues.
 
 An optional low-latency runtime sink is an append-only local spool:
 
@@ -2627,7 +2854,29 @@ logging:
       path: /opt/auth/spool/audit.jsonl
 ```
 
-Runtime processes that can write the spool append their structured events there. Vector or Filebeat should also tail the per-session JSONL glob so events written by individual bastion users are not missed, then ship asynchronously to OpenSearch, ClickHouse, S3, or a SIEM. Starter configurations covering both paths are available in `/opt/auth/deploy/vector/isolate.toml.example` and `/opt/auth/deploy/filebeat/isolate.yml.example`.
+Runtime processes that can write the spool append their structured events there. Enable this sink for events without a session file, such as service/API audit. The exporter also reads session files from individual bastion users who cannot write the spool. Starter Vector and Filebeat configurations now collect only the exported `events.jsonl` feed.
+
+### Wazuh 4.14
+
+Create the stable feed by starting the exporter before starting/restarting the Wazuh agent. Add the following inside the agent's `<ossec_config>` (also provided in `deploy/wazuh/localfile.xml.example`):
+
+```xml
+<localfile>
+  <location>/opt/auth/spool/events.jsonl</location>
+  <log_format>json</log_format>
+  <only-future-events max-size="1GB">no</only-future-events>
+</localfile>
+```
+
+Wazuh documents wildcard rediscovery via `logcollector.vcheck_files` (64 seconds by default). `only-future-events` defaults to `yes`; setting `no` enables collection of content generated while the logcollector was stopped, within the configured catch-up size. A persistent feed avoids depending on rediscovery for every short-lived session. It does not guarantee delivery during arbitrary outages: the catch-up limit, queues, disk space and rotation still matter. The agent normally reads as root; verify access to the auth-only spool rather than making it world-readable.
+
+The logrotate example uses rename/create for the JSONL spool instead of `copytruncate`; writers reopen the path for each append. Retain rotations longer than the expected outage, and recover archived output explicitly if the agent missed an entire rotation. Test restart, first enrollment, rotation and outages against the actual 4.14 agent/manager. Received events are distinct from alerts: configure manager rules for selected events, or `logall_json` and archives indexing if every event must be searchable. This repository does not enable manager-wide archives automatically. The `1GB` catch-up limit is finite and must be sized for the expected volume/outage.
+
+Raw terminal logs contain a timestamp per PTY read chunk, which can be a single echoed character, plus output and terminal escape sequences. They are recordings, not a command stream. Do not ingest them as one command per line. Structured commands are `event: "command"` with `command`, `cwd`, `exit_code`/`exitcode`, `username`, `keycloak_sub`, `host_id` and `connection_id`. They come from the managed input mode or, with partial coverage, configured target hooks. Shell hooks quote callback arguments for OpenSSH's remote command string, preserving spaces, quotes, newlines and shell metacharacters as data. They remain optional, best effort and bypassable: the Bash DEBUG hook records the last simple command before the prompt, while zsh preexec records its command line. They do not cover every shell, pipeline, script, TUI, sudo transition or noninteractive execution. End-to-end SSH forwarding encrypts commands through the bastion; use target-side auditd/tlog or an equivalent audit agent for stronger target execution coverage and send that audit separately. The exporter does not infer commands from raw recordings.
+
+The exporter preserves full records up to its 1 MiB input limit and journals a warning above 60 KiB. This is larger than Wazuh 4.14's roughly 64 KiB log message buffer; bound producer field lengths and monitor oversized records before relying on Wazuh ingestion. Do not truncate or rewrite signed events in the shipper to fit that buffer. Large records require a separate archival path. See the [4.14 buffer definitions](https://github.com/wazuh/wazuh/blob/v4.14.0/src/headers/defs.h) and [JSON file reader](https://github.com/wazuh/wazuh/blob/v4.14.0/src/logcollector/read_json.c).
+
+References: [Wazuh localfile configuration](https://documentation.wazuh.com/current/user-manual/reference/ossec-conf/localfile.html), [logcollector intervals](https://documentation.wazuh.com/current/user-manual/reference/internal-options.html), [manager event logging](https://documentation.wazuh.com/current/user-manual/manager/event-logging.html).
 
 Syslog is also supported:
 
@@ -3056,7 +3305,7 @@ Keep `tls_verify: true` in production.
 
 ### Dashboard 403
 
-Check Keycloak groups in token:
+For an administrative route, check Keycloak groups in the token:
 
 ```bash
 isolate login
@@ -3071,6 +3320,11 @@ dashboard:
     - Demo-DevOps
     - Demo-Security
 ```
+
+An ordinary signed-in user should use `/me`; administrative routes correctly return
+403. If `/me` is denied too, check `dashboard.self_service_enabled` and any exact
+`dashboard.self_service_groups` restriction. Do not add users to admin groups just
+to let them request access or view their own activity.
 
 ### Redis Debug
 
@@ -3091,6 +3345,13 @@ keys active_session_*
 ```
 
 ## Running service discovery (opt-in)
+
+For a fresh isolated contractor host, use the root-managed closed staging profile
+and procedures in [deploy/CLOSED-BASTION.md](deploy/CLOSED-BASTION.md). The SSH
+wrapper now verifies identity and policy itself; deploy the helper, callback,
+authorization module and wrapper together. Review the documented migration steps
+before upgrading existing installations. Incoming ProxyJump/ProxyCommand gateway
+authorization remains a separate implementation step and is disabled in staging.
 
 Merge `configs/service-discovery.example.yml` into the runtime config, select explicit
 `host_ids`, and set `enabled: true`. Provision a dedicated `remote_user` with a bastion
@@ -3120,6 +3381,23 @@ should use a separate restricted collector rather than granting Docker socket ac
 Default backups include `host_services_*`; add this pattern to existing customized
 backup configurations if the last scan snapshot must survive restore.
 
+Successful scans also retain a bounded history of the latest 50 change records
+inside each host's discovery snapshot. The first successful scan is a baseline,
+with no claim that all detected services just appeared. Later records list added
+and removed units. An unchanged successful scan refreshes the scan timestamp
+without duplicating history; a failed scan preserves both the last successful
+service list and the change timeline. A successful empty list records removals.
+
+```bash
+isolate host services-history 10004
+isolate host services-history 10004 --limit 50 --json
+```
+
+Dashboard Inventory links to `/inventory/10004/services` for the same timeline and
+UTC observation times. The timeline is a difference between scan observations,
+not a continuous log of service starts and stops between scans. Because it remains
+inside `host_services_*`, existing snapshot backup coverage includes the timeline.
+
 ## Dashboard identity and incident diagnosis
 
 The sidebar shows the effective Dashboard role, exact groups granting Dashboard
@@ -3134,7 +3412,9 @@ and logs it with method/path beside Flask's traceback. Inspect the actual runnin
 service's logs (systemd, container, or process supervisor) to determine the cause;
 do not infer it from a successful unauthenticated `/health` check. After deployment,
 check `/health`, `/login`, a real OIDC login, and the authenticated `/` route. Verify
-that non-admin users still receive 403. Monitoring should include the authenticated
+that eligible non-admin users reach `/me` and still receive 403 on administrative
+routes such as `/inventory`, `/grants`, `/raw/...`, and `/export/inventory`.
+Monitoring should include the authenticated
 page with a dedicated test identity and alert on HTTP 5xx rates; dependency health
 alone does not exercise page rendering. This repository does not automatically
 provision that monitor or its credentials.
@@ -3150,12 +3430,12 @@ Requests uses it: urllib3 tests IPv6 loopback availability. Correct outbound rou
 to the issuer's addresses and monitor metadata/JWKS availability as well as page
 rendering. Raising the Gunicorn timeout alone leaves the stalled connection intact.
 
-Keep Admin for configuration and policy mutations. A future self-service web role
-is useful for requesting temporary access and viewing one's own requests; an
-Approver role can be scoped to specific projects, and an Auditor role can be read-only.
-Each requires server-side authorization on every route and object, including exports
-and raw logs. The current panel remains admin-only; regular users can use the existing
-CLI access-request flow until those restrictions are implemented and tested.
+Keep Admin for configuration and policy mutations. The implemented `/me` workspace
+serves personal hosts, sessions, history, and requests with server-side ownership
+checks and a separate personal history export. Administrative routes, raw logs,
+replay, and global exports remain admin-only. Project-scoped Approver and read-only
+Auditor roles remain separate future work; the personal workspace does not grant
+either role.
 
 The reported duplicate `raw_log_path` SSH traceback is already fixed in the local
 wrapper: metadata holds the path once and both audit events use that metadata.
@@ -3191,7 +3471,7 @@ SSH wrapper.
 - Verify `g <host>` uses expected remote user.
 - Verify deny-by-default behavior.
 - Verify break-glass request and approval flow.
-- Verify dashboard 403 for non-admin users.
+- Verify eligible non-admin access to `/me`, ownership isolation, and 403 on administrative dashboard routes.
 - Run the dashboard through Gunicorn/systemd behind HTTPS, not Flask's development server.
 - Keep Redis local or enable an ACL user and verified TLS before exposing it over the network.
 - Export the current policy bundle, commit it for review, and test `policy diff`/`apply --dry-run`.

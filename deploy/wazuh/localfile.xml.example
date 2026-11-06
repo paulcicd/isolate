@@ -1,0 +1,7 @@
+<!-- Add inside <ossec_config> on the bastion. Create the file before starting
+     the agent. Do not also collect raw recordings/session.jsonl/audit.jsonl. -->
+<localfile>
+  <location>/opt/auth/spool/events.jsonl</location>
+  <log_format>json</log_format>
+  <only-future-events max-size="1GB">no</only-future-events>
+</localfile>

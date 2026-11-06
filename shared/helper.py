@@ -22,6 +22,8 @@ from isolate_policy import PolicyDenied, filter_allowed_hosts, resolve_grant
 from isolate_announcements import list_announcements
 from isolate_inventory import is_host_in_maintenance
 from isolate_service_discovery import get_discovery, service_display
+from isolate_connection_auth import prepare_authorization_file
+from isolate_ssh import SSHArgumentError, filter_extra_args
 
 
 LOG_FORMAT = '[%(levelname)s] %(name)s %(message)s'
@@ -260,6 +262,8 @@ class ServerConnection(object):
     # resolve host configuratin
     #
     def resolve(self):
+        if len(self.search_results) != 1:
+            raise PolicyDenied("an exact inventory host is required")
         project_config = self._get_project_config()
         host_config = self._get_host_config()
         final_config = merge_dicts(project_config, host_config)
@@ -339,6 +343,8 @@ class ServerConnection(object):
             sudo_mode = str(decision.get("sudo_mode") or "").lower()
             if sudo_mode in ("none", "no", "false", "nosudo", "no-sudo"):
                 self.nosudo = True
+            else:
+                self.nosudo = False
             self.policy_decision = decision
         except PolicyDenied as exc:
             self.policy_decision = {"denied": str(exc)}
@@ -348,6 +354,12 @@ class ServerConnection(object):
     # build commands
     #
     def build_cmd(self):
+        # Unknown helper arguments must never become wrapper identity/target options.
+        allowed = [arg for arg in self.helper.config.get("ssh", {}).get("allowed_extra_args", []) if arg != "-A"]
+        extras = filter_extra_args(self.unknown_args, allowed + ["--debug"])
+        authorization_file = prepare_authorization_file()
+        self.ssh_wrapper_argv.extend(['--authorization-file', authorization_file])
+        self.session_exports.append('ISOLATE_AUTHORIZATION_FILE={};'.format(shlex.quote(authorization_file)))
 
         if self.host:
             self.ssh_wrapper_argv.append(str(self.host))
@@ -382,8 +394,7 @@ class ServerConnection(object):
         if self.proxy_user:
             self.ssh_wrapper_argv.extend(['--proxy-user', str(self.proxy_user)])
 
-        if bool(self.unknown_args):
-            self.ssh_wrapper_argv.extend(self.unknown_args)
+        self.ssh_wrapper_argv.extend(extras)
 
         callback_argv = ' '.join([shlex.quote(str(arg)) for arg in self.ssh_wrapper_argv])
         self.session_exports.append('ISOLATE_CALLBACK_CMD=({})'.format(callback_argv))
@@ -454,7 +465,11 @@ class ServerConnection(object):
             )
             self.helper.print_p("Policy denied: {}".format(exc), stderr=True)
             sys.exit(2)
-        self.build_cmd()
+        try:
+            self.build_cmd()
+        except (SSHArgumentError, IdentityError, OSError) as exc:
+            self.helper.print_p("Connection denied: {}".format(exc), stderr=True)
+            sys.exit(2)
         self._write_session()
 
         connection_audit = SessionLogger(
@@ -966,12 +981,20 @@ def main():
         elif len(args.sargs) == 1 and helper.is_valid_ipv4(args.sargs[0]):
             conn.arg_type = 'ipv4_only'
             conn.host = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[0], fields=['server_ip'], exact_match=True)
+            if len(conn.search_results) == 1:
+                conn.project_name = conn.search_results[0]['project_name']
+                conn.server_id = conn.search_results[0]['server_id']
             conn.start()
 
         elif len(args.sargs) == 1 and helper.is_valid_fqdn(args.sargs[0]):
             LOGGER.debug('is_valid_fqdn')
             conn.arg_type = 'fqdn_only'
             conn.host = args.sargs[0]
+            conn.search_results = helper.search(args.sargs[0], fields=['server_name'], exact_match=True)
+            if len(conn.search_results) == 1:
+                conn.project_name = conn.search_results[0]['project_name']
+                conn.server_id = conn.search_results[0]['server_id']
             conn.start()
 
         #

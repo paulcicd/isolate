@@ -9,6 +9,8 @@ import logging
 import logging.handlers
 import os
 import socket
+import stat
+import uuid
 
 
 class AuditSinkError(Exception):
@@ -91,16 +93,35 @@ def verify_jsonl_file(path, key_file):
     return {"valid": not invalid, "checked": checked, "invalid": invalid}
 
 
-def _append_jsonl(path, record):
+def append_jsonl_record(path, record, mode=0o640, sync=False):
     parent = os.path.dirname(path)
     if parent and not os.path.isdir(parent):
         os.makedirs(parent, mode=0o750, exist_ok=True)
     payload = (json.dumps(record, sort_keys=True) + "\n").encode("utf-8")
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o640)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, mode)
     try:
-        os.write(fd, payload)
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise AuditSinkError("audit destination must be a regular file")
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        remaining = memoryview(payload)
+        while remaining:
+            count = os.write(fd, remaining)
+            if count <= 0:
+                raise OSError("short audit log write")
+            remaining = remaining[count:]
+        if sync:
+            os.fsync(fd)
     finally:
         os.close(fd)
+    if sync and parent and os.name == "posix":
+        directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
 
 def _send_syslog(sink, record):
@@ -140,7 +161,7 @@ def dispatch_audit_record(record, logging_config):
             if not isinstance(sink, dict):
                 raise AuditSinkError("audit sink must be an object")
             if sink_type == "jsonl":
-                _append_jsonl(sink["path"], record)
+                append_jsonl_record(sink["path"], record, sync=bool((logging_config or {}).get("sync", False)))
             elif sink_type == "syslog":
                 _send_syslog(sink, record)
             else:
@@ -155,6 +176,9 @@ def dispatch_audit_record(record, logging_config):
 
 def prepare_and_dispatch(record, logging_config):
     record = classify_audit_record(record)
+    # The same signed event can appear in both the runtime spool and a session
+    # file. Generate its identity before signing so exporters can correlate it.
+    record.setdefault("event_id", str(uuid.uuid4()))
     try:
         prepared = sign_audit_record(record, logging_config)
     except AuditSinkError:

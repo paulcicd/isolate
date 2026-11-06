@@ -21,15 +21,17 @@ __isolate_audit_prompt() {
     local command="$__isolate_audit_last_command"
     __isolate_audit_last_command=""
     trap - DEBUG
+    # OpenSSH joins command arguments into one remote string. Quote every field
+    # for the forced-command parser, including spaces, quotes and newlines.
+    local remote_command="isolate command-log append" arg
+    for arg in "--connection-id=$connection_id" \
+        "--host-id=${ISOLATE_HOST_ID:-}" "--project=${ISOLATE_PROJECT:-}" \
+        "--cwd=$PWD" "--exit-code=$exit_code" "--shell=bash" "--command=$command"; do
+        arg=${arg//\'/\'\\\'\'}
+        remote_command+=" '$arg'"
+    done
     ssh -o BatchMode=yes -o ClearAllForwardings=yes -o ConnectTimeout=3 \
-        "$ISOLATE_AUDIT_BASTION" isolate command-log append \
-        --connection-id "$connection_id" \
-        --host-id "${ISOLATE_HOST_ID:-}" \
-        --project "${ISOLATE_PROJECT:-}" \
-        --cwd "$PWD" \
-        --exit-code "$exit_code" \
-        --shell bash \
-        --command "$command" >/dev/null 2>&1 &
+        -- "$ISOLATE_AUDIT_BASTION" "$remote_command" >/dev/null 2>&1 &
     trap '__isolate_audit_preexec' DEBUG
     return "$exit_code"
 }

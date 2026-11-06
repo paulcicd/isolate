@@ -33,6 +33,10 @@ dashboard:
   secret_key_file: /opt/auth/keys/dashboard_secret
   admin_groups: []
   refresh_seconds: 15
+  # Verified users can access only their own resources through /me routes.
+  self_service_enabled: true
+  # Empty means every verified identity; otherwise require an exact OIDC group.
+  self_service_groups: []
   require_mutation_confirmation: true
   jobs_max_results: 250
   default_locale: en
@@ -63,6 +67,10 @@ access_packages:
 
 command_audit:
   enabled: false
+  # managed: durable audit of every submitted command, no remote interactive stdin.
+  # target-hooks: legacy, partial audit requiring target-side integration.
+  mode: target-hooks
+  command_timeout_seconds: 300
   require_connection_id: true
   require_active_session: true
   completion_grace_seconds: 30

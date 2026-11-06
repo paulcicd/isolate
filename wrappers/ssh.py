@@ -25,12 +25,15 @@ except ImportError:  # pragma: no cover - wrapper runs on Linux bastions
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared')))
 from isolate_config import load_config
-from isolate_identity import local_identity
+from isolate_identity import IdentityError
+from isolate_connection_auth import ConnectionDenied, authorize_connection, invoking_user, read_authorization_file, recheck_connection, trusted_config
+from isolate_policy import PolicyDenied
 from isolate_logging import SessionLogger
 from isolate_redis import create_redis_client
 from isolate_session_alerts import dispatch_alert_async, initial_session_alerts, long_session_alert
 from isolate_sessions import get_session, mark_alert_sent, mark_session_end, mark_session_start, touch_session
 from isolate_ssh import SSHArgumentError, build_ssh_argv
+from isolate_managed_shell import ManagedAuditError, audit_mode, run_managed_shell
 
 LOGGER = logging.getLogger('ssh-wrapper')
 LOG_FORMAT = '[%(asctime)s] [%(levelname)6s] %(name)s %(message)s'
@@ -261,32 +264,37 @@ def _terminate_child(proc):
         proc.wait()
 
 
-def _run_pipe_command(argv, raw_log, control=None):
+def _run_pipe_command(argv, raw_log, control=None, stdin_null=False):
     proc = subprocess.Popen(
         argv,
-        stdin=None,
+        stdin=subprocess.DEVNULL if stdin_null else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
         start_new_session=True,
     )
-    while True:
-        if control and control():
+    try:
+        while True:
+            if control and control():
+                _terminate_child(proc)
+                return 143
+            ready, _, _ = select.select([proc.stdout.fileno()], [], [], 0.5)
+            if ready:
+                chunk = os.read(proc.stdout.fileno(), 4096)
+                if chunk:
+                    os.write(sys.stdout.fileno(), chunk)
+                    _write_raw_log(raw_log, chunk)
+            if proc.poll() is not None:
+                remaining = proc.stdout.read() or b""
+                if remaining:
+                    os.write(sys.stdout.fileno(), remaining)
+                    _write_raw_log(raw_log, remaining)
+                break
+        return proc.wait()
+    finally:
+        if proc.poll() is None:
             _terminate_child(proc)
-            return 143
-        ready, _, _ = select.select([proc.stdout.fileno()], [], [], 0.5)
-        if ready:
-            chunk = os.read(proc.stdout.fileno(), 4096)
-            if chunk:
-                os.write(sys.stdout.fileno(), chunk)
-                _write_raw_log(raw_log, chunk)
-        if proc.poll() is not None:
-            remaining = proc.stdout.read() or b""
-            if remaining:
-                os.write(sys.stdout.fileno(), remaining)
-                _write_raw_log(raw_log, remaining)
-            break
-    return proc.wait()
+        proc.stdout.close()
 
 
 def _run_pty_command(argv, raw_log, control=None):
@@ -351,6 +359,8 @@ def _run_pty_command(argv, raw_log, control=None):
                     break
                 os.write(master_fd, data)
     finally:
+        if proc.poll() is None:
+            _terminate_child(proc)
         if old_tty is not None:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_tty)
         try:
@@ -365,7 +375,7 @@ def _redis_client(config):
     return create_redis_client(config)
 
 
-def run_command(argv, raw_log_path, audit, metadata, config=None):
+def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=None):
 
     LOGGER.debug(argv)
     metadata = dict(metadata)
@@ -374,6 +384,7 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
     started = time.time()
     redis = None
     control_state = {"checked_at": 0.0, "heartbeat_at": 0.0, "terminated": False}
+    authorization_checked_at = [0.0]
     control_cfg = (config or {}).get("session_control", {}) or {}
     if config and metadata.get("connection_id"):
         try:
@@ -392,7 +403,23 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
         except Exception as exc:
             LOGGER.warning("active session registry start failed: {}".format(exc))
 
-    def session_control():
+    def session_control(force=False):
+        if authorization is not None:
+            now = time.time()
+            interval = max(1, min(60, int((config or {}).get("connection_authorization", {}).get("recheck_interval", 5))))
+            if force or now >= authorization["deadline"] or now - authorization_checked_at[0] >= interval:
+                authorization_checked_at[0] = now
+                try:
+                    current_config = trusted_config()
+                    if audit_mode(current_config) != audit_mode(config):
+                        raise ConnectionDenied("command audit mode changed")
+                    recheck_connection(authorization, current_config, redis)
+                except Exception as exc:
+                    try:
+                        audit.event("session_authorization_revoked", reason=type(exc).__name__, **metadata)
+                    except Exception:
+                        LOGGER.error("Unable to write revocation audit; closing SSH regardless")
+                    return True
         if redis is None or not control_cfg.get("enabled", True):
             return False
         now = time.time()
@@ -439,7 +466,14 @@ def run_command(argv, raw_log_path, audit, metadata, config=None):
             os.chmod(raw_log_path, 0o660)
         except PermissionError:
             pass
-        if pty is not None and sys.stdin.isatty() and sys.stdout.isatty():
+        if audit_mode(config) == "managed":
+            try:
+                exit_code = run_managed_shell(argv, raw_log, audit, metadata, config, _run_pipe_command,
+                                              before_execute=lambda: session_control(force=True), control=session_control)
+            except ManagedAuditError as exc:
+                LOGGER.error(str(exc))
+                exit_code = 2
+        elif pty is not None and sys.stdin.isatty() and sys.stdout.isatty():
             exit_code = _run_pty_command(argv, raw_log, control=session_control)
         else:
             exit_code = _run_pipe_command(argv, raw_log, control=session_control)
@@ -483,6 +517,7 @@ if __name__ == '__main__':
     parser.add_argument('--server-name')
     parser.add_argument('--human-user')
     parser.add_argument('--keycloak-sub')
+    parser.add_argument('--authorization-file')
     parser.add_argument('--vip', action='store_true')
     args, extra_args = parser.parse_known_args()
     #
@@ -500,29 +535,39 @@ if __name__ == '__main__':
     LOGGER.debug(working_dir)
     LOGGER.debug(args)
     #
-    host_meta = verify_args(args)
-    raw_log_path = init_log_file(host_meta)
-    config = load_config()
-    identity = local_identity(args.human_user or local_sudo_user, [])
-    identity["keycloak_sub"] = args.keycloak_sub
-    connection_id = args.connection_id or host_meta["uuid"]
+    try:
+        if args.connection_id and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", args.connection_id) is None:
+            raise ConnectionDenied("invalid connection ID")
+        caller_uid, local_sudo_user = invoking_user()
+        config = trusted_config()
+        managed_commands = audit_mode(config) == "managed"
+        redis = _redis_client(config)
+        token = read_authorization_file(args.authorization_file, caller_uid)
+        authorization = authorize_connection(args, token, config, redis, local_sudo_user)
+        identity = authorization["identity"]
+        authorized_host = authorization["host"]
+        args.user = [authorization["decision"]["remote_user"]]
+        args.port = int(authorized_host.get("server_port") or 22)
+        args.project = authorized_host["project_name"]
+        args.server_name = authorized_host.get("server_name")
+        args.vip = bool(authorized_host.get("server_vip"))
+        host_meta = verify_args(args)
+        raw_log_path = init_log_file(host_meta)
+    except (ConnectionDenied, IdentityError, PolicyDenied, ManagedAuditError, OSError, ValueError) as exc:
+        LOGGER.critical("Connection denied: {}".format(exc))
+        sys.exit(2)
+    connection_id = args.connection_id or str(uuid.uuid4())
     audit = SessionLogger(
         config["logging"]["base_path"],
         identity,
         session_id=connection_id,
         logging_config=config.get("logging", {}),
     )
-    remote_command = None if host_meta['nosudo'] else 'sudo -i'
-    proxy = None
-    if args.proxy_host:
-        proxy = {
-            "host": host_meta["proxy_host"],
-            "port": host_meta["proxy_port"],
-            "user": host_meta["proxy_user"],
-        }
+    remote_command = None if managed_commands or host_meta['nosudo'] else 'sudo -i'
+    proxy = authorization["proxy"]
     try:
         send_env = []
-        if config.get("command_audit", {}).get("send_env", False):
+        if not managed_commands and config.get("command_audit", {}).get("send_env", False):
             context_env = {
                 "ISOLATE_CONNECTION_ID": connection_id,
                 "ISOLATE_HOST_ID": args.host_id or "",
@@ -532,7 +577,7 @@ if __name__ == '__main__':
             os.environ.update(context_env)
             send_env = sorted(context_env)
         argv = build_ssh_argv(
-            config["ssh"],
+            dict(config["ssh"], managed_commands=managed_commands),
             {
                 "hostname": host_meta["hostname"],
                 "port": host_meta["port"],
@@ -566,4 +611,4 @@ if __name__ == '__main__':
         "sudo_mode": "none" if host_meta['nosudo'] else "sudo-i",
         "server_vip": bool(args.vip),
         "source_ip": os.getenv("SSH_CONNECTION", "").split(" ")[0] if os.getenv("SSH_CONNECTION") else None,
-    }, config=config))
+    }, config=config, authorization=authorization))

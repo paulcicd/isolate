@@ -2042,6 +2042,8 @@ class GrantAdminUxTest(unittest.TestCase):
             '{"schema_version":2,"name":"prod-all","projects":["kube"],"project_globs":["*-prod","old-*"]}',
         )
         original_redis_client = isolate.redis_client
+        admin_patch = mock.patch.object(isolate, "_require_platform_admin", return_value={"username": "admin"})
+        admin_patch.start()
         isolate.redis_client = lambda config: redis
         try:
             with open(os.devnull, "w") as devnull, redirect_stdout(devnull):
@@ -2053,6 +2055,7 @@ class GrantAdminUxTest(unittest.TestCase):
             self.assertEqual(result, 0)
             self.assertEqual(load_project_sets(redis), {})
         finally:
+            admin_patch.stop()
             isolate.redis_client = original_redis_client
 
     def test_grant_explain_allowed_and_denied(self):

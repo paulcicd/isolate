@@ -2,8 +2,7 @@ filebeat.inputs:
   - type: filestream
     id: isolate-audit
     paths:
-      - /opt/auth/logs/*/*/session.jsonl
-      - /opt/auth/spool/audit.jsonl
+      - /opt/auth/spool/events.jsonl
     parsers:
       - ndjson:
           target: ""

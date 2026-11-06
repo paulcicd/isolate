@@ -39,6 +39,29 @@ def validate_config(config, check_paths=False):
     announcements = section("announcements")
     policy_as_code = section("policy_as_code")
     backup = section("backup")
+    connection_auth = section("connection_authorization")
+    for flag in ("connections_enabled", "require_explicit_mapping", "allow_proxy"):
+        if flag in connection_auth and not isinstance(connection_auth[flag], bool):
+            errors.append("connection_authorization.{} must be a boolean".format(flag))
+    if not isinstance(connection_auth.get("unix_users", {}), dict):
+        errors.append("connection_authorization.unix_users must be an object")
+    else:
+        for username, mapping in connection_auth.get("unix_users", {}).items():
+            if not isinstance(mapping, dict) or not isinstance(mapping.get("sub"), str) or not mapping["sub"]:
+                errors.append("connection_authorization.unix_users entries require an exact nonempty sub")
+    ports = connection_auth.get("allowed_target_ports", [])
+    if not isinstance(ports, list) or any(type(port) is not int or not 1 <= port <= 65535 for port in ports):
+        errors.append("connection_authorization.allowed_target_ports must be a list of valid ports")
+    for key, default, maximum in (("max_session_seconds", 28800, 86400), ("recheck_interval", 5, 60)):
+        try:
+            value = int(connection_auth.get(key, default))
+            if value < 1 or value > maximum:
+                errors.append("connection_authorization.{} is outside the supported range".format(key))
+        except (TypeError, ValueError):
+            errors.append("connection_authorization.{} must be an integer".format(key))
+    if connection_auth.get("connections_enabled") is True:
+        if not keycloak.get("issuer") or not keycloak.get("verify_tokens", True) or not keycloak.get("tls_verify", True):
+            errors.append("enabled connection authorization requires a trusted Keycloak issuer, token verification and TLS")
 
     if not isinstance(service_discovery.get("enabled", False), bool):
         errors.append("service_discovery.enabled must be a boolean")
@@ -169,6 +192,25 @@ def validate_config(config, check_paths=False):
 
     if not isinstance(command_audit.get("send_env", False), bool):
         errors.append("command_audit.send_env must be a boolean")
+    audit_mode = command_audit.get("mode", "target-hooks")
+    if audit_mode not in ("target-hooks", "managed"):
+        errors.append("command_audit.mode must be target-hooks or managed")
+    if audit_mode == "managed" and not command_audit.get("enabled", False):
+        errors.append("managed command audit must be enabled")
+    if audit_mode == "target-hooks" and command_audit.get("enabled", False):
+        warnings.append("target-hooks command audit is partial and bypassable; use managed for submitted-command auditing")
+    try:
+        limit = int(command_audit.get("max_command_length", 4096))
+        if limit < 1 or (audit_mode == "managed" and limit > 4096):
+            errors.append("managed max_command_length must be between 1 and 4096; other modes require a positive limit")
+    except (TypeError, ValueError):
+        errors.append("command_audit.max_command_length must be an integer")
+    try:
+        timeout = float(command_audit.get("command_timeout_seconds", 300))
+        if not 0 <= timeout <= 86400:
+            errors.append("command_audit.command_timeout_seconds must be between 0 and 86400")
+    except (TypeError, ValueError):
+        errors.append("command_audit.command_timeout_seconds must be numeric")
     for name in ("enabled", "require_connection_id", "require_active_session"):
         if not isinstance(command_audit.get(name, name == "require_active_session"), bool):
             errors.append("command_audit.{} must be a boolean".format(name))

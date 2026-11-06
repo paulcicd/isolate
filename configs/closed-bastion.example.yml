@@ -1,0 +1,53 @@
+# Staging profile: intentionally not ready to accept contractor connections.
+schema_version: 2
+data_root: /opt/auth
+keycloak:
+  issuer: null
+  client_id: isolate-apexdata
+  expected_audience: isolate-apexdata
+  verify_tokens: true
+  tls_verify: true
+  scopes: [openid, profile, email, groups]
+connection_authorization:
+  connections_enabled: false
+  require_explicit_mapping: true
+  unix_users: {}
+  allowed_target_ports: [22]
+  allow_proxy: false
+  max_session_seconds: 3600
+  recheck_interval: 5
+ssh:
+  config_path: /opt/auth/configs/defaults.conf
+  default_sudo_mode: none
+  require_known_hosts: true
+  allowed_extra_args: [-4, -6, -a, -C, -v, -vv, -vvv]
+dashboard:
+  enabled: false
+  admin_groups: []
+access:
+  admin_groups: []
+mcp:
+  enabled: false
+command_execution:
+  enabled: false
+runbooks:
+  enabled: false
+service_discovery:
+  enabled: false
+session_control:
+  enabled: true
+  terminate_enabled: true
+command_audit:
+  enabled: true
+  mode: managed
+  max_command_length: 4096
+  command_timeout_seconds: 300
+  send_env: false
+logging:
+  base_path: /opt/auth/logs
+  sinks:
+    - type: jsonl
+      path: /opt/auth/spool/audit.jsonl
+  integrity:
+    enabled: true
+    key_file: /opt/auth/keys/audit_hmac.key

@@ -666,7 +666,7 @@ class IsolateMCPService(object):
                 self._audit("access_request_comment", identity, "denied", started, {"access_request_id": request_id})
                 raise
         try:
-            record = comment_access_request(self.redis, request_id, identity, text)
+            record = comment_access_request(self.redis, request_id, identity, text, admin_groups=self.config.get("access", {}).get("admin_groups") or [])
             self._audit("access_request_comment", identity, "updated", started, {"access_request_id": request_id})
             return {"request": record}
         except Exception:

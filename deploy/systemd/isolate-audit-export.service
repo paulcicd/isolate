@@ -1,0 +1,24 @@
+[Unit]
+Description=Export Isolate audit events to a persistent SIEM feed
+After=local-fs.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+UMask=0027
+ExecStart=/opt/auth/.venv/bin/python -I /opt/auth/shared/isolate_audit_export.py
+Restart=on-failure
+RestartSec=5
+StateDirectory=isolate/audit-export
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/auth/logs
+ReadWritePaths=/opt/auth/spool
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

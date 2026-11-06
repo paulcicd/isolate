@@ -2,12 +2,12 @@
 # -*- coding: utf-8 -*-
 """Structured command audit helpers."""
 
-import json
 import os
 import time
 
-from isolate_audit import prepare_and_dispatch
+from isolate_audit import append_jsonl_record, prepare_and_dispatch
 from isolate_replay import find_session
+from isolate_command_events import command_fields
 
 
 class CommandAuditError(Exception):
@@ -62,9 +62,11 @@ def append_command_event(base_path, connection_id, command, cwd=None, exit_code=
         "shell": shell or "unknown",
         "source": source or "target-shell-hook",
     }
+    record.update(command_fields(command, exit_code=record["exit_code"], at=record["ts"],
+                                 audit_scope="shell_hook", audit_complete=False,
+                                 command_status="reported", timestamp_kind="received"))
     record = prepare_and_dispatch(record, (config or {}).get("logging", {}))
-    with open(details["session_path"], "a", encoding="utf-8") as session_f:
-        session_f.write(json.dumps(record, sort_keys=True) + "\n")
+    append_jsonl_record(details["session_path"], record, mode=0o660)
     if os.name == "posix":
         try:
             os.chmod(details["session_path"], 0o660)

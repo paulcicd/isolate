@@ -5,6 +5,7 @@
 import datetime
 import json
 import os
+import math
 from collections import Counter
 
 
@@ -19,7 +20,12 @@ def is_history_admin(identity, admin_groups=None):
 def _iter_session_files(base_path, users=None):
     users = set(users or [])
     if users:
-        roots = [os.path.join(base_path, user) for user in users]
+        base = os.path.realpath(base_path)
+        roots = []
+        for user in users:
+            candidate = os.path.realpath(os.path.join(base, str(user)))
+            if candidate != base and os.path.commonpath([base, candidate]) == base:
+                roots.append(candidate)
     else:
         roots = [base_path]
     for root in roots:
@@ -70,6 +76,7 @@ def _row_from_events(events):
         "ts": source.get("ts"),
         "time": format_ts(source.get("ts")),
         "username": source.get("username"),
+        "keycloak_sub": source.get("keycloak_sub") or (ssh_start or {}).get("keycloak_sub"),
         "project": source.get("project"),
         "host_id": source.get("host_id"),
         "server_name": source.get("server_name") or source.get("host_name"),
@@ -91,7 +98,43 @@ def _connection_key(event):
     return None
 
 
-def _matches(row, query=None, user=None, project=None, host=None):
+def parse_history_time(value, end_of_day=False):
+    """Parse a Unix timestamp, UTC calendar date or ISO time with an offset."""
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        text = str(value).strip()
+        try:
+            if len(text) == 10:
+                parsed = datetime.datetime.combine(datetime.date.fromisoformat(text), datetime.time(), datetime.timezone.utc)
+                result = parsed.timestamp() + (86400 - 0.000001 if end_of_day else 0)
+            else:
+                parsed = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError("timezone required")
+                result = parsed.timestamp()
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("history time must be a UTC date, Unix timestamp, or ISO 8601 time with timezone") from exc
+    if not math.isfinite(result):
+        raise ValueError("history time must be finite")
+    return result
+
+
+def _matches(row, query=None, user=None, project=None, host=None, since=None, until=None, result=None):
+    timestamp = float(row.get("ts") or 0)
+    if since is not None and timestamp < since:
+        return False
+    if until is not None and timestamp > until:
+        return False
+    outcome = row.get("result") or ""
+    if result == "success" and outcome != "exit=0":
+        return False
+    if result == "failure" and (not outcome.startswith("exit=") or outcome in ("exit=0", "exit=None")):
+        return False
+    if result and result not in ("success", "failure") and outcome != result:
+        return False
     if user and row.get("username") != user:
         return False
     if project and row.get("project") != project:
@@ -112,7 +155,18 @@ def _matches(row, query=None, user=None, project=None, host=None):
     return True
 
 
-def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None):
+def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None, since=None, until=None, result=None):
+    since = parse_history_time(since)
+    until = parse_history_time(until, end_of_day=True)
+    if since is not None and until is not None and since > until:
+        raise ValueError("history start must not be after end")
+    if result and result not in ("success", "failure", "started", "selected"):
+        import re
+        if not re.fullmatch(r"exit=-?\d+", str(result)):
+            raise ValueError("history result must be success, failure, started, selected, or exit=<code>")
+    limit = int(limit)
+    if not 1 <= limit <= 10000:
+        raise ValueError("history limit must be between 1 and 10000")
     username = identity.get("username")
     admin = is_history_admin(identity, admin_groups)
     if user and user != username and not admin:
@@ -121,6 +175,10 @@ def read_history(base_path, identity, query=None, user=None, project=None, host=
     scan_users = None if admin else [username]
     if user:
         scan_users = [user]
+    # Stable OIDC subjects remain owners after a username change. The final
+    # filter checks each record; legacy records retain username-based ownership.
+    if not admin and identity.get("keycloak_sub"):
+        scan_users = None
 
     grouped_events = {}
     for path in _iter_session_files(base_path, users=scan_users):
@@ -138,7 +196,10 @@ def read_history(base_path, identity, query=None, user=None, project=None, host=
     for events in grouped_events.values():
         events.sort(key=lambda event: float(event.get("ts") or 0))
         row = _row_from_events(events)
-        if row and _matches(row, query=query, user=user, project=project, host=host):
+        owned = row and (row.get("keycloak_sub") == identity.get("keycloak_sub") if row.get("keycloak_sub") else row.get("username") == username)
+        if row and (admin or owned) and _matches(
+            row, query=query, user=user if admin else None, project=project, host=host, since=since, until=until, result=result
+        ):
             rows.append(row)
 
     rows = sorted(rows, key=lambda row: row.get("ts") or 0, reverse=True)

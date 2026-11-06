@@ -87,12 +87,17 @@ deploy_lock () {
 auth_callback_cleanup () {
     # cat "${ISOLATE_SESSION}" 2>/dev/null;
     rm -f "${ISOLATE_SESSION}" > /dev/null 2>&1 || /bin/true;
+    case "${ISOLATE_AUTHORIZATION_FILE:-}" in
+        /tmp/isolate-authorization-*) rm -f -- "${ISOLATE_AUTHORIZATION_FILE}" ;; 
+    esac
+    unset ISOLATE_AUTHORIZATION_FILE;
 }
 
 auth_callback () {
     if [[ $# -eq 0 ]] ; then
         return
     fi
+    unset ISOLATE_CALLBACK ISOLATE_CALLBACK_CMD ISOLATE_AUTHORIZATION_FILE;
     SESS_DIR="${HOME}/.auth_sess";
     if [[ ! -d "${SESS_DIR}" ]] ; then
         mkdir -p "${SESS_DIR}";
@@ -105,15 +110,19 @@ auth_callback () {
     "${@}";
 
     source "${ISOLATE_SESSION}" > /dev/null 2>&1;
-    auth_callback_cleanup;
+    rm -f -- "${ISOLATE_SESSION}";
 
     if [ "${ISOLATE_CALLBACK}" == "${ISOLATE_SESSION}" ]; then
         if [ -n "${ISOLATE_CALLBACK_CMD+x}" ]; then
             "${ISOLATE_CALLBACK_CMD[@]}";
+            local connection_status=$?;
+            auth_callback_cleanup;
+            return "${connection_status}";
         else
             /bin/false;
         fi
     fi
+    auth_callback_cleanup;
 }
 
 g () {

@@ -39,6 +39,70 @@ class RecordingAudit:
 
 
 class SSHWrapperAuditTest(unittest.TestCase):
+    def test_managed_session_rechecks_before_each_command_and_never_falls_back(self):
+        config = {"command_audit": {"enabled": True, "mode": "managed"}}
+        def managed(*argv, before_execute, control):
+            for _ in range(3):
+                self.assertFalse(before_execute())
+            return 0
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ssh_wrapper, "run_managed_shell", side_effect=managed), \
+                mock.patch.object(ssh_wrapper, "trusted_config", return_value=config), \
+                mock.patch.object(ssh_wrapper, "recheck_connection") as recheck, \
+                mock.patch.object(ssh_wrapper, "_run_pty_command") as pty, \
+                mock.patch.object(ssh_wrapper, "_run_pipe_command") as pipe:
+            self.assertEqual(ssh_wrapper.run_command(["ssh"], os.path.join(directory, "raw.log"), RecordingAudit(), {},
+                             config=config, authorization={"deadline": 9999999999}), 0)
+        self.assertEqual(recheck.call_count, 3)
+        pty.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_managed_audit_failure_closes_without_an_interactive_fallback(self):
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ssh_wrapper, "run_managed_shell", side_effect=ssh_wrapper.ManagedAuditError("disk full")), \
+                mock.patch.object(ssh_wrapper, "_run_pty_command") as pty, \
+                mock.patch.object(ssh_wrapper, "_run_pipe_command") as pipe:
+            result = ssh_wrapper.run_command(["ssh"], os.path.join(directory, "raw.log"), RecordingAudit(), {},
+                         config={"command_audit": {"enabled": True, "mode": "managed"}})
+        self.assertEqual(result, 2)
+        pty.assert_not_called()
+        pipe.assert_not_called()
+
+    def test_revocation_closes_session_even_if_revocation_audit_fails(self):
+        audit = RecordingAudit()
+        original_event = audit.event
+        def event(name, **fields):
+            if name == "session_authorization_revoked":
+                raise OSError("audit unavailable")
+            original_event(name, **fields)
+        audit.event = event
+        def run(argv, raw_log, control):
+            self.assertTrue(control())
+            return 143
+        with tempfile.TemporaryDirectory() as directory, \
+                mock.patch.object(ssh_wrapper, "_redis_client", return_value=object()), \
+                mock.patch.object(ssh_wrapper, "mark_session_start", return_value={}), \
+                mock.patch.object(ssh_wrapper, "initial_session_alerts", return_value=[]), \
+                mock.patch.object(ssh_wrapper, "mark_session_end"), \
+                mock.patch.object(ssh_wrapper, "trusted_config", return_value={}), \
+                mock.patch.object(ssh_wrapper, "recheck_connection", side_effect=ssh_wrapper.ConnectionDenied("grant revoked")), \
+                mock.patch.object(ssh_wrapper, "_run_pipe_command", side_effect=run), \
+                mock.patch.object(ssh_wrapper, "_run_pty_command", side_effect=run):
+            result = ssh_wrapper.run_command(["ssh"], os.path.join(directory, "raw.log"), audit,
+                {"connection_id": "conn"}, config={"session_control": {}}, authorization={"deadline": 9999999999})
+        self.assertEqual(result, 143)
+        self.assertEqual(audit.events[-1][0], "ssh_end")
+
+    def test_pipe_control_failure_does_not_leave_an_orphan_ssh_process(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        with mock.patch.object(ssh_wrapper.subprocess, "Popen", return_value=proc), \
+                mock.patch.object(ssh_wrapper, "_terminate_child") as terminate:
+            with self.assertRaises(RuntimeError):
+                ssh_wrapper._run_pipe_command(["ssh"], mock.Mock(), control=mock.Mock(side_effect=RuntimeError("audit unavailable")))
+        terminate.assert_called_once_with(proc)
+        proc.stdout.close.assert_called_once()
+
     def test_exit_preserves_status_and_closes_session_for_pipe_and_pty(self):
         for is_tty in (False, True):
             for exit_code in (0, 1, 143):

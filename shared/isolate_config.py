@@ -18,6 +18,15 @@ DEFAULT_CONFIG_PATHS = (
 
 DEFAULT_CONFIG = {
     "schema_version": 2,
+    "connection_authorization": {
+        "connections_enabled": True,
+        "require_explicit_mapping": False,
+        "unix_users": {},
+        "allowed_target_ports": [],
+        "allow_proxy": False,
+        "max_session_seconds": 28800,
+        "recheck_interval": 5,
+    },
     "service_discovery": {
         "enabled": False,
         "remote_user": None,
@@ -60,7 +69,7 @@ DEFAULT_CONFIG = {
         "binary": "/usr/bin/ssh",
         "config_path": "/opt/auth/configs/defaults.conf",
         "allow_unknown_args": False,
-        "allowed_extra_args": ["-4", "-6", "-A", "-a", "-C", "-v", "-vv", "-vvv"],
+        "allowed_extra_args": ["-4", "-6", "-a", "-C", "-v", "-vv", "-vvv"],
         "default_remote_user": None,
         "default_sudo_mode": "sudo-i",
         "require_known_hosts": True,
@@ -112,6 +121,8 @@ DEFAULT_CONFIG = {
     },
     "command_audit": {
         "enabled": False,
+        "mode": "target-hooks",
+        "command_timeout_seconds": 300,
         "require_connection_id": True,
         "require_active_session": True,
         "completion_grace_seconds": 30,
@@ -147,6 +158,8 @@ DEFAULT_CONFIG = {
         "secret_key_file": "/opt/auth/keys/dashboard_secret",
         "admin_groups": [],
         "refresh_seconds": 15,
+        "self_service_enabled": True,
+        "self_service_groups": [],
         "require_mutation_confirmation": True,
         "jobs_max_results": 250,
         "default_locale": "en",
@@ -299,10 +312,10 @@ def _load_file(path):
     return loaded or {}
 
 
-def load_config(path=None):
+def load_config(path=None, use_env=True):
     """Load config from env/file and merge it with v2 defaults."""
     config = DEFAULT_CONFIG
-    config_path = path or os.getenv("ISOLATE_CONFIG")
+    config_path = path or (os.getenv("ISOLATE_CONFIG") if use_env else None)
     if config_path:
         if os.path.exists(config_path):
             config = _deep_merge(config, _load_file(config_path))
@@ -312,7 +325,7 @@ def load_config(path=None):
                 config = _deep_merge(config, _load_file(candidate))
                 break
 
-    config = _deep_merge(config, _env_overrides())
+    config = _deep_merge(config, _env_overrides() if use_env else {})
     data_root = config.get("data_root") or "/opt/auth"
     config["ssh"]["config_path"] = config["ssh"].get("config_path") or os.path.join(
         data_root, "configs", "defaults.conf"

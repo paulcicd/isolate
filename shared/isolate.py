@@ -15,6 +15,7 @@ from isolate_announcements import AnnouncementError, create_announcement, delete
 from isolate_access import (
     AccessDenied,
     approve_access_request,
+    cancel_access_request,
     comment_access_request,
     create_access_request,
     deny_access_request,
@@ -22,10 +23,13 @@ from isolate_access import (
     is_access_admin,
     list_access_requests,
     parse_duration,
+    parse_access_time,
     repeat_access_request,
+    renew_access_request,
+    revoke_access_request,
     set_notification_status,
 )
-from isolate_audit import AuditSinkError, verify_jsonl_file
+from isolate_audit import AuditSinkError, prepare_and_dispatch, verify_jsonl_file
 from isolate_backup import BackupError, create_backup, list_backups, restore_backup, verify_backup
 from isolate_command_audit import CommandAuditError, append_command_event
 from isolate_config import load_config
@@ -41,7 +45,13 @@ from isolate_identity import (
     save_token_cache,
 )
 from isolate_history import HistoryAccessDenied, format_history_table, is_history_admin, list_user_profiles, read_history, user_activity_summary
-from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, update_host
+from isolate_inventory import HostValidationError, format_hosts_table, get_host, list_hosts, normalize_tags, update_host
+from isolate_service_discovery import get_discovery_history
+from isolate_jobs import (
+    JobError, _runbook_submission_plan, create_runbook_fleet, get_job, list_jobs,
+    read_job_output, request_job_cancel, retry_job,
+)
+from isolate_runbooks import RunbookError, get_runbook, list_runbooks
 from isolate_connectivity import ConnectivityError, check_host, get_last_check, save_check
 from isolate_exports import ExportError, flatten_access_matrix, render_export
 from isolate_notifications import NotificationError, notify_access_event
@@ -111,6 +121,11 @@ def _effective_username():
 
 
 def _manual_policy_mutation_blocked(config):
+    try:
+        _require_platform_admin(config)
+    except (AccessDenied, IdentityError) as exc:
+        print("Administration denied: {}".format(exc), file=sys.stderr)
+        return True
     if config.get("policy_as_code", {}).get("enforce_git", False):
         print("manual policy mutation is disabled; update the Git policy and run isolate policy sync", file=sys.stderr)
         return True
@@ -515,6 +530,40 @@ def _require_access_admin(config):
     if not is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
         raise AccessDenied("access administration is allowed only for configured admin groups")
     return identity
+
+
+def _require_platform_admin(config):
+    if os.name == "posix" and os.geteuid() == 0:
+        return {"username": "root"}
+    # A user-supplied ISOLATE_CONFIG must not define their own trusted issuer or
+    # administrator groups. Read authorization settings from the system config.
+    from isolate_connection_auth import trusted_config, bind_identity, ConnectionDenied
+    try:
+        authorization_config = trusted_config()
+        if os.name == "posix":
+            import pwd
+            username = pwd.getpwuid(os.getuid()).pw_name
+        else:
+            raise ConnectionDenied("platform administration requires a Linux host")
+        from isolate_identity import _load_token_cache
+        identity = bind_identity(_load_token_cache().get("id_token"), authorization_config, username)
+    except (ConnectionDenied, OSError) as exc:
+        raise AccessDenied(str(exc)) from exc
+    groups = authorization_config.get("dashboard", {}).get("admin_groups") or authorization_config.get("access", {}).get("admin_groups") or []
+    if not is_access_admin(identity, groups):
+        raise AccessDenied("an administrator identity is required")
+    return identity
+
+
+def authorize_cli_command(args, config):
+    """Restrict the CLI as well as the dashboard; Redis credentials are privileged."""
+    public_functions = {cmd_login, cmd_logout, cmd_whoami, cmd_history, cmd_access_request,
+                        cmd_access_list, cmd_access_show, cmd_access_comment, cmd_access_repeat,
+                        cmd_access_cancel, cmd_access_renew, cmd_job_list, cmd_job_show,
+                        cmd_job_output, cmd_job_cancel, cmd_job_retry, cmd_runbook,
+                        cmd_user_activity, cmd_command_log_append}
+    if args.func not in public_functions:
+        _require_platform_admin(config)
 
 
 def _load_package_file(path):
@@ -1141,7 +1190,12 @@ def _str2bool(value):
 
 
 def cmd_host_list(args, config):
-    rows = list_hosts(redis_client(config), project=args.project, query=args.query)
+    try:
+        rows = list_hosts(redis_client(config), project=args.project, query=args.query,
+                          tags=normalize_tags(getattr(args, "tag", None)))
+    except HostValidationError as exc:
+        print("host list failed: {}".format(exc), file=sys.stderr)
+        return 2
     if args.json:
         print(json.dumps(rows, indent=2, sort_keys=True))
     else:
@@ -1177,6 +1231,13 @@ def cmd_host_update(args, config):
         "maintenance_reason": getattr(args, "maintenance_reason", None),
     }
     try:
+        if getattr(args, "tag", None) or getattr(args, "remove_tag", None) or getattr(args, "clear_tags", False):
+            previous = get_host(redis, args.server_id) or {}
+            tags = {} if getattr(args, "clear_tags", False) else normalize_tags(previous.get("tags"))
+            tags.update(normalize_tags(getattr(args, "tag", None)))
+            for key in getattr(args, "remove_tag", None) or []:
+                tags.pop(key, None)
+            updates["tags"] = tags
         host = update_host(redis, args.server_id, updates, updated_by=os.getenv("USER") or os.getenv("USERNAME"))
     except (HostValidationError, ValueError) as exc:
         print("host update failed: {}".format(exc), file=sys.stderr)
@@ -1185,6 +1246,23 @@ def cmd_host_update(args, config):
         print("Host not found: {}".format(args.server_id), file=sys.stderr)
         return 2
     print(json.dumps(host, indent=2, sort_keys=True))
+
+
+def cmd_host_services_history(args, config):
+    redis = redis_client(config)
+    if get_host(redis, args.server_id) is None:
+        print("Host not found: {}".format(args.server_id), file=sys.stderr)
+        return 2
+    rows = get_discovery_history(redis, args.server_id, limit=min(max(args.limit, 1), 1000))
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        print("checked_at             added                         removed")
+        for row in rows:
+            checked_at = datetime.datetime.fromtimestamp(row.get("checked_at") or 0, datetime.timezone.utc).isoformat()
+            print("{}  {:<28} {}".format(checked_at, ", ".join(row.get("added") or []), ", ".join(row.get("removed") or [])))
+        if not rows:
+            print("No service changes recorded")
 
 
 def cmd_host_maintenance(args, config):
@@ -1298,7 +1376,7 @@ def cmd_announcement_remove(args, config):
 def _export_rows(kind, args, config):
     redis = redis_client(config)
     if kind == "inventory":
-        return list_hosts(redis, project=args.project, query=args.query)
+        return list_hosts(redis, project=args.project, query=args.query, tags=normalize_tags(getattr(args, "tag", None)))
     if kind == "grants":
         return list_grant_records(redis, project=args.project)
     if kind == "users":
@@ -1309,6 +1387,7 @@ def _export_rows(kind, args, config):
             config["logging"]["base_path"], identity, query=args.query, user=args.user, project=args.project,
             host=args.host, limit=min(args.limit, int(config.get("history", {}).get("max_limit", 100))),
             admin_groups=config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
         )
     if kind == "access-matrix":
         matrix = build_access_matrix(load_grants(redis), load_project_sets(redis), list_hosts(redis), defaults={**config.get("policy", {}), **config.get("ssh", {})})
@@ -1325,7 +1404,7 @@ def cmd_export(args, config):
         else:
             _write_private_file(args.output, content)
             print("Exported {} rows to {}".format(len(rows), args.output))
-    except (ExportError, IdentityError, HistoryAccessDenied, OSError, ValueError) as exc:
+    except (ExportError, IdentityError, HistoryAccessDenied, HostValidationError, OSError, ValueError) as exc:
         print("export failed: {}".format(exc), file=sys.stderr)
         return 2
 
@@ -1449,8 +1528,9 @@ def cmd_history(args, config):
             host=args.host,
             limit=limit,
             admin_groups=history_cfg.get("admin_groups") or [],
+            since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
         )
-    except HistoryAccessDenied as exc:
+    except (HistoryAccessDenied, ValueError) as exc:
         print("history denied: {}".format(exc), file=sys.stderr)
         return 2
 
@@ -1481,8 +1561,10 @@ def cmd_access_request(args, config):
             ticket=args.ticket,
             template=args.template,
             config=config,
+            starts_at=parse_access_time(getattr(args, "starts_at", None)),
+            ends_at=parse_access_time(getattr(args, "ends_at", None)),
         )
-    except AccessDenied as exc:
+    except (AccessDenied, ValueError) as exc:
         print("access request failed: {}".format(exc), file=sys.stderr)
         return 2
     try:
@@ -1550,6 +1632,7 @@ def cmd_access_approve(args, config):
             sudo_mode=args.sudo_mode,
             max_ttl=max_ttl,
             comment=args.comment,
+            starts_at=parse_access_time(getattr(args, "starts_at", None)),
         )
     except (AccessDenied, IdentityError, ValueError) as exc:
         print("access approve failed: {}".format(exc), file=sys.stderr)
@@ -1607,7 +1690,11 @@ def cmd_access_comment(args, config):
     if record.get("requester") != identity.get("username") and not admin:
         print("access comment denied: other users are visible only to admins", file=sys.stderr)
         return 2
-    record = comment_access_request(redis, args.id, identity, args.text)
+    try:
+        record = comment_access_request(redis, args.id, identity, args.text, admin_groups=config.get("access", {}).get("admin_groups") or [])
+    except AccessDenied as exc:
+        print("access comment failed: {}".format(exc), file=sys.stderr)
+        return 2
     print(json.dumps(record, indent=2, sort_keys=True))
 
 
@@ -1627,11 +1714,70 @@ def cmd_access_repeat(args, config):
         print("access repeat denied: other users are visible only to admins", file=sys.stderr)
         return 2
     try:
-        record = repeat_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket, config=config)
+        record = repeat_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket, config=config,
+                                       admin_groups=config.get("access", {}).get("admin_groups") or [])
     except AccessDenied as exc:
         print("access repeat failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def _finish_access_change(redis, config, identity, record, event):
+    if record is None:
+        raise AccessDenied("access request was not found")
+    prepare_and_dispatch({
+        "event": event, "ts": time.time(), "source": "isolate-cli",
+        "username": identity.get("username"), "request_id": record.get("id"),
+        "requester": record.get("requester"), "project": record.get("project"),
+        "host_id": record.get("host"), "result": record.get("status"),
+    }, config.get("logging", {}))
+    try:
+        result = notify_access_event(config, event, record, actor=identity)
+        _record_notification_status(redis, record["id"], result=result)
+        _print_notification_warnings(result)
+    except NotificationError as exc:
+        _record_notification_status(redis, record["id"], error=exc)
+        print("notification failed: {}".format(exc), file=sys.stderr)
+    print(json.dumps(get_access_request(redis, record["id"]) or record, indent=2, sort_keys=True))
+
+
+def cmd_access_cancel(args, config):
+    try:
+        identity = _load_cli_identity()
+        if not args.yes:
+            raise AccessDenied("explicit --yes is required to cancel a request")
+        redis = redis_client(config)
+        record = cancel_access_request(redis, args.id, identity)
+        _finish_access_change(redis, config, identity, record, "access_request_cancelled")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access cancel failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_access_revoke(args, config):
+    try:
+        identity = _require_access_admin(config)
+        if not args.yes:
+            raise AccessDenied("explicit --yes is required to revoke access")
+        redis = redis_client(config)
+        record = revoke_access_request(redis, args.id, identity,
+                                       admin_groups=config.get("access", {}).get("admin_groups") or [], reason=args.reason)
+        _finish_access_change(redis, config, identity, record, "access_request_revoked")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access revoke failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_access_renew(args, config):
+    try:
+        identity = _load_cli_identity()
+        redis = redis_client(config)
+        record = renew_access_request(redis, args.id, identity, reason=args.reason, ticket=args.ticket,
+                                      starts_at=parse_access_time(args.starts_at), ends_at=parse_access_time(args.ends_at), config=config)
+        _finish_access_change(redis, config, identity, record, "access_request_created")
+    except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
+        print("access renew failed: {}".format(exc), file=sys.stderr)
+        return 2
 
 
 def cmd_command_log_append(args, config):
@@ -1675,6 +1821,221 @@ def cmd_jwks_refresh(args, config):
         print("jwks refresh failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps({"keys": len(jwks.get("keys") or []), "cache_path": config.get("keycloak", {}).get("jwks_cache_path")}, indent=2, sort_keys=True))
+
+
+def _job_context():
+    """Bind operational CLI calls to root-managed configuration and the Unix user."""
+    from isolate_connection_auth import ConnectionDenied, bind_identity, trusted_config
+    from isolate_identity import _load_token_cache
+
+    try:
+        config = trusted_config()
+        if os.name != "posix":
+            raise ConnectionDenied("job and runbook operations require a Linux bastion")
+        import pwd
+
+        username = pwd.getpwuid(os.getuid()).pw_name
+        identity = bind_identity(_load_token_cache().get("id_token"), config, username)
+    except (ConnectionDenied, OSError) as exc:
+        raise AccessDenied(str(exc)) from exc
+    return config, identity
+
+
+def _job_admin(identity, config):
+    groups = set(identity.get("groups") or [])
+    admins = set(config.get("dashboard", {}).get("admin_groups") or [])
+    admins.update(config.get("access", {}).get("admin_groups") or [])
+    return bool(groups & admins)
+
+
+def _owns_job(record, identity):
+    if record.get("keycloak_sub"):
+        return record["keycloak_sub"] == identity.get("keycloak_sub")
+    return bool(identity.get("username")) and record.get("username") == identity["username"]
+
+
+def _visible_job(redis, job_id, identity, config):
+    if not str(job_id).isdigit():
+        raise JobError("job id must be numeric")
+    record = get_job(redis, job_id)
+    if record is None or (not _owns_job(record, identity) and not _job_admin(identity, config)):
+        raise JobError("job was not found or is not visible")
+    if not _owns_job(record, identity):
+        _require_platform_admin(config)
+    return record
+
+
+def _audit_cli_job(config, identity, event, record):
+    prepare_and_dispatch({
+        "event": event, "source": "isolate-cli", "ts": time.time(),
+        "username": identity.get("username"), "job_id": record.get("id"),
+        "project": record.get("project"), "host_id": record.get("host_id"),
+    }, config.get("logging", {}))
+
+
+def cmd_job_list(args, config):
+    try:
+        config, identity = _job_context()
+        admin = _job_admin(identity, config)
+        if args.user and args.user != identity.get("username") and not admin:
+            raise JobError("other users' jobs are visible only to administrators")
+        user = args.user if admin else identity.get("username")
+        if admin and user != identity.get("username"):
+            _require_platform_admin(config)
+        limit = min(max(args.limit, 1), 1000)
+        rows = list_jobs(redis_client(config), user=user, status=args.status, limit=1000 if not admin else limit)
+        if not admin:
+            rows = [row for row in rows if _owns_job(row, identity)][:limit]
+        if args.json:
+            print(json.dumps(rows, indent=2, sort_keys=True))
+        else:
+            print("id      status       user               host      runbook          fleet")
+            for row in rows:
+                print("{:<7} {:<12} {:<18} {:<9} {:<16} {}".format(
+                    row.get("id"), row.get("status"), row.get("username"), row.get("host_id"),
+                    row.get("runbook_id") or row.get("type"), row.get("fleet_id") or ""))
+    except (IdentityError, AccessDenied, JobError, ValueError) as exc:
+        print("job list failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_show(args, config):
+    try:
+        config, identity = _job_context()
+        record = _visible_job(redis_client(config), args.id, identity, config)
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError) as exc:
+        print("job show failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_output(args, config):
+    try:
+        config, identity = _job_context()
+        record = _visible_job(redis_client(config), args.id, identity, config)
+        execution = config.get("command_execution", {}) or {}
+        output = read_job_output(record, max_bytes=int(execution.get("max_return_bytes", 262144)),
+                                 jobs_path=execution.get("jobs_path", "/opt/auth/jobs"), job_id=args.id)
+        if args.json:
+            print(json.dumps({"job_id": args.id, "status": record.get("status"), "output": output,
+                              "output_truncated": bool(record.get("output_truncated") or record.get("output_bytes", 0) > int(execution.get("max_return_bytes", 262144)))}, indent=2, sort_keys=True))
+        else:
+            sys.stdout.write(output)
+    except (IdentityError, AccessDenied, JobError, ValueError, OSError) as exc:
+        print("job output failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_cancel(args, config):
+    try:
+        config, identity = _job_context()
+        redis = redis_client(config)
+        _visible_job(redis, args.id, identity, config)
+        if not args.yes:
+            raise JobError("explicit --yes is required to cancel a job")
+        record = request_job_cancel(redis, args.id, identity)
+        _audit_cli_job(config, identity, "job_cancel_requested", record)
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError, AuditSinkError) as exc:
+        print("job cancel failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def cmd_job_retry(args, config):
+    try:
+        config, identity = _job_context()
+        redis = redis_client(config)
+        original = _visible_job(redis, args.id, identity, config)
+        if not args.yes:
+            raise JobError("explicit --yes is required to retry a job")
+        if _owns_job(original, identity):
+            record = retry_job(redis, config, args.id, identity, current_identity=identity)
+        else:
+            record = retry_job(redis, config, args.id, identity)
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, ValueError, AuditSinkError) as exc:
+        print("job retry failed: {}".format(exc), file=sys.stderr)
+        return 2
+
+
+def _runbook_classes(identity, config):
+    runbooks = config.get("runbooks", {}) or {}
+    if not runbooks.get("enabled", False):
+        raise JobError("runbooks are disabled")
+    return [name for name in ("read_only", "operational")
+            if (name != "operational" or runbooks.get(name, {}).get("enabled", False))
+            and set(identity.get("groups") or []) & set(runbooks.get(name, {}).get("allowed_groups") or [])]
+
+
+def _runbook_parameters(values):
+    parameters = {}
+    for value in values or []:
+        if "=" not in value:
+            raise JobError("parameters must use name=value")
+        name, parameter = value.split("=", 1)
+        name = name.strip()
+        if not name or name in parameters:
+            raise JobError("parameter names must be nonempty and unique")
+        parameters[name] = parameter
+    return parameters
+
+
+def _runbook_host_ids(redis, args):
+    explicit = getattr(args, "host", None) or []
+    tags = normalize_tags(getattr(args, "tag", None))
+    project = getattr(args, "project", None)
+    if explicit and (project or tags):
+        raise JobError("use --host or --project/--tag selectors, not both")
+    if explicit:
+        return list(dict.fromkeys(host.strip() for value in explicit for host in value.split(",") if host.strip()))
+    if not project and not tags:
+        raise JobError("an explicit --host, --project, or --tag selector is required")
+    return [str(host["server_id"]) for host in list_hosts(redis, project=project, tags=tags)]
+
+
+def cmd_runbook(args, config):
+    try:
+        config, identity = _job_context()
+        classes = _runbook_classes(identity, config)
+        if not classes:
+            raise JobError("identity is not in an allowed runbook group")
+        if args.runbook_command == "list":
+            rows = list_runbooks(config, classes=classes)
+            if args.json:
+                print(json.dumps(rows, indent=2, sort_keys=True))
+            else:
+                print("id                   class         description")
+                for row in rows:
+                    print("{:<20} {:<13} {}".format(row["id"], row["class"], row.get("description") or row.get("title")))
+            return 0
+        runbook = get_runbook(config, args.runbook)
+        if runbook is None or runbook["class"] not in classes:
+            raise JobError("runbook is unknown, disabled, or not allowed")
+        if args.runbook_command == "show":
+            print(json.dumps(runbook, indent=2, sort_keys=True))
+            return 0
+        redis = redis_client(config)
+        host_ids = _runbook_host_ids(redis, args)
+        parameters = _runbook_parameters(args.param)
+        if args.timeout is not None and not 0 < args.timeout <= int(config.get("command_execution", {}).get("max_timeout", 900)):
+            raise JobError("timeout is outside the configured range")
+        if args.runbook_command == "preview":
+            rendered, planned, _ = _runbook_submission_plan(redis, config, identity, args.runbook, host_ids,
+                                                            parameters=parameters, timeout=args.timeout)
+            print(json.dumps({"runbook": rendered["runbook"]["id"], "command": rendered["command"],
+                              "parameters": rendered["parameters"], "count": len(planned),
+                              "hosts": [{"host_id": str(host["server_id"]), "project": host.get("project_name"),
+                                         "remote_user": decision.get("remote_user"), "sudo_mode": decision.get("sudo_mode")}
+                                        for host, decision in planned]}, indent=2, sort_keys=True))
+        else:
+            if not args.yes:
+                raise JobError("explicit --yes is required; use runbook preview to inspect the fleet")
+            result = create_runbook_fleet(redis, config, identity, args.runbook, host_ids,
+                                          parameters=parameters, timeout=args.timeout, confirmed=True)
+            print(json.dumps(result, indent=2, sort_keys=True))
+    except (IdentityError, AccessDenied, JobError, RunbookError, HostValidationError, ValueError, AuditSinkError) as exc:
+        print("runbook {} failed: {}".format(args.runbook_command, exc), file=sys.stderr)
+        return 2
 
 
 def build_parser():
@@ -1976,6 +2337,7 @@ def build_parser():
     host_list = host_sub.add_parser("list")
     host_list.add_argument("--project")
     host_list.add_argument("--query")
+    host_list.add_argument("--tag", action="append", help="exact key=value tag filter; repeat for AND matching")
     host_list.add_argument("--json", action="store_true")
     host_list.set_defaults(func=cmd_host_list)
 
@@ -1994,6 +2356,9 @@ def build_parser():
     host_update.add_argument("--vip", type=_str2bool)
     host_update.add_argument("--services")
     host_update.add_argument("--note")
+    host_update.add_argument("--tag", action="append", help="set a key=value tag while preserving other tags")
+    host_update.add_argument("--remove-tag", action="append", help="remove a tag by key")
+    host_update.add_argument("--clear-tags", action="store_true")
     host_update.add_argument("--privileged-provider")
     host_update.add_argument("--privileged-url")
     host_update.add_argument("--privileged-hint")
@@ -2020,6 +2385,50 @@ def build_parser():
     host_check.add_argument("--json", action="store_true")
     host_check.set_defaults(func=cmd_host_check)
 
+    services_history = host_sub.add_parser("services-history")
+    services_history.add_argument("server_id")
+    services_history.add_argument("--limit", type=int, default=20)
+    services_history.add_argument("--json", action="store_true")
+    services_history.set_defaults(func=cmd_host_services_history)
+
+    job = sub.add_parser("job", aliases=["jobs"])
+    job_sub = job.add_subparsers(dest="job_command", required=True)
+    job_list = job_sub.add_parser("list")
+    job_list.add_argument("--user")
+    job_list.add_argument("--status", choices=["queued", "running", "completed", "failed", "cancelled", "timed_out"])
+    job_list.add_argument("--limit", type=int, default=50)
+    job_list.add_argument("--json", action="store_true")
+    job_list.set_defaults(func=cmd_job_list)
+    for name, handler in (("show", cmd_job_show), ("output", cmd_job_output),
+                          ("cancel", cmd_job_cancel), ("retry", cmd_job_retry)):
+        command = job_sub.add_parser(name)
+        command.add_argument("id")
+        if name in ("cancel", "retry"):
+            command.add_argument("--yes", action="store_true")
+        if name == "output":
+            command.add_argument("--json", action="store_true")
+        command.set_defaults(func=handler)
+
+    runbook = sub.add_parser("runbook")
+    runbook_sub = runbook.add_subparsers(dest="runbook_command", required=True)
+    runbook_list = runbook_sub.add_parser("list")
+    runbook_list.add_argument("--json", action="store_true")
+    runbook_list.set_defaults(func=cmd_runbook)
+    runbook_show = runbook_sub.add_parser("show")
+    runbook_show.add_argument("runbook")
+    runbook_show.set_defaults(func=cmd_runbook)
+    for name in ("preview", "run"):
+        command = runbook_sub.add_parser(name)
+        command.add_argument("runbook")
+        command.add_argument("--host", action="append", help="host id or comma-separated ids; repeatable")
+        command.add_argument("--project")
+        command.add_argument("--tag", action="append", help="exact key=value selector; repeat for AND matching")
+        command.add_argument("--param", action="append", help="typed runbook parameter as name=value")
+        command.add_argument("--timeout", type=int)
+        if name == "run":
+            command.add_argument("--yes", action="store_true")
+        command.set_defaults(func=cmd_runbook)
+
     session = sub.add_parser("session")
     session_sub = session.add_subparsers(dest="session_command", required=True)
     search = session_sub.add_parser("search")
@@ -2038,6 +2447,9 @@ def build_parser():
     history.add_argument("--user")
     history.add_argument("--project")
     history.add_argument("--host")
+    history.add_argument("--since", help="Unix time or ISO 8601 date/time with timezone")
+    history.add_argument("--until", help="Unix time or ISO 8601 date/time with timezone")
+    history.add_argument("--result", help="connection result filter, such as success, failure, or exit=255")
     history.add_argument("--limit", type=int)
     history.add_argument("--json", action="store_true")
     history.set_defaults(func=cmd_history)
@@ -2050,6 +2462,10 @@ def build_parser():
     export.add_argument("--host")
     export.add_argument("--user")
     export.add_argument("--query")
+    export.add_argument("--tag", action="append")
+    export.add_argument("--since")
+    export.add_argument("--until")
+    export.add_argument("--result")
     export.add_argument("--limit", type=int, default=100)
     export.set_defaults(func=cmd_export)
 
@@ -2103,10 +2519,12 @@ def build_parser():
     access_request.add_argument("--reason", required=True)
     access_request.add_argument("--ticket")
     access_request.add_argument("--template")
+    access_request.add_argument("--starts-at", help="Unix time or ISO 8601 with explicit timezone")
+    access_request.add_argument("--ends-at", help="Unix time or ISO 8601 with explicit timezone")
     access_request.set_defaults(func=cmd_access_request)
 
     access_list = access_sub.add_parser("list")
-    access_list.add_argument("--status", choices=["pending", "approved", "denied"])
+    access_list.add_argument("--status", choices=["pending", "approved", "denied", "cancelled", "revoked"])
     access_list.add_argument("--user")
     access_list.add_argument("--project")
     access_list.add_argument("--ticket")
@@ -2123,6 +2541,7 @@ def build_parser():
     access_approve.add_argument("--remote-user")
     access_approve.add_argument("--sudo-mode")
     access_approve.add_argument("--comment")
+    access_approve.add_argument("--starts-at", help="override access start with Unix time or ISO 8601 with timezone")
     access_approve.set_defaults(func=cmd_access_approve)
 
     access_deny = access_sub.add_parser("deny")
@@ -2142,6 +2561,25 @@ def build_parser():
     access_repeat.add_argument("--ticket")
     access_repeat.set_defaults(func=cmd_access_repeat)
 
+    access_cancel = access_sub.add_parser("cancel")
+    access_cancel.add_argument("--id", required=True)
+    access_cancel.add_argument("--yes", action="store_true")
+    access_cancel.set_defaults(func=cmd_access_cancel)
+
+    access_revoke = access_sub.add_parser("revoke")
+    access_revoke.add_argument("--id", required=True)
+    access_revoke.add_argument("--reason", required=True)
+    access_revoke.add_argument("--yes", action="store_true")
+    access_revoke.set_defaults(func=cmd_access_revoke)
+
+    access_renew = access_sub.add_parser("renew")
+    access_renew.add_argument("--id", required=True)
+    access_renew.add_argument("--reason", required=True)
+    access_renew.add_argument("--ticket")
+    access_renew.add_argument("--starts-at")
+    access_renew.add_argument("--ends-at")
+    access_renew.set_defaults(func=cmd_access_renew)
+
     jwks = sub.add_parser("jwks")
     jwks_sub = jwks.add_subparsers(dest="jwks_command", required=True)
     jwks_refresh = jwks_sub.add_parser("refresh")
@@ -2153,6 +2591,11 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     config = load_config()
+    try:
+        authorize_cli_command(args, config)
+    except (AccessDenied, IdentityError) as exc:
+        print("Administration denied: {}".format(exc), file=sys.stderr)
+        return 2
     return args.func(args, config) or 0
 
 

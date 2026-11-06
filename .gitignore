@@ -11,6 +11,7 @@ spool/*
 .idea/
 __pycache__/
 *.pyc
+.venv/
 .coverage
 **/.coverage
 .deploy
