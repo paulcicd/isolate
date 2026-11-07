@@ -73,6 +73,17 @@ def host_matches_tags(host, tags):
     return all(host_tags.get(key) == value for key, value in selectors.items())
 
 
+def _resource_metadata(value, field, maximum):
+    if value is None:
+        return ""
+    if not isinstance(value, str):
+        raise HostValidationError("{} must be a string".format(field))
+    value = value.strip()
+    if len(value) > maximum or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise HostValidationError("{} must contain at most {} printable characters".format(field, maximum))
+    return value
+
+
 def normalize_host(host):
     row = dict(host)
     row["server_id"] = str(row.get("server_id") or "")
@@ -83,6 +94,8 @@ def normalize_host(host):
     row["server_note"] = str(row.get("server_note") or "").strip()
     row["tags"] = normalize_tags(row.get("tags"))
     row["tags_display"] = ", ".join("{}={}".format(key, value) for key, value in row["tags"].items())
+    row["resource_owner"] = _resource_metadata(row.get("resource_owner"), "resource owner", 128) or row["tags"].get("owner", "")
+    row["environment"] = _resource_metadata(row.get("environment"), "environment", 64) or row["tags"].get("env", "")
     row["server_vip"] = bool(row.get("server_vip"))
     row["server_vip_marker"] = "VIP" if row["server_vip"] else ""
     row["privileged_access_provider"] = str(row.get("privileged_access_provider") or "").strip()
@@ -158,6 +171,8 @@ def host_matches_query(host, query):
         "server_services_display",
         "server_note",
         "tags_display",
+        "resource_owner",
+        "environment",
         "server_vip_marker",
         "privileged_access_provider",
         "privileged_access_url",
@@ -170,6 +185,9 @@ def host_matches_query(host, query):
 
 def validate_host_updates(redis, updates):
     normalized = {}
+    for field, maximum in (("resource_owner", 128), ("environment", 64)):
+        if field in updates:
+            normalized[field] = _resource_metadata(updates[field], field, maximum)
     if updates.get("tags") is not None:
         normalized["tags"] = normalize_tags(updates["tags"])
     if updates.get("project_name") is not None:
@@ -241,23 +259,67 @@ def validate_host_updates(redis, updates):
     return normalized
 
 
-def update_host(redis, server_id, updates, updated_by=None, expected_revision=None):
-    raw = redis.get("server_{}".format(server_id))
-    if raw is None:
+def _mutate_hosts(redis, server_ids, mutation):
+    """Recheck object scopes and revisions against the records being committed."""
+    keys = ["server_{}".format(server_id) for server_id in server_ids]
+
+    def apply(reader, writer=None):
+        current = [(server_id, _read_host_record(reader, key)) for server_id, key in zip(server_ids, keys)]
+        records = mutation(current)
+        if writer is not None and callable(getattr(writer, "multi", None)):
+            writer.multi()
+        target = writer if writer is not None else redis
+        for server_id, host in records:
+            target.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+        if writer is not None:
+            writer.execute()
+        return records
+
+    if not callable(getattr(redis, "pipeline", None)):
+        return apply(redis)
+    pipeline = redis.pipeline(transaction=True)
+    if not callable(getattr(pipeline, "watch", None)):
+        return apply(redis, pipeline)
+    from redis.exceptions import WatchError
+    for _ in range(5):
+        with redis.pipeline(transaction=True) as pipeline:
+            try:
+                pipeline.watch(*keys)
+                return apply(pipeline, pipeline)
+            except WatchError:
+                continue
+    raise HostValidationError("host changed concurrently; reload before saving")
+
+
+def _read_host_record(redis, key):
+    raw = redis.get(key)
+    return json.loads(decode(raw)) if raw is not None else None
+
+
+def update_host(redis, server_id, updates, updated_by=None, expected_revision=None, authorize=None):
+    def update(current):
+        server_id, host = current[0]
+        if host is None:
+            return []
+        before = normalize_host(host)
+        if expected_revision and host_revision(before) != str(expected_revision):
+            raise HostValidationError("host changed since this form was opened; reload before saving")
+        proposed = dict(host, **validate_host_updates(redis, updates))
+        if authorize is not None:
+            authorize(before, normalize_host(proposed))
+        proposed["updated_by"] = updated_by or "unknown"
+        proposed["updated_at"] = int(time.time())
+        return [(server_id, proposed)]
+
+    records = _mutate_hosts(redis, [str(server_id)], update)
+    if not records:
         return None
-    host = json.loads(decode(raw))
-    if expected_revision and host_revision(normalize_host(host)) != str(expected_revision):
-        raise HostValidationError("host changed since this form was opened; reload before saving")
-    host.update(validate_host_updates(redis, updates))
-    host["updated_by"] = updated_by or "unknown"
-    host["updated_at"] = int(time.time())
-    redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
-    normalized = normalize_host(host)
+    normalized = normalize_host(records[0][1])
     normalized["_revision"] = host_revision(normalized)
     return normalized
 
 
-def bulk_update_hosts(redis, server_ids, updates, updated_by=None):
+def bulk_update_hosts(redis, server_ids, updates, updated_by=None, authorize=None):
     ids = [str(server_id) for server_id in server_ids]
     if not ids:
         raise HostValidationError("at least one host id is required")
@@ -266,28 +328,20 @@ def bulk_update_hosts(redis, server_ids, updates, updated_by=None):
     normalized_updates = validate_host_updates(redis, updates)
     if not normalized_updates:
         raise HostValidationError("at least one update field is required")
-    current = []
-    for server_id in ids:
-        raw = redis.get("server_{}".format(server_id))
-        if raw is None:
-            raise HostValidationError("host not found: {}".format(server_id))
-        current.append((server_id, json.loads(decode(raw))))
-
-    updated_at = int(time.time())
-    records = []
-    for server_id, host in current:
-        host.update(normalized_updates)
-        host["updated_by"] = updated_by or "unknown"
-        host["updated_at"] = updated_at
-        records.append((server_id, host))
-    if hasattr(redis, "pipeline"):
-        pipeline = redis.pipeline(transaction=True)
-        for server_id, host in records:
-            pipeline.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
-        pipeline.execute()
-    else:
-        for server_id, host in records:
-            redis.set("server_{}".format(server_id), json.dumps(host, sort_keys=True))
+    def update(current):
+        updated_at = int(time.time())
+        records = []
+        for server_id, host in current:
+            if host is None:
+                raise HostValidationError("host not found: {}".format(server_id))
+            proposed = dict(host, **normalized_updates)
+            if authorize is not None:
+                authorize(normalize_host(host), normalize_host(proposed))
+            proposed["updated_by"] = updated_by or "unknown"
+            proposed["updated_at"] = updated_at
+            records.append((server_id, proposed))
+        return records
+    records = _mutate_hosts(redis, ids, update)
     return [normalize_host(host) for _, host in records]
 
 
@@ -312,6 +366,8 @@ def create_host(redis, values, updated_by=None):
         "server_services": normalized.get("server_services", ""),
         "server_note": normalized.get("server_note", ""),
         "tags": normalized.get("tags", {}),
+        "resource_owner": normalized.get("resource_owner", ""),
+        "environment": normalized.get("environment", ""),
         "server_vip": normalized.get("server_vip", False),
         "privileged_access_provider": normalized.get("privileged_access_provider", ""),
         "privileged_access_url": normalized.get("privileged_access_url", ""),

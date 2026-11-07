@@ -54,7 +54,9 @@ class CLIFeatureTests(unittest.TestCase):
             "logging": {"base_path": self.temp.name},
             "history": {"max_limit": 100},
             "access": {"admin_groups": ["Admins"]},
-            "dashboard": {"admin_groups": ["Admins"]},
+            "dashboard": {"admin_groups": ["Admins"], "role_bindings": [
+                {"group": "Operators", "role": "inventory-operator", "projects": ["payments"]},
+            ]},
             "command_execution": {"signing_key_file": key_path, "jobs_path": self.temp.name, "max_timeout": 900},
             "runbooks": {"enabled": True, "max_fleet_hosts": 10,
                          "read_only": {"allowed_groups": ["Operators"], "allow_sudo": False}},

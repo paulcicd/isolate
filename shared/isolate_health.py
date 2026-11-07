@@ -27,6 +27,7 @@ def validate_config(config, check_paths=False):
     keycloak = section("keycloak")
     logging_cfg = section("logging")
     dashboard = section("dashboard")
+    session_approval = section("session_approval")
     access_packages = section("access_packages")
     mcp = section("mcp")
     command_execution = section("command_execution")
@@ -151,6 +152,33 @@ def validate_config(config, check_paths=False):
         errors.append("dashboard.jobs_max_results must be an integer")
     if str(dashboard.get("default_locale") or "en").lower() not in ("en", "ru"):
         errors.append("dashboard.default_locale must be en or ru")
+    from isolate_permissions import ROLE_PERMISSIONS
+    bindings = dashboard.get("role_bindings", [])
+    if not isinstance(bindings, list):
+        errors.append("dashboard.role_bindings must be a list")
+    else:
+        for index, binding in enumerate(bindings):
+            prefix = "dashboard.role_bindings[{}]".format(index)
+            if not isinstance(binding, dict):
+                errors.append(prefix + " must be an object")
+                continue
+            if not isinstance(binding.get("group"), str) or not binding["group"].strip():
+                errors.append(prefix + ".group must be an exact nonempty OIDC group")
+            if not isinstance(binding.get("role"), str) or binding["role"] not in ROLE_PERMISSIONS:
+                errors.append(prefix + ".role is unknown")
+            for name in ("projects", "project_globs"):
+                value = binding.get(name, [])
+                if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+                    errors.append(prefix + "." + name + " must be a list of nonempty strings")
+            if not binding.get("projects") and not binding.get("project_globs"):
+                errors.append(prefix + " requires explicit projects or project_globs")
+    try:
+        from isolate_session_approvals import _settings, SessionApprovalDenied
+        _settings(config)
+    except SessionApprovalDenied as exc:
+        errors.append(str(exc))
+    if session_approval.get("enabled") and not (session_approval.get("required_projects") or session_approval.get("required_project_globs") or session_approval.get("require_privileged")):
+        warnings.append("session_approval is enabled without any selected targets")
 
     if not isinstance(maintenance.get("enforce", True), bool):
         errors.append("maintenance.enforce must be a boolean")

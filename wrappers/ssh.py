@@ -26,7 +26,7 @@ except ImportError:  # pragma: no cover - wrapper runs on Linux bastions
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'shared')))
 from isolate_config import load_config
 from isolate_identity import IdentityError
-from isolate_connection_auth import ConnectionDenied, authorize_connection, invoking_user, read_authorization_file, recheck_connection, trusted_config
+from isolate_connection_auth import ConnectionDenied, authorize_connection, invoking_user, read_authorization_file, recheck_connection, trusted_config, wait_for_connection_approval
 from isolate_policy import PolicyDenied
 from isolate_logging import SessionLogger
 from isolate_redis import create_redis_client
@@ -34,6 +34,7 @@ from isolate_session_alerts import dispatch_alert_async, initial_session_alerts,
 from isolate_sessions import get_session, mark_alert_sent, mark_session_end, mark_session_start, touch_session
 from isolate_ssh import SSHArgumentError, build_ssh_argv
 from isolate_managed_shell import ManagedAuditError, audit_mode, run_managed_shell
+from isolate_session_approvals import SessionApprovalDenied, close_session_approval, set_session_approval_notification_status
 
 LOGGER = logging.getLogger('ssh-wrapper')
 LOG_FORMAT = '[%(asctime)s] [%(levelname)6s] %(name)s %(message)s'
@@ -380,6 +381,42 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
     LOGGER.debug(argv)
     metadata = dict(metadata)
     metadata["raw_log_path"] = raw_log_path
+    if authorization is not None and config and config.get("session_approval", {}).get("enabled", False) is True:
+        approval_redis = _redis_client(config)
+        def approval_event(name, record):
+            audit.event(name, session_approval_id=record["id"],
+                        required_approvals=record.get("required_approvals"), **metadata)
+            if name == "session_approval_requested":
+                print("Waiting for administrator approval of session {} (request {}).".format(
+                    metadata.get("connection_id"), record["id"]), file=sys.stderr, flush=True)
+                if config.get("notifications", {}).get("enabled", False):
+                    from isolate_notifications import notify_session_approval_event
+                    try:
+                        delivery = notify_session_approval_event(config, name, record, actor=authorization["identity"])
+                    except Exception as exc:
+                        set_session_approval_notification_status(approval_redis, record["id"], {"ok": False, "errors": [str(exc)], "sent": []})
+                        audit.event("session_approval_notification_failed", session_approval_id=record["id"], **metadata)
+                        raise
+                    status = {"ok": not bool(delivery.get("errors")), **delivery}
+                    set_session_approval_notification_status(approval_redis, record["id"], status)
+                    audit.event("session_approval_notification", session_approval_id=record["id"], ok=status["ok"], **metadata)
+        try:
+            authorization = wait_for_connection_approval(authorization, config, approval_redis,
+                metadata.get("connection_id"), source_ip=metadata.get("source_ip"),
+                on_event=approval_event, refresh_config=trusted_config)
+            if audit_mode(trusted_config()) != audit_mode(config):
+                raise ConnectionDenied("command audit mode changed while awaiting approval")
+            if authorization.get("session_approval_id"):
+                metadata["session_approval_id"] = authorization["session_approval_id"]
+        except Exception as exc:
+            if authorization.get("session_approval_id"):
+                try:
+                    close_session_approval(approval_redis, authorization["session_approval_id"])
+                except Exception:
+                    pass
+            audit.event("session_approval_blocked", reason=str(exc), **metadata)
+            LOGGER.error("Connection denied: {}".format(exc))
+            return 2
     audit.event("ssh_start", argv=argv, **metadata)
     started = time.time()
     redis = None
@@ -413,7 +450,9 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
                     current_config = trusted_config()
                     if audit_mode(current_config) != audit_mode(config):
                         raise ConnectionDenied("command audit mode changed")
-                    recheck_connection(authorization, current_config, redis)
+                    current_authorization = recheck_connection(authorization, current_config, redis)
+                    if isinstance(current_authorization, dict) and current_authorization.get("deadline") is not None:
+                        authorization["deadline"] = min(authorization["deadline"], current_authorization["deadline"])
                 except Exception as exc:
                     try:
                         audit.event("session_authorization_revoked", reason=type(exc).__name__, **metadata)
@@ -466,7 +505,9 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
             os.chmod(raw_log_path, 0o660)
         except PermissionError:
             pass
-        if audit_mode(config) == "managed":
+        if authorization is not None and audit_mode(config) != "managed" and session_control(force=True):
+            exit_code = 143
+        elif audit_mode(config) == "managed":
             try:
                 exit_code = run_managed_shell(argv, raw_log, audit, metadata, config, _run_pipe_command,
                                               before_execute=lambda: session_control(force=True), control=session_control)
@@ -493,6 +534,11 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
             mark_session_end(redis, metadata["connection_id"], exit_code=exit_code)
         except Exception as exc:
             LOGGER.warning("active session registry end failed: {}".format(exc))
+    if authorization is not None and authorization.get("session_approval_id"):
+        try:
+            close_session_approval(redis, authorization["session_approval_id"])
+        except Exception as exc:
+            LOGGER.warning("session approval close failed: {}".format(exc))
     return exit_code
 
 

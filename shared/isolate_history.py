@@ -155,7 +155,7 @@ def _matches(row, query=None, user=None, project=None, host=None, since=None, un
     return True
 
 
-def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None, since=None, until=None, result=None):
+def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None, since=None, until=None, result=None, permission_config=None):
     since = parse_history_time(since)
     until = parse_history_time(until, end_of_day=True)
     if since is not None and until is not None and since > until:
@@ -169,10 +169,12 @@ def read_history(base_path, identity, query=None, user=None, project=None, host=
         raise ValueError("history limit must be between 1 and 10000")
     username = identity.get("username")
     admin = is_history_admin(identity, admin_groups)
-    if user and user != username and not admin:
+    from isolate_permissions import has_permission
+    scoped_audit = permission_config is not None and has_permission(identity, permission_config, "audit.read")
+    if user and user != username and not (admin or scoped_audit):
         raise HistoryAccessDenied("history for other users is visible only to admins")
 
-    scan_users = None if admin else [username]
+    scan_users = None if admin or scoped_audit else [username]
     if user:
         scan_users = [user]
     # Stable OIDC subjects remain owners after a username change. The final
@@ -197,8 +199,12 @@ def read_history(base_path, identity, query=None, user=None, project=None, host=
         events.sort(key=lambda event: float(event.get("ts") or 0))
         row = _row_from_events(events)
         owned = row and (row.get("keycloak_sub") == identity.get("keycloak_sub") if row.get("keycloak_sub") else row.get("username") == username)
-        if row and (admin or owned) and _matches(
-            row, query=query, user=user if admin else None, project=project, host=host, since=since, until=until, result=result
+        visible = row and (admin or (
+            bool(row.get("project")) and has_permission(identity, permission_config, "audit.read", row["project"])
+            if scoped_audit else owned
+        ))
+        if row and visible and _matches(
+            row, query=query, user=user if admin or scoped_audit else None, project=project, host=host, since=since, until=until, result=result
         ):
             rows.append(row)
 

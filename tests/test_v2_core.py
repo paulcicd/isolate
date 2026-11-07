@@ -1816,14 +1816,18 @@ class InventoryTest(unittest.TestCase):
             privileged_hint=None,
             proxy_id=None,
         )
-        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as output:
+        management_config = {"dashboard": {"admin_groups": ["Test-Admins"]}}
+        management_identity = {"username": "admin", "groups": ["Test-Admins"]}
+        with mock.patch.object(isolate, "_management_context", return_value=(management_config, management_identity)), \
+                mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()) as output:
             code = isolate.cmd_host_update(args, {})
 
         self.assertIsNone(code)
         self.assertEqual(json.loads(output.getvalue())["server_services"], "nginx, kafka")
 
         args.ip = "not-an-ip"
-        with mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
+        with mock.patch.object(isolate, "_management_context", return_value=(management_config, management_identity)), \
+                mock.patch.object(isolate, "redis_client", return_value=redis), redirect_stdout(StringIO()), redirect_stderr(StringIO()):
             code = isolate.cmd_host_update(args, {})
         self.assertEqual(code, 2)
 
@@ -3488,9 +3492,9 @@ class AccessNotificationCliTest(unittest.TestCase):
         approver = {"username": "admin", "groups": ["DevOps"]}
         first = create_access_request(redis, requester, project="prod", reason="INC-1")
         second = create_access_request(redis, requester, project="prod", reason="INC-2")
-        config = {"access": {"default_ttl": "2h", "max_ttl": "24h"}, "notifications": {"enabled": False}}
+        config = {"access": {"default_ttl": "2h", "max_ttl": "24h"}, "notifications": {"enabled": False}, "dashboard": {"admin_groups": ["DevOps"]}}
 
-        with mock.patch.object(isolate, "_require_access_admin", return_value=approver), \
+        with mock.patch.object(isolate, "_management_context", return_value=(config, approver)), \
                 mock.patch.object(isolate, "redis_client", return_value=redis), \
                 mock.patch.object(isolate, "notify_access_event", return_value={"sent": [], "errors": []}) as notifier, \
                 redirect_stdout(StringIO()):

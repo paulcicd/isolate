@@ -173,6 +173,9 @@ def authorize_connection(args, token, config, redis, username, now=None):
         if not proxy_host:
             raise ConnectionDenied("proxy host is missing")
         proxy_decision = policy_for_host(redis, config, identity, proxy_host)
+        from isolate_session_approvals import session_approval_required
+        if session_approval_required(config, proxy_host, proxy_decision):
+            raise ConnectionDenied("proxy requires session approval; separate proxy approval is not supported")
         proxy = {"host": str(ipaddress.ip_address(proxy_host["server_ip"])), "port": int(proxy_host.get("server_port") or 22), "user": proxy_decision["remote_user"]}
         if ports and proxy["port"] not in ports:
             raise ConnectionDenied("proxy port is not permitted")
@@ -195,4 +198,74 @@ def recheck_connection(context, config, redis):
     current = authorize_connection(context["args"], context["token"], config, redis, context["username"])
     if current["proxy"] != context["proxy"]:
         raise ConnectionDenied("proxy authorization changed")
+    from isolate_session_approvals import SessionApprovalDenied, session_approval_required, validate_session_approval
+    approval_id = context.get("session_approval_id")
+    if approval_id:
+        try:
+            approval = validate_session_approval(redis, config, approval_id, current["identity"], current["host"],
+                current["decision"], context["connection_id"], source_ip=context.get("source_ip"))
+        except SessionApprovalDenied as exc:
+            raise ConnectionDenied(str(exc)) from exc
+        current["deadline"] = min(current["deadline"], int(approval["session_expires_at"]))
+        if time.time() >= current["deadline"]:
+            raise ConnectionDenied("session approval expired")
+    elif session_approval_required(config, current["host"], current["decision"]):
+        raise ConnectionDenied("this session now requires administrator approval")
     return current
+
+
+def wait_for_connection_approval(context, config, redis, connection_id, source_ip=None, on_event=None,
+                                 refresh_config=None, sleeper=None):
+    """Wait before starting SSH, then atomically consume one connection's approval.
+
+    Identity and current policy are re-evaluated while waiting. A pending request
+    never acts as a grant, and a consumed record cannot start another connection.
+    """
+    from isolate_session_approvals import (
+        SessionApprovalDenied, cancel_session_approval, close_session_approval, consume_session_approval,
+        get_session_approval, request_session_approval,
+    )
+    if context.get("session_approval_id"):
+        raise ConnectionDenied("session approval has already been consumed")
+    record = request_session_approval(redis, config, context["identity"], context["host"], context["decision"],
+                                      connection_id, source_ip=source_ip)
+    if record is None:
+        return context
+    request_id = record["id"]
+    sleep = sleeper or time.sleep
+    consumed = False
+    try:
+        if on_event:
+            on_event("session_approval_requested", record)
+        while True:
+            current_config = refresh_config() if refresh_config else config
+            current = authorize_connection(context["args"], context["token"], current_config, redis, context["username"])
+            if current["proxy"] != context["proxy"]:
+                raise ConnectionDenied("proxy authorization changed while awaiting approval")
+            latest = get_session_approval(redis, request_id, config=current_config)
+            if latest is None:
+                raise ConnectionDenied("session approval request disappeared")
+            if latest["status"] == "approved":
+                approved = consume_session_approval(redis, current_config, request_id, current["identity"], current["host"],
+                    current["decision"], connection_id, source_ip=source_ip)
+                consumed = True
+                current.update(session_approval_id=request_id, connection_id=connection_id, source_ip=source_ip)
+                current["deadline"] = min(context["deadline"], current["deadline"], approved["session_expires_at"])
+                if on_event:
+                    on_event("session_approval_consumed", approved)
+                return current
+            if latest["status"] != "pending":
+                raise ConnectionDenied("session approval is {}".format(latest["status"]))
+            if time.time() >= min(context["deadline"], current["deadline"]):
+                raise ConnectionDenied("connection authorization expired while awaiting approval")
+            interval = max(1, min(30, int(current_config.get("session_approval", {}).get("poll_interval_seconds", 2))))
+            sleep(min(interval, max(0, latest["request_expires_at"] - time.time())))
+    except BaseException:
+        try:
+            if consumed:
+                close_session_approval(redis, request_id)
+            else:
+                cancel_session_approval(redis, config, request_id, context["identity"])
+        except Exception:
+            pass
+        raise

@@ -208,6 +208,29 @@ def notify_access_event(config, event_name, request_record, actor=None, extra=No
     return {"sent": results, "errors": errors}
 
 
+def notify_session_approval_event(config, event_name, record, actor=None):
+    """Use configured delivery sinks for per-connection approval changes."""
+    subject = "Session approval: {}".format(event_name.removeprefix("session_approval_"))
+    url = (config.get("dashboard", {}).get("public_url") or "").rstrip("/") + "/session-approvals"
+    lines = [subject, "user: {}".format(record.get("requester") or ""),
+             "project: {}".format(record.get("project") or ""), "host: {}".format(record.get("host_id") or ""),
+             "remote_user: {}".format(record.get("remote_user") or ""), "status: {}".format(record.get("status") or ""),
+             "approvals: {}/{}".format(len(record.get("approvals") or []), record.get("required_approvals") or 1),
+             "request: {}".format(record.get("id") or ""), "review: " + url]
+    notification = {"subject": subject, "text": "\n".join(lines),
+                    "payload": {"event": event_name, "request": record, "actor": _actor_name(actor), "url": url}}
+    sent, errors = [], []
+    for sink in _enabled_sinks(config):
+        try:
+            sent.append(_send_sink(config, sink, notification))
+        except Exception as exc:
+            message = "{} sink failed: {}".format(sink.get("type") or "unknown", exc)
+            errors.append(message)
+            if config.get("notifications", {}).get("fail_closed", False):
+                raise NotificationError(message) from exc
+    return {"sent": sent, "errors": errors}
+
+
 def notify_session_alert(config, alert_name, session_record, extra=None):
     notification = build_session_notification(config, alert_name, session_record, extra=extra)
     results = []

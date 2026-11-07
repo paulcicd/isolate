@@ -129,7 +129,25 @@ def validate_command(command, config):
     return command
 
 
+def _reject_gated_job(redis, config, host, decision):
+    """Unattended execution must not bypass a human per-connection gate."""
+    from isolate_session_approvals import SessionApprovalDenied, session_approval_required
+    try:
+        required = session_approval_required(config, host, decision)
+        if host.get("proxy_id"):
+            proxy_host = get_host(redis, host["proxy_id"])
+            if proxy_host is None:
+                raise JobError("proxy host no longer exists")
+            required = required or session_approval_required(config, proxy_host, {
+                "remote_user": proxy_host.get("server_user"), "sudo_mode": "none"})
+    except SessionApprovalDenied as exc:
+        raise JobError(str(exc)) from exc
+    if required:
+        raise JobError("target requires human session approval; unattended jobs are not permitted")
+
+
 def create_command_job(redis, config, identity, host, decision, command, timeout=None):
+    _reject_gated_job(redis, config, host, decision)
     execution = config.get("command_execution", {}) or {}
     command = validate_command(command, config)
     timeout = int(timeout or execution.get("default_timeout", 60))
@@ -171,6 +189,7 @@ def create_command_job(redis, config, identity, host, decision, command, timeout
 
 
 def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None):
+    _reject_gated_job(redis, config, host, decision)
     execution = config.get("command_execution", {}) or {}
     runbook = rendered["runbook"]
     timeout = int(timeout or runbook.get("default_timeout") or execution.get("default_timeout", 60))
@@ -263,6 +282,7 @@ def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, para
             raise JobError("host {} is not allowed: {}".format(host_id, exc)) from exc
         if decision.get("sudo_mode") == "sudo-i" and not class_config.get("allow_sudo", False):
             raise JobError("sudo execution is disabled for this runbook class")
+        _reject_gated_job(redis, config, host, decision)
         planned.append((host, decision))
     return rendered, planned, timeout
 
@@ -553,6 +573,10 @@ def execute_job(redis, config, record):
         return _fail_job(redis, config, current, "command remote identity changed after the job was queued")
     if decision.get("sudo_mode") == "sudo-i" and not authorization_config.get("allow_sudo", False):
         return _fail_job(redis, config, current, "sudo execution is disabled for this job class")
+    try:
+        _reject_gated_job(redis, config, host, decision)
+    except JobError as exc:
+        return _fail_job(redis, config, current, exc)
     proxy = None
     if host.get("proxy_id"):
         proxy_host = get_host(redis, host["proxy_id"])

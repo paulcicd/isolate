@@ -37,6 +37,11 @@ dashboard:
   self_service_enabled: true
   # Empty means every verified identity; otherwise require an exact OIDC group.
   self_service_groups: []
+  # Management roles use verified OIDC groups and never grant SSH access.
+  role_bindings: []
+  # - group: Payments-Approvers
+  #   role: approver
+  #   projects: [payments-prod]
   require_mutation_confirmation: true
   jobs_max_results: 250
   default_locale: en
@@ -64,6 +69,19 @@ access_packages:
   enabled: true
   max_rules: 50
   max_assignments_per_operation: 100
+
+# Per-connection approval is enforced at the trusted SSH wrapper before launch.
+session_approval:
+  enabled: false
+  required_projects: []
+  required_project_globs: []
+  require_privileged: false
+  minimum_approvals: 1
+  privileged_minimum_approvals: 2
+  request_timeout_seconds: 300
+  approval_ttl_seconds: 300
+  max_session_seconds: 3600
+  poll_interval_seconds: 2
 
 command_audit:
   enabled: false
@@ -236,6 +254,7 @@ backup:
     - policy_*
     - project_set_*
     - access_request_*
+    - session_approval_*
     - active_session_*
     - job_*
     - dashboard_alert_state_*

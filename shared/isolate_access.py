@@ -233,12 +233,23 @@ def list_access_requests(redis, status=None, user=None, project=None, ticket=Non
     return sorted(records, key=lambda item: int(item.get("id", 0)), reverse=True)
 
 
-def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user=None, sudo_mode=None, max_ttl=None, comment=None, starts_at=None):
+def _require_decision_permission(record, actor, config):
+    if config is None:
+        return
+    from isolate_permissions import has_permission
+    if (is_access_admin(actor, config.get("access", {}).get("admin_groups") or [])
+            or (record.get("project") and has_permission(actor, config, "access.approve", record["project"]))):
+        return
+    raise AccessDenied("access decision is outside the authorized project scope")
+
+
+def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user=None, sudo_mode=None, max_ttl=None, comment=None, starts_at=None, config=None):
     ttl_seconds = int(ttl_seconds)
     if ttl_seconds <= 0:
         raise AccessDenied("ttl must be positive")
 
     def approve(record, reader):
+        _require_decision_permission(record, approver, config)
         if record.get("status") != "pending":
             raise AccessDenied("request is already {}".format(record.get("status")))
         now = now_ts()
@@ -283,8 +294,9 @@ def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user
     return _mutate_request(redis, request_id, approve) or (None, None)
 
 
-def deny_access_request(redis, request_id, approver, reason=None, comment=None):
+def deny_access_request(redis, request_id, approver, reason=None, comment=None, config=None):
     def deny(record, reader):
+        _require_decision_permission(record, approver, config)
         if record.get("status") != "pending":
             raise AccessDenied("request is already {}".format(record.get("status")))
         record.update({"status": "denied", "decided_by": approver.get("username"),
@@ -341,11 +353,12 @@ def cancel_access_request(redis, request_id, identity):
     return _mutate_request(redis, request_id, cancel)
 
 
-def revoke_access_request(redis, request_id, identity, admin_groups=None, reason=None):
-    if not is_access_admin(identity, admin_groups):
+def revoke_access_request(redis, request_id, identity, admin_groups=None, reason=None, config=None):
+    if config is None and not is_access_admin(identity, admin_groups):
         raise AccessDenied("revoking access requires an access administrator")
 
     def revoke(record, reader):
+        _require_decision_permission(record, identity, config)
         if record.get("status") != "approved":
             raise AccessDenied("only an approved request can be revoked")
         changes = []

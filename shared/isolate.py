@@ -5,6 +5,7 @@
 import argparse
 import datetime
 import getpass
+import functools
 import json
 import os
 import sys
@@ -21,6 +22,7 @@ from isolate_access import (
     deny_access_request,
     get_access_request,
     is_access_admin,
+    owns_access_request,
     list_access_requests,
     parse_duration,
     parse_access_time,
@@ -69,6 +71,11 @@ from isolate_packages import (
     update_package,
 )
 from isolate_policy import PolicyDenied, resolve_grant, resolve_policy
+from isolate_permissions import authorize_inventory_change, filter_projects, has_permission, is_platform_admin
+from isolate_session_approvals import (
+    SessionApprovalDenied, decide_session_approval, get_session_approval,
+    list_session_approvals, revoke_session_approval,
+)
 from isolate_health import run_health_checks, validate_config
 from isolate_policy_bundle import (
     PolicyBundleError,
@@ -561,9 +568,78 @@ def authorize_cli_command(args, config):
                         cmd_access_list, cmd_access_show, cmd_access_comment, cmd_access_repeat,
                         cmd_access_cancel, cmd_access_renew, cmd_job_list, cmd_job_show,
                         cmd_job_output, cmd_job_cancel, cmd_job_retry, cmd_runbook,
+                        cmd_host_list, cmd_host_show, cmd_host_update, cmd_host_maintenance,
+                        cmd_host_check, cmd_host_services_history, cmd_export,
+                        cmd_session_search,
+                        cmd_access_approve, cmd_access_deny, cmd_access_revoke,
+                        cmd_session_approval,
                         cmd_user_activity, cmd_command_log_append}
     if args.func not in public_functions:
         _require_platform_admin(config)
+
+
+def _management_context(config):
+    """Use trusted configuration and a Unix-bound identity for delegated work."""
+    if os.name == "posix" and os.geteuid() == 0:
+        return config, {"username": "root", "groups": ["isolate:local-root"], "_local_root": True}
+    return _job_context()
+
+
+def _management_admin(identity, config):
+    return bool(identity.get("_local_root")) or is_platform_admin(identity, config)
+
+
+def _management_allowed(identity, config, permission, project=None):
+    if _management_admin(identity, config):
+        return True
+    if permission.startswith("access.") and is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        return True
+    return has_permission(identity, config, permission, project)
+
+
+def _require_management_permission(identity, config, permission, project=None):
+    if not _management_allowed(identity, config, permission, project):
+        raise AccessDenied("{} is not allowed for project '{}'".format(permission, project or "<none>"))
+
+
+def _management_rows(rows, identity, config, permission, project_field="project"):
+    if _management_admin(identity, config):
+        return list(rows)
+    if permission.startswith("access.") and is_access_admin(identity, config.get("access", {}).get("admin_groups") or []):
+        return list(rows)
+    return filter_projects(rows, identity, config, permission, project_field)
+
+
+def _management_host(redis, server_id, identity, config, permission):
+    host = get_host(redis, server_id)
+    if host is None or not host.get("project_name"):
+        raise AccessDenied("host was not found or is not visible")
+    _require_management_permission(identity, config, permission, host["project_name"])
+    return host
+
+
+def _managed_cli(permission=None):
+    def decorate(handler):
+        @functools.wraps(handler)
+        def wrapped(args, config):
+            try:
+                config, identity = _management_context(config)
+                if permission:
+                    _require_management_permission(identity, config, permission)
+                args._management_identity = identity
+                return handler(args, config)
+            except (AccessDenied, IdentityError, HostValidationError, ValueError) as exc:
+                print("{} denied: {}".format(handler.__name__.removeprefix("cmd_").replace("_", " "), exc), file=sys.stderr)
+                return 2
+        return wrapped
+    return decorate
+
+
+def _authorize_host_update(identity, config):
+    def authorize(current, proposed):
+        if not identity.get("_local_root"):
+            authorize_inventory_change(identity, config, current, proposed)
+    return authorize
 
 
 def _load_package_file(path):
@@ -835,6 +911,7 @@ def cmd_policy_test(args, config):
     return 0
 
 
+@_managed_cli("audit.read")
 def cmd_session_search(args, config):
     base = config["logging"]["base_path"]
     for root, _, files in os.walk(base):
@@ -844,6 +921,9 @@ def cmd_session_search(args, config):
         with open(path, "r", encoding="utf-8") as session_f:
             for line in session_f:
                 record = json.loads(line)
+                if not _management_admin(args._management_identity, config) and (not record.get("project") or not
+                    has_permission(args._management_identity, config, "audit.read", record["project"])):
+                    continue
                 if args.user and record.get("username") != args.user:
                     continue
                 if args.project and record.get("project") != args.project:
@@ -873,6 +953,58 @@ def cmd_session_terminate(args, config):
         print("session terminate failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(record, indent=2, sort_keys=True))
+
+
+def cmd_session_approval(args, config):
+    """Inspect or decide connection-specific requests as a verified human."""
+    try:
+        config, identity = _job_context()
+        if not identity.get("keycloak_sub"):
+            raise SessionApprovalDenied("a stable verified subject is required")
+        redis = redis_client(config)
+        action = args.approval_command
+
+        def visible(record):
+            project = record.get("project")
+            return (record.get("requester_sub") == identity["keycloak_sub"]
+                    or bool(project and (has_permission(identity, config, "sessions.read", project)
+                                         or has_permission(identity, config, "sessions.approve", project))))
+
+        if action == "list":
+            rows = [row for row in list_session_approvals(redis, status=args.status, project=args.project) if visible(row)]
+            if args.json:
+                print(json.dumps(rows, indent=2, sort_keys=True))
+            else:
+                print("id                                status    project            host    user             approvals")
+                for row in rows:
+                    print("{:<33} {:<9} {:<18} {:<7} {:<16} {}/{}".format(row["id"], row["status"], row.get("project") or "",
+                        row.get("host_id") or "", row.get("requester") or "", len(row.get("approvals") or []), row.get("required_approvals") or 1))
+            return 0
+        record = get_session_approval(redis, args.id)
+        if record is None or not visible(record):
+            raise SessionApprovalDenied("session approval was not found or is not visible")
+        if action == "show":
+            print(json.dumps(record, indent=2, sort_keys=True))
+            return 0
+        if not args.yes:
+            raise SessionApprovalDenied("explicit --yes is required for a session decision")
+        project = record.get("project")
+        if not project or not has_permission(identity, config, "sessions.approve", project):
+            raise SessionApprovalDenied("session decision is outside the authorized project scope")
+        if action == "revoke":
+            record = revoke_session_approval(redis, config, args.id, identity, reason=args.reason)
+        else:
+            record = decide_session_approval(redis, config, args.id, identity, approve=action == "approve", reason=args.reason)
+        if record is None:
+            raise SessionApprovalDenied("session approval was not found")
+        prepare_and_dispatch({"event": "session_approval_" + action, "source": "isolate-cli", "ts": time.time(),
+            "username": identity.get("username"), "keycloak_sub": identity["keycloak_sub"],
+            "session_approval_id": args.id, "project": project, "host_id": record.get("host_id"),
+            "outcome": record.get("status")}, config.get("logging", {}))
+        print(json.dumps(record, indent=2, sort_keys=True))
+    except (AccessDenied, IdentityError, SessionApprovalDenied, AuditSinkError, ValueError) as exc:
+        print("session approval failed: {}".format(exc), file=sys.stderr)
+        return 2
 
 
 def cmd_whoami(args, config):
@@ -1189,10 +1321,12 @@ def _str2bool(value):
     raise argparse.ArgumentTypeError("expected true or false")
 
 
+@_managed_cli("inventory.read")
 def cmd_host_list(args, config):
     try:
         rows = list_hosts(redis_client(config), project=args.project, query=args.query,
                           tags=normalize_tags(getattr(args, "tag", None)))
+        rows = _management_rows(rows, args._management_identity, config, "inventory.read", "project_name")
     except HostValidationError as exc:
         print("host list failed: {}".format(exc), file=sys.stderr)
         return 2
@@ -1202,16 +1336,19 @@ def cmd_host_list(args, config):
         print(format_hosts_table(rows))
 
 
+@_managed_cli("inventory.read")
 def cmd_host_show(args, config):
-    host = get_host(redis_client(config), args.server_id)
+    host = _management_host(redis_client(config), args.server_id, args._management_identity, config, "inventory.read")
     if host is None:
         print("Host not found: {}".format(args.server_id), file=sys.stderr)
         return 2
     print(json.dumps(host, indent=2, sort_keys=True))
 
 
+@_managed_cli("inventory.write")
 def cmd_host_update(args, config):
     redis = redis_client(config)
+    previous = _management_host(redis, args.server_id, args._management_identity, config, "inventory.write")
     updates = {
         "project_name": args.project,
         "server_name": args.name,
@@ -1222,6 +1359,8 @@ def cmd_host_update(args, config):
         "server_vip": args.vip,
         "server_services": args.services,
         "server_note": args.note,
+        "resource_owner": getattr(args, "owner", None),
+        "environment": getattr(args, "environment", None),
         "privileged_access_provider": args.privileged_provider,
         "privileged_access_url": args.privileged_url,
         "privileged_access_hint": args.privileged_hint,
@@ -1232,13 +1371,13 @@ def cmd_host_update(args, config):
     }
     try:
         if getattr(args, "tag", None) or getattr(args, "remove_tag", None) or getattr(args, "clear_tags", False):
-            previous = get_host(redis, args.server_id) or {}
             tags = {} if getattr(args, "clear_tags", False) else normalize_tags(previous.get("tags"))
             tags.update(normalize_tags(getattr(args, "tag", None)))
             for key in getattr(args, "remove_tag", None) or []:
                 tags.pop(key, None)
             updates["tags"] = tags
-        host = update_host(redis, args.server_id, updates, updated_by=os.getenv("USER") or os.getenv("USERNAME"))
+        host = update_host(redis, args.server_id, updates, updated_by=args._management_identity.get("username"),
+                           authorize=_authorize_host_update(args._management_identity, config), expected_revision=previous.get("_revision"))
     except (HostValidationError, ValueError) as exc:
         print("host update failed: {}".format(exc), file=sys.stderr)
         return 2
@@ -1248,9 +1387,10 @@ def cmd_host_update(args, config):
     print(json.dumps(host, indent=2, sort_keys=True))
 
 
+@_managed_cli("inventory.read")
 def cmd_host_services_history(args, config):
     redis = redis_client(config)
-    if get_host(redis, args.server_id) is None:
+    if _management_host(redis, args.server_id, args._management_identity, config, "inventory.read") is None:
         print("Host not found: {}".format(args.server_id), file=sys.stderr)
         return 2
     rows = get_discovery_history(redis, args.server_id, limit=min(max(args.limit, 1), 1000))
@@ -1265,9 +1405,10 @@ def cmd_host_services_history(args, config):
             print("No service changes recorded")
 
 
+@_managed_cli("inventory.write")
 def cmd_host_maintenance(args, config):
     redis = redis_client(config)
-    host = get_host(redis, args.server_id)
+    host = _management_host(redis, args.server_id, args._management_identity, config, "inventory.write")
     if host is None:
         print("Host not found: {}".format(args.server_id), file=sys.stderr)
         return 2
@@ -1284,13 +1425,15 @@ def cmd_host_maintenance(args, config):
             return 2
         updates = {"maintenance_enabled": True, "maintenance_until": until, "maintenance_reason": args.reason}
     try:
-        result = update_host(redis, args.server_id, updates, updated_by=_effective_username())
+        result = update_host(redis, args.server_id, updates, updated_by=args._management_identity.get("username"),
+                             authorize=_authorize_host_update(args._management_identity, config), expected_revision=host.get("_revision"))
     except (HostValidationError, ValueError) as exc:
         print("host maintenance failed: {}".format(exc), file=sys.stderr)
         return 2
     print(json.dumps(result, indent=2, sort_keys=True))
 
 
+@_managed_cli("inventory.write")
 def cmd_host_check(args, config):
     redis = redis_client(config)
     if not args.server_id and not args.project:
@@ -1301,6 +1444,10 @@ def cmd_host_check(args, config):
         return 2
     rows = [get_host(redis, args.server_id)] if args.server_id else list_hosts(redis, project=args.project)
     rows = [row for row in rows if row is not None]
+    for row in rows:
+        _require_management_permission(args._management_identity, config, "inventory.write", row.get("project_name") or "")
+    if args.ssh and not _management_admin(args._management_identity, config):
+        raise AccessDenied("SSH authentication probes require a platform administrator")
     if not rows:
         print("No hosts found", file=sys.stderr)
         return 2
@@ -1374,19 +1521,24 @@ def cmd_announcement_remove(args, config):
 
 
 def _export_rows(kind, args, config):
+    identity = args._management_identity
     redis = redis_client(config)
     if kind == "inventory":
-        return list_hosts(redis, project=args.project, query=args.query, tags=normalize_tags(getattr(args, "tag", None)))
+        _require_management_permission(identity, config, "inventory.read")
+        return _management_rows(list_hosts(redis, project=args.project, query=args.query, tags=normalize_tags(getattr(args, "tag", None))),
+                                identity, config, "inventory.read", "project_name")
+    if kind not in ("inventory", "history") and not _management_admin(identity, config):
+        raise AccessDenied("this export requires a platform administrator")
     if kind == "grants":
         return list_grant_records(redis, project=args.project)
     if kind == "users":
         return list_user_profiles(config["logging"]["base_path"])
     if kind == "history":
-        identity = load_verified_identity(config)
         return read_history(
             config["logging"]["base_path"], identity, query=args.query, user=args.user, project=args.project,
             host=args.host, limit=min(args.limit, int(config.get("history", {}).get("max_limit", 100))),
-            admin_groups=config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            admin_groups=identity.get("groups") if identity.get("_local_root") else config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            permission_config=None if identity.get("_local_root") else config,
             since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
         )
     if kind == "access-matrix":
@@ -1395,6 +1547,7 @@ def _export_rows(kind, args, config):
     raise ExportError("unknown export kind: {}".format(kind))
 
 
+@_managed_cli()
 def cmd_export(args, config):
     try:
         rows = _export_rows(args.kind, args, config)
@@ -1507,12 +1660,9 @@ def cmd_grant_explain(args, config):
         return 2
 
 
+@_managed_cli()
 def cmd_history(args, config):
-    try:
-        identity = load_verified_identity(config)
-    except IdentityError as exc:
-        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
-        return 2
+    identity = args._management_identity
 
     history_cfg = config.get("history", {})
     default_limit = int(history_cfg.get("default_limit", 10))
@@ -1527,7 +1677,8 @@ def cmd_history(args, config):
             project=args.project,
             host=args.host,
             limit=limit,
-            admin_groups=history_cfg.get("admin_groups") or [],
+            admin_groups=identity.get("groups") if identity.get("_local_root") else history_cfg.get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
+            permission_config=None if identity.get("_local_root") else config,
             since=getattr(args, "since", None), until=getattr(args, "until", None), result=getattr(args, "result", None),
         )
     except (HistoryAccessDenied, ValueError) as exc:
@@ -1579,47 +1730,41 @@ def cmd_access_request(args, config):
     print(json.dumps(record, indent=2, sort_keys=True))
 
 
+@_managed_cli()
 def cmd_access_list(args, config):
     redis = redis_client(config)
-    try:
-        identity = _load_cli_identity()
-    except IdentityError as exc:
-        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
-        return 2
-    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
-    if args.user and args.user != identity.get("username") and not admin:
-        print("access list denied: other users are visible only to admins", file=sys.stderr)
-        return 2
-    user = args.user if admin else identity.get("username")
-    records = list_access_requests(redis, status=args.status, user=user, project=args.project, ticket=args.ticket)
+    identity = args._management_identity
+    records = list_access_requests(redis, status=args.status, user=args.user, project=args.project, ticket=args.ticket)
+    records = [record for record in records if owns_access_request(record, identity)
+               or (record.get("project") and _management_allowed(identity, config, "access.read", record["project"]))]
     if args.json:
         print(json.dumps(records, indent=2, sort_keys=True))
     else:
         print(format_access_table(records))
 
 
+@_managed_cli()
 def cmd_access_show(args, config):
     redis = redis_client(config)
     record = get_access_request(redis, args.id)
     if record is None:
         print("Access request not found: {}".format(args.id), file=sys.stderr)
         return 2
-    try:
-        identity = _load_cli_identity()
-    except IdentityError as exc:
-        print("isolate identity unavailable: {}; run isolate login".format(exc), file=sys.stderr)
-        return 2
-    admin = is_access_admin(identity, config.get("access", {}).get("admin_groups") or [])
-    if record.get("requester") != identity.get("username") and not admin:
-        print("access show denied: other users are visible only to admins", file=sys.stderr)
-        return 2
+    identity = args._management_identity
+    if not owns_access_request(record, identity):
+        _require_management_permission(identity, config, "access.read", record.get("project") or "")
     print(json.dumps(record, indent=2, sort_keys=True))
 
 
+@_managed_cli("access.approve")
 def cmd_access_approve(args, config):
     redis = redis_client(config)
     try:
-        approver = _require_access_admin(config)
+        approver = args._management_identity
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(approver, config, "access.approve", current.get("project") or "")
         access_cfg = config.get("access", {})
         ttl = parse_duration(args.ttl, default=access_cfg.get("default_ttl", "2h"))
         max_ttl = parse_duration(access_cfg.get("max_ttl", "24h"))
@@ -1633,6 +1778,7 @@ def cmd_access_approve(args, config):
             max_ttl=max_ttl,
             comment=args.comment,
             starts_at=parse_access_time(getattr(args, "starts_at", None)),
+            config=None if approver.get("_local_root") else config,
         )
     except (AccessDenied, IdentityError, ValueError) as exc:
         print("access approve failed: {}".format(exc), file=sys.stderr)
@@ -1652,11 +1798,17 @@ def cmd_access_approve(args, config):
     print(json.dumps({"request": record, "grant": grant}, indent=2, sort_keys=True))
 
 
+@_managed_cli("access.approve")
 def cmd_access_deny(args, config):
     redis = redis_client(config)
     try:
-        approver = _require_access_admin(config)
-        record = deny_access_request(redis, args.id, approver, reason=args.reason, comment=args.comment)
+        approver = args._management_identity
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(approver, config, "access.approve", current.get("project") or "")
+        record = deny_access_request(redis, args.id, approver, reason=args.reason, comment=args.comment,
+                                     config=None if approver.get("_local_root") else config)
     except (AccessDenied, IdentityError) as exc:
         print("access deny failed: {}".format(exc), file=sys.stderr)
         return 2
@@ -1754,14 +1906,20 @@ def cmd_access_cancel(args, config):
         return 2
 
 
+@_managed_cli("access.approve")
 def cmd_access_revoke(args, config):
     try:
-        identity = _require_access_admin(config)
+        identity = args._management_identity
         if not args.yes:
             raise AccessDenied("explicit --yes is required to revoke access")
         redis = redis_client(config)
+        current = get_access_request(redis, args.id)
+        if current is None:
+            raise AccessDenied("access request was not found")
+        _require_management_permission(identity, config, "access.approve", current.get("project") or "")
         record = revoke_access_request(redis, args.id, identity,
-                                       admin_groups=config.get("access", {}).get("admin_groups") or [], reason=args.reason)
+                                       admin_groups=identity.get("groups") if identity.get("_local_root") else config.get("access", {}).get("admin_groups") or [], reason=args.reason,
+                                       config=None if identity.get("_local_root") else config)
         _finish_access_change(redis, config, identity, record, "access_request_revoked")
     except (IdentityError, AccessDenied, ValueError, AuditSinkError) as exc:
         print("access revoke failed: {}".format(exc), file=sys.stderr)
@@ -1829,9 +1987,9 @@ def _job_context():
     from isolate_identity import _load_token_cache
 
     try:
-        config = trusted_config()
         if os.name != "posix":
-            raise ConnectionDenied("job and runbook operations require a Linux bastion")
+            raise ConnectionDenied("operational CLI commands require a Linux bastion")
+        config = trusted_config()
         import pwd
 
         username = pwd.getpwuid(os.getuid()).pw_name
@@ -2356,6 +2514,8 @@ def build_parser():
     host_update.add_argument("--vip", type=_str2bool)
     host_update.add_argument("--services")
     host_update.add_argument("--note")
+    host_update.add_argument("--owner", help="resource owner shown in the catalogue")
+    host_update.add_argument("--environment", help="environment shown in the catalogue")
     host_update.add_argument("--tag", action="append", help="set a key=value tag while preserving other tags")
     host_update.add_argument("--remove-tag", action="append", help="remove a tag by key")
     host_update.add_argument("--clear-tags", action="store_true")
@@ -2441,6 +2601,21 @@ def build_parser():
     session_terminate.add_argument("--reason")
     session_terminate.add_argument("--yes", action="store_true")
     session_terminate.set_defaults(func=cmd_session_terminate)
+
+    approval = session_sub.add_parser("approval")
+    approval_sub = approval.add_subparsers(dest="approval_command", required=True)
+    approval_list = approval_sub.add_parser("list")
+    approval_list.add_argument("--status", choices=["pending", "approved", "active", "denied", "revoked", "cancelled", "expired", "closed"])
+    approval_list.add_argument("--project")
+    approval_list.add_argument("--json", action="store_true")
+    approval_list.set_defaults(func=cmd_session_approval)
+    for name in ("show", "approve", "deny", "revoke"):
+        command = approval_sub.add_parser(name)
+        command.add_argument("id")
+        if name != "show":
+            command.add_argument("--reason")
+            command.add_argument("--yes", action="store_true")
+        command.set_defaults(func=cmd_session_approval)
 
     history = sub.add_parser("history")
     history.add_argument("query", nargs="?")

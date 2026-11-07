@@ -32,6 +32,9 @@ All examples in this document use fictional users, groups, domains, projects, an
 - Active session registry.
 - JSONL audit logs and legacy raw SSH transcripts.
 - Lightweight Flask admin dashboard.
+- Resource catalogue with owners, environments, effective access windows, and connection instructions.
+- Project-scoped management roles for approvals, inventory operations, and audit.
+- Optional single-use approvals of individual SSH connections, including two-person privileged approval.
 - User web workspace for allowed hosts, personal sessions, history, and access requests.
 - Structured host tags, CLI runbook fleets, scheduled access windows, and service change history.
 - Safer SSH argv construction through `subprocess` arguments.
@@ -763,6 +766,16 @@ isolate host update 10004 \
 ```
 
 `isolate host update` preserves all fields that were not passed and updates `updated_by` / `updated_at`.
+
+Resource metadata can be managed separately from SSH routing and credentials:
+
+```bash
+isolate host update 10004 --owner "Payments Operations" --environment production
+```
+
+These fields are stored as `resource_owner` (up to 128 printable characters) and
+`environment` (up to 64). Empty fields fall back to the host's `owner` and `env`
+tags for catalogue display. They are searchable and included in inventory exports.
 
 ### Structured Host Tags
 
@@ -1708,6 +1721,67 @@ isolate session terminate 22222222-2222-2222-2222-222222222222 \
 
 The command sets an authenticated Redis control flag. The auth-owned wrapper records `session_termination_received`, sends `SIGTERM` to the SSH process group, escalates to `SIGKILL` only if needed, restores the local TTY, and writes `ssh_end` with exit code `143`. If Redis is temporarily unavailable, an existing SSH session continues; control-plane failure does not break the data path.
 
+### Approval Of Individual SSH Sessions
+
+Session approvals add a decision for one connection after the normal SSH grant
+check succeeds. They do not create grants, extend a grant's lifetime, or replace
+the existing access-request workflow. The SSH wrapper waits before opening the
+outbound connection and prints the approval request ID for the operator.
+
+The feature is disabled by default. Enable it for exact projects, project globs,
+and/or privileged sessions:
+
+```yaml
+session_approval:
+  enabled: true
+  required_projects: [payments-prod]
+  required_project_globs: ["*-critical"]
+  require_privileged: true
+  minimum_approvals: 1
+  privileged_minimum_approvals: 2
+  request_timeout_seconds: 300
+  approval_ttl_seconds: 300
+  max_session_seconds: 3600
+  poll_interval_seconds: 2
+```
+
+`require_privileged` covers remote `root` and `sudo-i`. For a connection requiring
+approval, the effective privileged quorum is at least
+`privileged_minimum_approvals`. Each approving person is identified by their
+verified Keycloak subject; self-approval and a second vote by the same person are
+rejected. A scoped `approver` or `project-owner` needs permission for that exact
+project. Global administrators still cannot approve their own connection.
+
+Approvers use `/session-approvals`; the requester follows their own pending and
+active decisions at `/me/session-approvals`. The equivalent CLI is:
+
+```bash
+isolate session approval list --status pending --project payments-prod --json
+isolate session approval show <request-uuid>
+isolate session approval approve <request-uuid> --reason "INC-1001 verified" --yes
+isolate session approval deny <request-uuid> --reason "Use staging first" --yes
+isolate session approval revoke <request-uuid> --reason "Incident resolved" --yes
+```
+
+The pending request has a timeout. After quorum is reached,
+`approval_ttl_seconds` limits how long that connection may wait to consume the
+approval; it does not grant repeated connections. The UUID request is bound to
+one connection ID, requester subject, source address, target routing, remote
+identity, and policy decision. A different connection or changed binding needs a
+new decision. At consumption, `max_session_seconds`, identity expiry, and grant
+expiry bound the session deadline. Regular authorization rechecks also enforce
+revocation and the currently configured quorum. Existing sessions without an approval close if a
+newly applied configuration requires one.
+
+This approval path is implemented for interactive SSH through the wrapper.
+Jobs/runbooks targeting a host or proxy that requires session approval fail closed; an
+interactive approval cannot be reused to authorize worker execution.
+
+Approval records use `session_approval_*` Redis keys. Default backups include
+them; add this pattern to existing custom backup patterns and service Redis ACLs
+when those configurations override the defaults. Decision state and notification
+results remain available for audit after a request expires or closes.
+
 ## Session Logging
 
 Structured logs are written to:
@@ -1967,6 +2041,7 @@ Routes:
 - `/auth/callback`: OIDC callback.
 - `/logout`: logout.
 - `/me`: personal workspace and policy-allowed hosts.
+- `/me/resources/<server_id>`: resource metadata, cached health, effective SSH identity and access expiry, and connection instructions.
 - `/me/sessions`: the current user's active sessions.
 - `/me/history` and `/me/history/export`: the current user's filtered history and CSV/JSON export.
 - `/me/access`: create and track personal access requests, add comments, cancel pending requests, and request renewals.
@@ -1981,6 +2056,8 @@ Routes:
 - `/inventory/<server_id>/services`: successful discovery baseline and service changes for a host.
 - `/announcements`: global/project/host operational notices with severity and TTL.
 - `/access`: access requests with filters, comments, repeat, approve, and deny forms.
+- `/session-approvals`: project-scoped decisions and revocation for individual SSH connections.
+- `/me/session-approvals`: the current user's connection approval requests.
 - `/grants`: create/edit/remove grants and project sets, plus bulk allowed-action/member operations.
 - `/packages`: create and assign reusable access profiles; package details provide preview, revision apply, and rollback.
 - `/policy/simulate`: visual allow/deny simulator using the production resolver.
@@ -1994,15 +2071,16 @@ Routes:
 - `/raw/<user>/<connection_id>`: raw transcript for admins.
 - `/export/<inventory|grants|history|users|access-matrix>`: authenticated CSV or JSON download.
 
-Administrative routes require membership in `dashboard.admin_groups`; authenticated
-non-admin users receive HTTP 403 on those routes, including administrative exports,
-session details/replay, raw logs, and policy mutations. Personal `/me` routes have
-their own per-user authorization and do not expose those administrator capabilities.
+Global configuration, policy mutations, jobs administration, and user management
+require membership in `dashboard.admin_groups`. Project-scoped management roles
+can enter their permitted inventory, access, session, and audit pages; every object
+and export is filtered again by its project. Personal `/me` routes retain their
+per-user ownership checks.
 
 ### Personal User Workspace
 
-After Keycloak sign-in, eligible non-admin users land on `/me`. They see only
-policy-allowed hosts, their own active sessions and connection history, and their
+After Keycloak sign-in, eligible non-admin users land on `/me`. They see
+policy-allowed resources, their own active sessions and connection history, and their
 own access requests. They can request a scheduled access window, comment on a
 request, cancel a pending request, or create a renewal awaiting administrator
 approval. Personal history exports preserve the selected filters and omit internal
@@ -2020,9 +2098,79 @@ dashboard:
   self_service_groups: [Demo-Operators, Demo-Contractors]
 ```
 
-Set `self_service_enabled: false` to disable non-admin access to the personal workspace. These settings
-do not grant SSH access or administrator privileges; host visibility still uses
-the production grant resolver. Existing admin routes remain admin-only.
+Set `self_service_enabled: false` to disable ordinary non-admin access to the
+personal workspace. Users with an assigned project management role can still
+enter the resource catalogue for their authorized scope. These settings do not
+grant SSH access or administrator privileges.
+
+### Resource Catalogue
+
+`/me` presents searchable resource cards. A card includes owner, environment,
+manual and discovered services, maintenance state, the latest cached connectivity
+result and check time, and the effective SSH remote user, sudo mode, and expiry.
+Expiry reflects the earlier of the current identity and grant deadlines. A stale
+or route-mismatched connectivity result is not presented as a fresh successful
+check; browsing the catalogue never initiates a network probe.
+
+Open `/me/resources/<server_id>` for details. The connection control copies
+`g <server_id>` for use after logging in to the bastion and running
+`isolate login`. Its request-access link prefills the visible host and project;
+opening that link creates no request until the user confirms the form.
+
+SSH visibility is calculated with the production grant resolver. A management
+role with `inventory.read` can also view resources in its project, with a clear
+"No SSH permission" indication when no SSH grant applies. A management role alone
+does not enable connection or reveal credentials. Direct details and request
+prefills recheck the current host and scope, including after project moves.
+
+### Project-Scoped Management Roles
+
+Assign management roles through the trusted runtime configuration and verified
+Keycloak group membership. Role assignment is configuration-managed; there is no
+new global role-assignment form in the dashboard.
+
+```yaml
+dashboard:
+  admin_groups: [Demo-Platform-Admins]
+  role_bindings:
+    - group: Demo-Payments-Owners
+      role: project-owner
+      projects: [payments-prod, payments-stage]
+    - group: Demo-Payments-Approvers
+      role: approver
+      projects: [payments-prod]
+    - group: Demo-Production-Auditors
+      role: auditor
+      project_globs: ["*-prod"]
+    - group: Demo-Payments-Inventory
+      role: inventory-operator
+      projects: [payments-prod, payments-stage]
+```
+
+Group names are exact, case-sensitive verified OIDC group values. `projects`
+contains exact project names; `project_globs` optionally adds glob selectors.
+An explicit `projects: ["*"]` grants that role across projects. Missing or malformed
+scopes do not implicitly grant global access. Multiple matching bindings combine
+their permissions.
+
+| Role | Project-scoped capabilities |
+| --- | --- |
+| `project-owner` | Inventory read/write, access-request read/approve, session read/approve, audit read |
+| `approver` | Inventory read, access-request read/approve, session approval |
+| `auditor` | Inventory read, access-request read, session read, audit read |
+| `inventory-operator` | Inventory read and descriptive inventory changes |
+
+Inventory writers can edit descriptions, services, tags, owner/environment, and
+maintenance, and move a host only when they hold write permission for both its
+current and proposed project. The write rechecks both scopes within the Redis
+transaction, including after a concurrent change. Host creation and changes to
+addresses, ports, remote credentials/user, sudo defaults, proxies, VIP status, or
+privileged-access settings remain global administrator operations.
+
+Auditors can read permitted project history, session details, replay, raw logs,
+and corresponding filtered exports. Access to another project, an object without
+project metadata, or a global policy/user-management surface is denied. Project
+roles govern management operations and never create target SSH grants.
 
 Use the `EN` / `RU` control in the top bar to select the dashboard locale. The choice is stored in the authenticated Flask session. Navigation, compact per-page explanations, and input-field help are localized without changing data or policy values. Day/night theme remains a browser-local preference.
 
@@ -3321,8 +3469,10 @@ dashboard:
     - Demo-Security
 ```
 
-An ordinary signed-in user should use `/me`; administrative routes correctly return
-403. If `/me` is denied too, check `dashboard.self_service_enabled` and any exact
+An ordinary signed-in user without a project management role should use `/me`;
+administrative routes correctly return 403. A scoped operator should check the
+role's permissions and project selectors in `dashboard.role_bindings` instead of
+assuming full administrator access. If `/me` is denied too, check `dashboard.self_service_enabled` and any exact
 `dashboard.self_service_groups` restriction. Do not add users to admin groups just
 to let them request access or view their own activity.
 
@@ -3412,8 +3562,10 @@ and logs it with method/path beside Flask's traceback. Inspect the actual runnin
 service's logs (systemd, container, or process supervisor) to determine the cause;
 do not infer it from a successful unauthenticated `/health` check. After deployment,
 check `/health`, `/login`, a real OIDC login, and the authenticated `/` route. Verify
-that eligible non-admin users reach `/me` and still receive 403 on administrative
-routes such as `/inventory`, `/grants`, `/raw/...`, and `/export/inventory`.
+that ordinary users without project roles reach `/me` and still receive 403 on
+administrative routes such as `/inventory`, `/grants`, `/raw/...`, and
+`/export/inventory`. Verify that scoped operators can enter permitted project
+pages while other-project objects, exports, and policy management remain denied.
 Monitoring should include the authenticated
 page with a dedicated test identity and alert on HTTP 5xx rates; dependency health
 alone does not exercise page rendering. This repository does not automatically
@@ -3430,12 +3582,12 @@ Requests uses it: urllib3 tests IPv6 loopback availability. Correct outbound rou
 to the issuer's addresses and monitor metadata/JWKS availability as well as page
 rendering. Raising the Gunicorn timeout alone leaves the stalled connection intact.
 
-Keep Admin for configuration and policy mutations. The implemented `/me` workspace
-serves personal hosts, sessions, history, and requests with server-side ownership
-checks and a separate personal history export. Administrative routes, raw logs,
-replay, and global exports remain admin-only. Project-scoped Approver and read-only
-Auditor roles remain separate future work; the personal workspace does not grant
-either role.
+Keep global Admin for configuration and policy mutations. The `/me` workspace
+serves resource cards, personal sessions, history, and requests with server-side
+ownership checks. Project-scoped management roles add delegated inventory,
+approval, and audit operations with object and export scope enforcement. Assign
+those roles explicitly in trusted configuration; a personal workspace does not
+assign a project role or create an SSH grant.
 
 The reported duplicate `raw_log_path` SSH traceback is already fixed in the local
 wrapper: metadata holds the path once and both audit events use that metadata.
@@ -3472,6 +3624,8 @@ SSH wrapper.
 - Verify deny-by-default behavior.
 - Verify break-glass request and approval flow.
 - Verify eligible non-admin access to `/me`, ownership isolation, and 403 on administrative dashboard routes.
+- Verify each project role's permitted pages, cross-project denials, and filtered exports.
+- If session approvals are enabled, verify quorum, self-approval denial, timeout, single-use consumption, and revocation on a real SSH connection.
 - Run the dashboard through Gunicorn/systemd behind HTTPS, not Flask's development server.
 - Keep Redis local or enable an ACL user and verified TLS before exposing it over the network.
 - Export the current policy bundle, commit it for review, and test `policy diff`/`apply --dry-run`.

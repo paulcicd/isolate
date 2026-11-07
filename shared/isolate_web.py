@@ -13,7 +13,7 @@ import urllib.parse
 
 from isolate import get_grant_record, list_grant_records, load_grants, load_project_sets, redis_client, update_grant_record
 from isolate_audit import prepare_and_dispatch
-from isolate_access import AccessDenied, approve_access_request, deny_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, revoke_access_request, set_notification_status
+from isolate_access import AccessDenied, approve_access_request, deny_access_request, get_access_request, is_access_admin, list_access_requests, parse_duration, repeat_access_request, revoke_access_request, set_notification_status
 from isolate_announcements import AnnouncementError, create_announcement, delete_announcement, list_announcements
 from isolate_build import get_build_info
 from isolate_config import load_config
@@ -56,14 +56,15 @@ from isolate_runbooks import list_runbooks
 from isolate_sessions import SessionControlError, get_session, list_active_sessions, list_session_records, request_session_termination
 from isolate_service_discovery import get_discovery_history
 from isolate_self_service import history_filters, history_form, register_self_service
+from isolate_permissions import has_permission, filter_projects, is_platform_admin, role_names
+from isolate_session_approval_web import register_session_approval_routes
 
 
 _DASHBOARD_STARTED_AT = time.time()
 
 
 def is_dashboard_admin(identity, config):
-    groups = config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or []
-    return is_access_admin(identity, groups)
+    return is_platform_admin(identity, config)
 
 
 def is_self_service_user(identity, config):
@@ -785,7 +786,7 @@ def _html(title, body, config=None, notice=None):
     matched_groups = sorted(set(identity.get("groups") or []) & set(admin_groups))
     labels = ("Роль Dashboard", "Группы доступа", "Группы OIDC", "Роли Keycloak") if locale == "ru" else ("Dashboard role", "Access groups", "OIDC groups", "Keycloak roles")
     identity_details = '<details class="identity-details"><summary>{}: {}</summary>{}</details>'.format(
-        labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else "User",
+        labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else ", ".join(role_names(identity, config or {})) or "User",
         "".join('<div><strong>{}</strong>: {}</div>'.format(html.escape(label), html.escape(", ".join(values) or "—")) for label, values in zip(labels[1:], (matched_groups, identity.get("groups") or [], identity.get("roles") or []))),
     )
     field_help_script = """
@@ -823,6 +824,17 @@ def _html(title, body, config=None, notice=None):
         ):
             admin_nav += '<div class="nav-section"><span class="nav-label">{}</span>{}</div>'.format(
                 html.escape(words[section]), "".join('<a class="nav-link" href="{}">{}</a>'.format(href, html.escape(words[label])) for href, label in entries))
+    else:
+        links = (("/inventory", "inventory", "inventory.read"), ("/access", "requests", "access.read"),
+                 ("/history", "history", "audit.read"), ("/sessions/active", "active_sessions", "sessions.read"))
+        delegated_links = "".join('<a class="nav-link" href="{}">{}</a>'.format(href, html.escape(words[label]))
+                                  for href, label, permission in links if has_permission(identity, config or {}, permission))
+        if delegated_links:
+            admin_nav = '<div class="nav-section"><span class="nav-label">{}</span>{}</div>'.format(
+                "Мои проекты" if locale == "ru" else "My projects", delegated_links)
+    if has_permission(identity, config or {}, "sessions.approve") or has_permission(identity, config or {}, "sessions.read"):
+        admin_nav += '<a class="nav-link" href="/session-approvals">{}</a>'.format("Согласования сессий" if locale == "ru" else "Session approvals")
+    portal_nav += '<a class="nav-link" href="/me/session-approvals">{}</a>'.format("Мои согласования" if locale == "ru" else "My approvals")
     rendered = """<!doctype html>
 <html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
 <script>{theme_bootstrap_script}</script>
@@ -1120,6 +1132,8 @@ def _host_form_values(form, partial=False):
         "maintenance_until": "maintenance_until",
         "maintenance_reason": "maintenance_reason",
         "tags": "tags",
+        "owner": "resource_owner",
+        "environment": "environment",
     }
     result = {}
     for source, target in mapping.items():
@@ -1194,6 +1208,40 @@ def create_app(config=None):
             abort(403)
         return identity
 
+    def require_permission(permission, project=None):
+        identity = current_identity()
+        if identity is None:
+            return redirect(url_for("login"))
+        if not has_permission(identity, config, permission, project):
+            abort(403)
+        return identity
+
+    def require_object_permission(identity, permission, project):
+        if not is_dashboard_admin(identity, config) and (not project or not has_permission(identity, config, permission, project)):
+            abort(404)
+
+    def scoped_host(redis, server_id, identity, permission="inventory.read"):
+        host = get_host(redis, server_id)
+        if host is None:
+            abort(404)
+        require_object_permission(identity, permission, host.get("project_name"))
+        return host
+
+    def inventory_authorizer(identity):
+        from isolate_permissions import authorize_inventory_change
+        return lambda current, proposed: authorize_inventory_change(identity, config, current, proposed)
+
+    def disable_protected_inventory_fields(body):
+        fields = "ip|port|user|nosudo|vip|proxy_id|privileged_provider|privileged_url|privileged_hint"
+        return re.sub(r'(<(?:input|select)\b[^>]*\bname="(?:' + fields + r')")', r'\1 disabled', body)
+
+    def scoped_session(connection_id, identity):
+        details = find_session(config["logging"]["base_path"], connection_id)
+        if details is None:
+            abort(404)
+        require_object_permission(identity, "audit.read", (details.get("summary") or {}).get("project"))
+        return details
+
     def csrf_token():
         token = session.get("csrf_token")
         if not token:
@@ -1260,7 +1308,7 @@ def create_app(config=None):
             links.append('<a href="{}">{}</a>'.format(href, text))
         return " ".join(links)
 
-    def access_table(rows, token, access_cfg):
+    def access_table(rows, token, access_cfg, identity):
         default_ttl = html.escape(str(access_cfg.get("default_ttl", "2h")))
         header = (
             "<th>id</th><th>status</th><th>user</th><th>project</th><th>host</th><th>ticket</th>"
@@ -1268,6 +1316,7 @@ def create_app(config=None):
         )
         body = ""
         for row in rows:
+            revoke_form = ""
             cells = [
                 html.escape(str(row.get("id") or "")),
                 html.escape(str(row.get("status") or "")),
@@ -1301,6 +1350,7 @@ def create_app(config=None):
   <input name="remote_user" value="{remote_user}" placeholder="remote_user" size="10">
   <input name="sudo_mode" value="{sudo_mode}" placeholder="sudo_mode" size="8">
   <input name="comment" placeholder="comment" size="12">
+  <label><input type="checkbox" name="confirm" value="true" required> confirm</label>
   <button type="submit">Approve</button>
 </form>
 <form class="inline" method="post">
@@ -1309,6 +1359,7 @@ def create_app(config=None):
   <input type="hidden" name="action" value="deny">
   <input name="reason" placeholder="reason" size="12">
   <input name="comment" placeholder="comment" size="12">
+  <label><input type="checkbox" name="confirm" value="true" required> confirm</label>
   <button type="submit">Deny</button>
 </form>""".format(
                     token=html.escape(token),
@@ -1330,7 +1381,12 @@ def create_app(config=None):
   <button type="submit">Request again</button>
 </form>""".format(token=html.escape(token), request_id=request_id)
                 if row.get("status") == "approved":
-                    actions += '<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><input type="hidden" name="action" value="revoke"><input name="reason" placeholder="revocation reason"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Revoke access</button></form>'.format(html.escape(token), request_id)
+                    revoke_form = '<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="id" value="{}"><input type="hidden" name="action" value="revoke"><input name="reason" placeholder="revocation reason"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Revoke access</button></form>'.format(html.escape(token), request_id)
+                    actions += revoke_form
+            if not has_permission(identity, config, "access.approve", row.get("project") or ""):
+                actions = ""
+            elif not is_dashboard_admin(identity, config) and row.get("status") != "pending":
+                actions = revoke_form
             body += "<tr>{}<td>{}</td></tr>".format("".join("<td>{}</td>".format(cell) for cell in cells), actions)
         return "<table><thead><tr>{}</tr></thead><tbody>{}</tbody></table>".format(header, body)
 
@@ -1362,7 +1418,7 @@ def create_app(config=None):
         if not isinstance(claims, dict) or not claims:
             abort(401, description="Keycloak did not return verified OIDC claims")
         identity = normalize_claims(claims)
-        if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config):
+        if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config) and not role_names(identity, config):
             abort(403)
         session.clear()
         session["identity"] = identity
@@ -1376,7 +1432,7 @@ def create_app(config=None):
     @app.route("/")
     def index():
         identity = current_identity()
-        if identity and not is_dashboard_admin(identity, config) and is_self_service_user(identity, config):
+        if identity and not is_dashboard_admin(identity, config) and (is_self_service_user(identity, config) or role_names(identity, config)):
             return redirect("/me")
         admin = require_admin()
         if not isinstance(admin, dict):
@@ -1793,22 +1849,23 @@ def create_app(config=None):
 
     @app.route("/sessions/active")
     def active_sessions():
-        admin = require_admin()
+        admin = require_permission("sessions.read")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
-        rows = list_active_sessions(redis)
+        rows = filter_projects(list_active_sessions(redis), admin, config, "sessions.read")
         token = csrf_token()
-        termination_enabled = config.get("session_control", {}).get("terminate_enabled", False)
+        termination_enabled = is_dashboard_admin(admin, config) and config.get("session_control", {}).get("terminate_enabled", False)
         for row in rows:
             if not row.get("server_name") and row.get("host_id"):
                 host_record = get_host(redis, row.get("host_id"))
-                if host_record is not None:
+                if host_record is not None and has_permission(admin, config, "inventory.read", host_record.get("project_name") or ""):
                     row["server_name"] = host_record.get("server_name")
             row["started"] = _format_ts(row.get("started_at"))
             connection_id = html.escape(str(row.get("connection_id") or ""))
             username = str(row.get("username") or "")
-            row["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
+            row["user_link"] = ('<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
+                                if is_dashboard_admin(admin, config) else html.escape(username))
             row["live"] = '<a href="/session/{}/live">live</a>'.format(connection_id)
             if termination_enabled:
                 row["control"] = """
@@ -1845,12 +1902,12 @@ def create_app(config=None):
 
     @app.route("/history")
     def history():
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
         try:
             rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
-                                admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
+                                admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [], permission_config=config)
         except ValueError as exc:
             abort(400, description=str(exc))
         redis = redis_client(config)
@@ -1859,7 +1916,7 @@ def create_app(config=None):
             username = str(row.get("username") or "")
             if not row.get("server_name") and row.get("host_id"):
                 host_record = get_host(redis, row.get("host_id"))
-                if host_record is not None:
+                if host_record is not None and has_permission(admin, config, "inventory.read", host_record.get("project_name") or ""):
                     row["server_name"] = host_record.get("server_name")
             row["user_link"] = '<a href="/user/{}">{}</a>'.format(urllib.parse.quote(username, safe=""), html.escape(username))
             if connection_id:
@@ -1880,7 +1937,7 @@ def create_app(config=None):
 
     @app.route("/export/<kind>")
     def export_data(kind):
-        admin = require_admin()
+        admin = require_permission("inventory.read" if kind == "inventory" else "audit.read") if kind in ("inventory", "history") else require_admin()
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
@@ -1888,6 +1945,7 @@ def create_app(config=None):
         if kind == "inventory":
             try:
                 rows = list_hosts(redis, project=request.args.get("project"), query=request.args.get("q"), tags=request.args.get("tags") or None)
+                rows = filter_projects(rows, admin, config, "inventory.read", project_field="project_name")
             except HostValidationError as exc:
                 abort(400, description=str(exc))
         elif kind == "grants":
@@ -1897,7 +1955,7 @@ def create_app(config=None):
         elif kind == "history":
             try:
                 rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
-                                    admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
+                                    admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [], permission_config=config)
             except ValueError as exc:
                 abort(400, description=str(exc))
         elif kind == "access-matrix":
@@ -1918,7 +1976,7 @@ def create_app(config=None):
 
     @app.route("/access", methods=["GET", "POST"])
     def access():
-        admin = require_admin()
+        admin = require_permission("access.read")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
@@ -1927,7 +1985,13 @@ def create_app(config=None):
             validate_csrf()
             action = request.form.get("action")
             request_id = request.form.get("id")
+            target_request = get_access_request(redis, request_id)
+            if target_request is None:
+                abort(404)
+            require_object_permission(admin, "access.approve" if action in ("approve", "deny", "revoke") else "access.read", target_request.get("project"))
             try:
+                if not is_dashboard_admin(admin, config):
+                    require_mutation_confirmation()
                 if action == "approve":
                     ttl = parse_duration(request.form.get("ttl"), default=config.get("access", {}).get("default_ttl", "2h"))
                     max_ttl = parse_duration(config.get("access", {}).get("max_ttl", "24h"))
@@ -1943,14 +2007,17 @@ def create_app(config=None):
                         max_ttl=max_ttl,
                         comment=request.form.get("comment") or None,
                         starts_at=request.form.get("starts_at") or None,
+                        config=config,
                     )
                     notice = notify_dashboard(redis, "access_request_approved", record, admin, extra={"grant": grant})
                     notice = notice or {"level": "info", "text": "Access request approved"}
                 elif action == "deny":
-                    record = deny_access_request(redis, request_id, admin, reason=request.form.get("reason"), comment=request.form.get("comment") or None)
+                    record = deny_access_request(redis, request_id, admin, reason=request.form.get("reason"), comment=request.form.get("comment") or None, config=config)
                     notice = notify_dashboard(redis, "access_request_denied", record, admin)
                     notice = notice or {"level": "info", "text": "Access request denied"}
                 elif action == "repeat":
+                    if not is_dashboard_admin(admin, config):
+                        abort(403)
                     record = repeat_access_request(redis, request_id, admin, reason=request.form.get("reason") or None, ticket=request.form.get("ticket") or None, config=config,
                                                    admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [])
                     notice = notify_dashboard(redis, "access_request_created", record, admin)
@@ -1959,14 +2026,14 @@ def create_app(config=None):
                     require_mutation_confirmation()
                     record = revoke_access_request(redis, request_id, admin,
                         admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [],
-                        reason=request.form.get("reason") or None)
+                        reason=request.form.get("reason") or None, config=config)
                     if record is None:
                         raise ValueError("access request was not found")
                     audit_admin("access_request_revoke", admin, "applied", {"access_request_id": request_id})
                     notice = notify_dashboard(redis, "access_request_revoked", record, admin) or {"level": "info", "text": "Access revoked"}
                 else:
                     raise ValueError("unknown access action")
-            except Exception as exc:
+            except (AccessDenied, ValueError) as exc:
                 notice = {"level": "error", "text": str(exc)}
         status = request.args.get("status")
         if status == "all":
@@ -1978,6 +2045,7 @@ def create_app(config=None):
             project=request.args.get("project") or None,
             ticket=request.args.get("ticket") or None,
         )
+        rows = filter_projects(rows, admin, config, "access.read")
         body = """
 <h1>Access Requests</h1>
 <form method="get">
@@ -1992,13 +2060,13 @@ def create_app(config=None):
             project=html.escape(request.args.get("project") or ""),
             ticket=html.escape(request.args.get("ticket") or ""),
             links=status_filter_links(status),
-            table=access_table(rows, csrf_token(), config.get("access", {})),
+            table=access_table(rows, csrf_token(), config.get("access", {}), admin),
         )
         return _html("Access Requests", body, config=config, notice=notice)
 
     @app.route("/inventory", methods=["GET", "POST"])
     def inventory():
-        admin = require_admin()
+        admin = require_permission("inventory.read")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
@@ -2006,9 +2074,13 @@ def create_app(config=None):
         if request.method == "POST":
             validate_csrf()
             action = request.form.get("action")
+            if not has_permission(admin, config, "inventory.write"):
+                abort(403)
             try:
                 require_mutation_confirmation()
                 if action == "add":
+                    if not is_dashboard_admin(admin, config):
+                        abort(403)
                     host = create_host(redis, _host_form_values(request.form), updated_by=admin.get("username"))
                     notice = {"level": "info", "text": "Host {} added".format(host.get("server_id"))}
                     audit_admin("host_add", admin, "applied", {"host_id": host.get("server_id")})
@@ -2019,14 +2091,16 @@ def create_app(config=None):
                     updates = _host_form_values(request.form, partial=True)
                     if not updates:
                         raise ValueError("at least one bulk update field is required")
-                    bulk_update_hosts(redis, host_ids, updates, updated_by=admin.get("username"))
+                    for server_id in host_ids:
+                        scoped_host(redis, server_id, admin, "inventory.write")
+                    bulk_update_hosts(redis, host_ids, updates, updated_by=admin.get("username"), authorize=inventory_authorizer(admin))
                     changed = [str(host_id) for host_id in host_ids]
                     notice = {"level": "info", "text": "Updated hosts: {}".format(", ".join(changed))}
                     audit_admin("host_bulk_update", admin, "applied", {"host_ids": changed, "count": len(changed)})
                 elif action == "connectivity_check":
-                    host = get_host(redis, request.form.get("host_id"))
-                    if host is None:
-                        raise ValueError("host not found")
+                    host = scoped_host(redis, request.form.get("host_id"), admin, "inventory.write")
+                    if not is_dashboard_admin(admin, config):
+                        abort(403)
                     result = check_host(host, config, timeout=config.get("connectivity", {}).get("default_timeout", 3))
                     save_check(redis, result, ttl=config.get("connectivity", {}).get("result_ttl", 3600))
                     notice = {"level": "info" if result.get("ok") else "warning", "text": "Host {}: {}".format(host.get("server_id"), "reachable" if result.get("ok") else result.get("error"))}
@@ -2040,6 +2114,7 @@ def create_app(config=None):
         query = request.args.get("q") or None
         try:
             rows = list_hosts(redis, project=project, query=query, tags=request.args.get("tags") or None)
+            rows = filter_projects(rows, admin, config, "inventory.read", project_field="project_name")
         except HostValidationError as exc:
             abort(400, description=str(exc))
         for row in rows:
@@ -2053,6 +2128,13 @@ def create_app(config=None):
             last_check = get_last_check(redis, row.get("server_id"))
             row["connectivity"] = "unknown" if not last_check else ("reachable" if last_check.get("ok") else "failed")
             row["control"] = '<form method="post" class="inline"><input type="hidden" name="csrf_token" value="{}"><input type="hidden" name="action" value="connectivity_check"><input type="hidden" name="host_id" value="{}"><input type="hidden" name="confirm" value="true"><button type="submit">Check</button></form>'.format(html.escape(csrf_token()), html.escape(str(row.get("server_id") or "")))
+            if not is_dashboard_admin(admin, config):
+                row["control"] = ""
+                if not has_permission(admin, config, "inventory.write", row.get("project_name") or ""):
+                    row["details"] = '<a href="/me/resources/{}">view</a>'.format(urllib.parse.quote(str(row["server_id"]), safe=""))
+                if not has_permission(admin, config, "audit.read", row.get("project_name") or ""):
+                    row["history"] = ""
+                    row["project_link"] = html.escape(str(row.get("project_name") or ""))
         body = """
 <h1>Inventory</h1>
 <p>{export_links}</p>
@@ -2069,6 +2151,7 @@ def create_app(config=None):
   <input name="ip" placeholder="IP" required><input name="port" value="22" size="5">
   <input name="user" placeholder="remote user" required><input name="services" placeholder="services">
   <input name="tags" placeholder="env=prod,owner=payments">
+  <input name="owner" placeholder="resource owner"><input name="environment" placeholder="environment">
   <select name="vip"><option value="false">standard</option><option value="true">VIP</option></select>
   <label><input type="checkbox" name="confirm" value="true" required> confirm</label><button type="submit">Add</button>
 </form>
@@ -2078,6 +2161,7 @@ def create_app(config=None):
   <input name="host_ids" placeholder="10001,10002" required><input name="project" placeholder="new project">
   <input name="user" placeholder="new remote user"><input name="services" placeholder="new services">
   <input name="tags" placeholder="replace tags: env=prod"><label><input type="checkbox" name="clear_tags" value="true"> clear tags</label>
+  <input name="owner" placeholder="resource owner"><input name="environment" placeholder="environment">
   <select name="vip"><option value="">keep VIP</option><option value="true">VIP</option><option value="false">not VIP</option></select>
   <select name="maintenance"><option value="">keep maintenance</option><option value="true">maintenance</option><option value="false">available</option></select>
   <label><input type="checkbox" name="confirm" value="true" required> confirm</label><button type="submit">Apply</button>
@@ -2090,11 +2174,17 @@ def create_app(config=None):
                 html.escape(urllib.parse.urlencode({**request.args.to_dict(), "format": fmt}), quote=True), fmt.upper()) for fmt in ("csv", "json")),
             csrf=html.escape(csrf_token()),
         )
+        if not is_dashboard_admin(admin, config):
+            add_start = body.index("<h2>Add host</h2>")
+            bulk_start = body.index("<h2>Bulk update</h2>")
+            body = body[:add_start] + (body[bulk_start:] if has_permission(admin, config, "inventory.write") else "")
+            body = disable_protected_inventory_fields(body)
         body += _table(rows, [
             ("project_link", "project"), ("server_id", "id"), ("server_ip", "ip"), ("server_name", "name"),
             ("server_vip_marker", "vip"), ("server_user", "user"), ("server_services_display", "services"),
             ("maintenance_marker", "state"), ("maintenance_reason", "maintenance reason"),
             ("tags_display", "tags"), ("actions", "service changes"),
+            ("resource_owner", "owner"), ("environment", "environment"),
             ("server_note", "note"), ("privileged_access_provider", "privileged"), ("privileged_access_hint", "hint"),
             ("connectivity", "connectivity"), ("control", "check"), ("history", "history"), ("details", "edit")
         ])
@@ -2102,10 +2192,11 @@ def create_app(config=None):
 
     @app.route("/inventory/<server_id>/edit", methods=["GET", "POST"])
     def inventory_edit(server_id):
-        admin = require_admin()
+        admin = require_permission("inventory.write")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
+        scoped_host(redis, server_id, admin, "inventory.write")
         notice = None
         if request.method == "POST":
             validate_csrf()
@@ -2117,6 +2208,7 @@ def create_app(config=None):
                     _host_form_values(request.form),
                     updated_by=admin.get("username"),
                     expected_revision=request.form.get("revision") or None,
+                    authorize=inventory_authorizer(admin),
                 )
                 if host is None:
                     abort(404)
@@ -2125,9 +2217,7 @@ def create_app(config=None):
             except (HostValidationError, ValueError) as exc:
                 audit_admin("host_update", admin, "denied", {"host_id": server_id})
                 notice = {"level": "error", "text": str(exc)}
-        host = get_host(redis, server_id)
-        if host is None:
-            abort(404)
+        host = scoped_host(redis, server_id, admin, "inventory.write")
         body = """
 <h1>Edit Host {server_id}</h1>
 <form method="post">
@@ -2137,6 +2227,7 @@ def create_app(config=None):
 <p>IP <input name="ip" value="{ip}" required> Port <input name="port" value="{port}" required> User <input name="user" value="{user}" required></p>
 <p>Services <input name="services" value="{services}" size="60"></p>
 <p>Tags <input name="tags" value="{tags}" placeholder="env=prod,owner=payments" size="60"></p>
+<p>Owner <input name="owner" value="{owner}"> Environment <input name="environment" value="{environment}"></p>
 <p>Note <input name="note" value="{note}" size="80"></p>
 <p>VIP <select name="vip"><option value="false">false</option><option value="true" {vip_selected}>true</option></select>
 No sudo <select name="nosudo"><option value="false">false</option><option value="true" {nosudo_selected}>true</option></select></p>
@@ -2153,6 +2244,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             ip=html.escape(str(host.get("server_ip") or "")), port=html.escape(str(host.get("server_port") or 22)),
             user=html.escape(str(host.get("server_user") or "")), services=html.escape(str(host.get("server_services") or "")),
             tags=html.escape(str(host.get("tags_display") or ""), quote=True),
+            owner=html.escape(str(host.get("resource_owner") or ""), quote=True), environment=html.escape(str(host.get("environment") or ""), quote=True),
             note=html.escape(str(host.get("server_note") or "")), vip_selected="selected" if host.get("server_vip") else "",
             nosudo_selected="selected" if host.get("server_nosudo") else "", provider=html.escape(str(host.get("privileged_access_provider") or "")),
             provider_url=html.escape(str(host.get("privileged_access_url") or "")), provider_hint=html.escape(str(host.get("privileged_access_hint") or "")),
@@ -2161,6 +2253,8 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             maintenance_until=html.escape(str(host.get("maintenance_until") or "")),
             maintenance_reason=html.escape(str(host.get("maintenance_reason") or "")),
         )
+        if not is_dashboard_admin(admin, config):
+            body = disable_protected_inventory_fields(body)
         return _html("Edit Host", body, config=config, notice=notice)
 
     @app.route("/announcements", methods=["GET", "POST"])
@@ -2227,19 +2321,17 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
 
     @app.route("/session/<connection_id>")
     def session_details(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
-        details = find_session(config["logging"]["base_path"], connection_id)
-        if details is None:
-            abort(404)
+        details = scoped_session(connection_id, admin)
         summary = details.get("summary") or {}
         if not summary.get("server_name") and summary.get("host_id"):
             try:
                 host_record = get_host(redis_client(config), summary.get("host_id"))
             except Exception:
                 host_record = None
-            if host_record is not None:
+            if host_record is not None and has_permission(admin, config, "inventory.read", host_record.get("project_name") or ""):
                 summary["server_name"] = host_record.get("server_name")
         raw_link = ""
         replay_link = ""
@@ -2301,12 +2393,10 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
 
     @app.route("/session/<connection_id>/events.json")
     def session_events_json(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
-        details = find_session(config["logging"]["base_path"], connection_id)
-        if details is None:
-            abort(404)
+        details = scoped_session(connection_id, admin)
         return app.response_class(
             response=json.dumps(details.get("events") or [], indent=2, sort_keys=True),
             status=200,
@@ -2315,7 +2405,7 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
 
     @app.route("/session/<connection_id>/live.json")
     def session_live_json(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
@@ -2323,6 +2413,10 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
         details = find_session(config["logging"]["base_path"], connection_id)
         if details is None and active is None:
             abort(404)
+        if details is not None:
+            require_object_permission(admin, "audit.read", (details.get("summary") or {}).get("project"))
+        if active is not None:
+            require_object_permission(admin, "audit.read", active.get("project"))
         raw_path = (details or {}).get("raw_log_path")
         replay_data = parse_raw_replay(
             raw_path,
@@ -2341,9 +2435,10 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
 
     @app.route("/session/<connection_id>/live")
     def session_live(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
+        scoped_session(connection_id, admin)
         connection_id_safe = html.escape(str(connection_id))
         body = """
 <h1>Live Session</h1>
@@ -2379,12 +2474,10 @@ refreshLive();
 
     @app.route("/replay/<connection_id>.json")
     def replay_json(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
-        details = find_session(config["logging"]["base_path"], connection_id)
-        if details is None:
-            abort(404)
+        details = scoped_session(connection_id, admin)
         replay = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         return app.response_class(
             response=json.dumps(replay, indent=2, sort_keys=True),
@@ -2394,12 +2487,10 @@ refreshLive();
 
     @app.route("/replay/<connection_id>")
     def replay(connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
-        details = find_session(config["logging"]["base_path"], connection_id)
-        if details is None:
-            abort(404)
+        details = scoped_session(connection_id, admin)
         replay_data = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         readable = html.escape(replay_data.get("readable") or replay_data.get("plain") or "")
         error = replay_data.get("error")
@@ -3073,10 +3164,10 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
 
     @app.route("/raw/<user>/<connection_id>")
     def raw(user, connection_id):
-        admin = require_admin()
+        admin = require_permission("audit.read")
         if not isinstance(admin, dict):
             return admin
-        details = find_session(config["logging"]["base_path"], connection_id)
+        details = scoped_session(connection_id, admin)
         summary = (details or {}).get("summary") or {}
         if details and str(summary.get("username") or "") == str(user) and details.get("raw_log_path"):
             return send_file(details["raw_log_path"], mimetype="text/plain")
@@ -3084,13 +3175,11 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
 
     @app.route("/inventory/<server_id>/services")
     def service_changes(server_id):
-        admin = require_admin()
+        admin = require_permission("inventory.read")
         if not isinstance(admin, dict):
             return admin
         redis = redis_client(config)
-        host = get_host(redis, server_id)
-        if host is None:
-            abort(404)
+        host = scoped_host(redis, server_id, admin)
         rows = get_discovery_history(redis, server_id, limit=50)
         for row in rows:
             row["time"] = _format_ts(row.get("checked_at"))
@@ -3102,6 +3191,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         return _html("Service changes", body, config=config)
 
     register_self_service(app, config, current_identity, csrf_token, validate_csrf, notify_dashboard, audit_admin)
+    register_session_approval_routes(app, config, current_identity, csrf_token, validate_csrf, audit_admin)
     return app
 
 
