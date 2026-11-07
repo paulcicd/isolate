@@ -17,6 +17,10 @@ from isolate_inventory import get_host
 from isolate_policy import PolicyDenied, resolve_grant
 from isolate_runbooks import RunbookError, render_runbook
 from isolate_ssh import SSHArgumentError, build_ssh_argv
+from isolate_worker_ownership import (
+    JobOwnershipError, claim_job, claim_key, mark_recovery_required, mutate_job,
+    owner_token, release_lock, update_owned_job,
+)
 
 
 class JobError(Exception):
@@ -131,6 +135,14 @@ def validate_command(command, config):
 
 def _reject_gated_job(redis, config, host, decision):
     """Unattended execution must not bypass a human per-connection gate."""
+    security = config.get("identity_security", {})
+    if ((security.get("backchannel_logout") or {}).get("enabled")
+            or (security.get("introspection") or {}).get("enabled")):
+        raise JobError("unattended jobs require delegated Keycloak identity lifecycle support; "
+                       "jobs are disabled while centralized identity revocation is enabled")
+    from isolate_identity_security import step_up_required
+    if step_up_required(config, host, decision):
+        raise JobError("target requires fresh step-up authentication; unattended jobs are not permitted")
     from isolate_session_approvals import SessionApprovalDenied, session_approval_required
     try:
         required = session_approval_required(config, host, decision)
@@ -396,18 +408,19 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None):
 
 
 def request_job_cancel(redis, job_id, actor):
-    record = get_job(redis, job_id)
-    if record is None:
-        return None
-    if record.get("status") in ("completed", "failed", "cancelled", "timed_out"):
-        raise JobError("job is already {}".format(record.get("status")))
-    record["cancel_requested"] = True
-    record["cancel_requested_by"] = actor.get("username")
-    record["cancel_requested_at"] = now_ts()
-    if record.get("status") == "queued":
-        record["status"] = "cancelled"
-        record["finished_at"] = now_ts()
-    return _save(redis, record)
+    def change(record):
+        if record is None:
+            return None
+        if record.get("status") in ("completed", "failed", "cancelled", "timed_out"):
+            raise JobError("job is already {}".format(record.get("status")))
+        record["cancel_requested"] = True
+        record["cancel_requested_by"] = actor.get("username")
+        record["cancel_requested_at"] = now_ts()
+        if record.get("status") == "queued":
+            record["status"] = "cancelled"
+            record["finished_at"] = now_ts()
+        return record
+    return mutate_job(redis, job_id, change)
 
 
 def read_job_output(record, max_bytes=None, jobs_path=None, job_id=None):
@@ -500,10 +513,25 @@ def _remote_command(record, execution):
 
 
 def execute_job(redis, config, record):
-    execution = config.get("command_execution", {}) or {}
     lock_key = "job_lock_{}".format(record["id"])
-    if not redis.set(lock_key, str(os.getpid()), nx=True, ex=int(record["timeout"]) + 60):
+    owner = owner_token()
+    if not redis.set(lock_key, owner, nx=True, ex=int(record["timeout"]) + 60):
         return None
+    try:
+        current = get_job(redis, record["id"])
+        if current and (current.get("status") in ("claimed", "running")
+                        or redis.get(claim_key(record["id"])) is not None):
+            recovered = mark_recovery_required(redis, record["id"], owner)
+            if recovered and recovered.get("status") == "recovery_required":
+                _audit(config, "job_recovery_required", recovered)
+            return recovered
+        return _execute_job_locked(redis, config, record, owner)
+    finally:
+        release_lock(redis, lock_key, owner)
+
+
+def _execute_job_locked(redis, config, record, owner):
+    execution = config.get("command_execution", {}) or {}
     current = get_job(redis, record["id"])
     if current is None or current.get("status") != "queued" or current.get("cancel_requested"):
         return current
@@ -606,15 +634,31 @@ def execute_job(redis, config, record):
         )
     except SSHArgumentError as exc:
         return _fail_job(redis, config, current, "SSH arguments are invalid: {}".format(exc))
+    try:
+        current = claim_job(redis, current["id"], owner)
+    except JobOwnershipError:
+        return get_job(redis, record["id"])
+    if current is None:
+        return get_job(redis, record["id"])
     claim_path = os.path.join(jobs_path, ".job-{}.claimed".format(current["id"]))
     try:
         claim_fd = os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
         with os.fdopen(claim_fd, "w", encoding="ascii") as claim_f:
             claim_f.write("{}\n".format(now_ts()))
     except FileExistsError:
-        return _fail_job(redis, config, current, "job has already been claimed for execution")
-    current.update({"status": "running", "started_at": now_ts(), "output_path": output_path})
-    _save(redis, current)
+        current = update_owned_job(redis, current["id"], owner, {
+            "status": "recovery_required", "recovery_required_at": now_ts(),
+            "error": "A local execution claim already exists; inspect the remote outcome",
+        })
+        _audit(config, "job_recovery_required", current)
+        return current
+    current = update_owned_job(redis, current["id"], owner,
+                               {"status": "running", "started_at": now_ts(), "output_path": output_path})
+    if current.get("cancel_requested"):
+        current = update_owned_job(redis, current["id"], owner,
+                                   {"status": "cancelled", "finished_at": now_ts()})
+        _audit(config, "job_end", current, {"status": "cancelled"})
+        return current
     _audit(config, "job_start", current)
 
     max_output = int(execution.get("max_output_bytes", 1048576))
@@ -668,8 +712,7 @@ def execute_job(redis, config, record):
         proc.stdout.close()
 
     size = os.path.getsize(output_path)
-    current = get_job(redis, current["id"]) or current
-    current.update(
+    current = update_owned_job(redis, current["id"], owner,
         {
             "status": status,
             "finished_at": now_ts(),
@@ -678,9 +721,8 @@ def execute_job(redis, config, record):
             "output_path": output_path,
             "output_bytes": size,
             "output_truncated": error == "command output exceeded configured maximum",
-        }
+        },
     )
-    _save(redis, current)
     _audit(config, "job_end", current, {"status": status, "exit_code": proc.returncode, "output_bytes": size})
     return current
 
@@ -689,6 +731,12 @@ def run_worker(config, redis, once=False):
     execution = config.get("command_execution", {}) or {}
     poll = max(float(execution.get("poll_interval", 1)), 0.1)
     while True:
+        # A crashed owner's job is no longer queued. Surface its ambiguous
+        # result without automatically repeating a possibly completed command.
+        for status in ("claimed", "running"):
+            for record in list_jobs(redis, status=status, limit=100):
+                if redis.get("job_lock_" + str(record["id"])) is None:
+                    execute_job(redis, config, record)
         queued = list_jobs(redis, status="queued", limit=100)
         for record in reversed(queued):
             execute_job(redis, config, record)

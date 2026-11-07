@@ -72,6 +72,10 @@ isolate () {
     "${ISOLATE_PYTHON}" "${ISOLATE_CLI}" "${@}";
 }
 
+isolate-complete () {
+    "${ISOLATE_PYTHON}" "${ISOLATE_HELPER%/*}/isolate_client.py" complete "${@}";
+}
+
 deploy_lock () {
     while [ ! -d "${ISOLATE_DATA_ROOT}" ]; do
         echo "ISOLATE Git root not found: ${ISOLATE_DATA_ROOT} awaiting deploy...";

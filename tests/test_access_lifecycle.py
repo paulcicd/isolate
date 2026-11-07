@@ -25,8 +25,11 @@ class MemoryRedis:
     def get(self, key):
         return self.store.get(key)
 
-    def set(self, key, value):
+    def set(self, key, value, nx=False, ex=None):
+        if nx and key in self.store:
+            return False
         self.store[key] = value
+        return True
 
     def incr(self, key):
         value = int(self.store.get(key, 0)) + 1
@@ -73,7 +76,7 @@ class MemoryPipeline:
     def multi(self):
         pass
 
-    def set(self, key, value):
+    def set(self, key, value, **kwargs):
         self.commands.append(("set", key, value))
 
     def delete(self, key):

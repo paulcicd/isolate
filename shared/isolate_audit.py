@@ -164,6 +164,9 @@ def dispatch_audit_record(record, logging_config):
                 append_jsonl_record(sink["path"], record, sync=bool((logging_config or {}).get("sync", False)))
             elif sink_type == "syslog":
                 _send_syslog(sink, record)
+            elif sink_type == "sql":
+                from isolate_audit_index import AuditIndex
+                AuditIndex(sink).ingest(record)
             else:
                 raise AuditSinkError("unsupported audit sink type: {}".format(sink_type))
             results["sent"].append(sink_type)

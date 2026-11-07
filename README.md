@@ -1,5 +1,11 @@
 # Isolate Bastion Platform v2
 
+Optional native SSH, Web SSH and API console migration:
+[deployment guide](deploy/GATEWAY-MIGRATION.md),
+[identity and credentials](deploy/IDENTITY-CREDENTIALS.md),
+[protocol adapters](deploy/PROTOCOL-ADAPTERS.md),
+[cluster operations](deploy/CLUSTER.md).
+
 > Для быстрого локального запуска bastion, Keycloak, Redis, dashboard и пяти SSH targets используйте [Docker demo](demo/README.md).
 
 Isolate Bastion Platform v2 is an SSH bastion access layer for large Linux fleets. It keeps the familiar `s` and `g` workflow while adding modern identity, policy, audit, temporary access, and dashboard capabilities.

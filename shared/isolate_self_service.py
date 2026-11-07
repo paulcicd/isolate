@@ -194,8 +194,11 @@ def register_self_service(app, config, current_identity, csrf_token, validate_cs
 
     def connection_command(host, labels):
         command = "g {}".format(host["server_id"])
-        return '<div class="resource-command"><code>{}</code><button type="button" data-copy-command="{}" data-copied-label="{}">{}</button></div>'.format(
+        result = '<div class="resource-command"><code>{}</code><button type="button" data-copy-command="{}" data-copied-label="{}">{}</button></div>'.format(
             html.escape(command), html.escape(command, quote=True), html.escape(labels["copied"], quote=True), html.escape(labels["copy_command"]))
+        if config.get("api", {}).get("enabled") and config.get("gateway", {}).get("enabled"):
+            result += '<a class="button" href="/me/terminal/{}">Web SSH</a>'.format(urllib.parse.quote(str(host["server_id"]), safe=""))
+        return result
 
     def copy_script():
         return """<script>document.querySelectorAll('[data-copy-command]').forEach(function(button) {

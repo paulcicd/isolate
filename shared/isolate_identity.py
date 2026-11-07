@@ -6,6 +6,7 @@ import json
 import base64
 import os
 import ssl
+import threading
 import time
 import uuid
 import warnings
@@ -14,6 +15,10 @@ from urllib import error, parse, request
 
 class IdentityError(Exception):
     pass
+
+
+_JWKS_REFRESH_LOCK = threading.Lock()
+_JWKS_REFRESH_ATTEMPTS = {}
 
 
 def normalize_claims(claims):
@@ -129,12 +134,27 @@ def load_cached_identity(path=None, now=None, require_valid=True):
 
 def load_verified_identity(config, path=None, now=None):
     cache = _load_token_cache(path=path)
-    token = cache.get("id_token")
+    token_kind = (config.get("keycloak") or {}).get("token_kind", "id_token")
+    if token_kind not in ("id_token", "access_token"):
+        raise IdentityError("Keycloak token_kind must be id_token or access_token")
+    token = cache.get(token_kind)
     if not token:
         raise IdentityError("legacy or incomplete identity cache; run isolate login")
     claims = verify_jwt_claims(token, config.get("keycloak", {}), now=now)
     identity = normalize_claims(claims)
     identity["session_id"] = cache.get("session_id") or identity.get("session_id")
+    security = config.get("identity_security") or {}
+    if (security.get("backchannel_logout") or {}).get("enabled") or (security.get("introspection") or {}).get("enabled"):
+        # Import lazily to preserve login/offline CLI behavior when these
+        # optional server-side identity checks are disabled.
+        from isolate_identity_security import assert_identity_active
+        from isolate_redis import create_redis_client
+        try:
+            assert_identity_active(create_redis_client(config), config, identity, token=token, now=now)
+        except IdentityError:
+            raise
+        except Exception as exc:
+            raise IdentityError("cannot verify identity revocation state") from exc
     return identity
 
 
@@ -153,7 +173,9 @@ def verify_jwt_claims(token, keycloak_config, now=None):
     if not keycloak_config.get("verify_tokens", True):
         return decode_jwt_payload(token)
     try:
-        claims = _verify_jwt_signature(token, load_jwks(keycloak_config))
+        jwks = load_jwks(keycloak_config)
+        jwks = refresh_jwks_for_unknown_kid(token, keycloak_config, jwks)
+        claims = _verify_jwt_signature(token, jwks)
     except ImportError:
         raise IdentityError("joserfc or Authlib is required for JWT verification")
     except Exception as exc:
@@ -191,6 +213,8 @@ def _verify_jwt_signature(token, jwks):
 
 def _validate_claims(claims, keycloak_config, now=None):
     now = int(now if now is not None else time.time())
+    if "http://schemas.openid.net/event/backchannel-logout" in (claims.get("events") or {}):
+        raise IdentityError("a logout token cannot authenticate a user")
     issuer = (keycloak_config.get("issuer") or "").rstrip("/")
     if issuer and claims.get("iss") != issuer:
         raise IdentityError("invalid token issuer")
@@ -223,6 +247,40 @@ def refresh_jwks_cache(keycloak_config):
     jwks = _fetch_jwks(keycloak_config)
     _write_jwks_cache(keycloak_config.get("jwks_cache_path"), jwks)
     return jwks
+
+
+def refresh_jwks_for_unknown_kid(token, keycloak_config, jwks):
+    """Retry cached keys once for a rotated Keycloak signing key.
+
+    Only an unknown, explicit kid using an allowed asymmetric algorithm can
+    trigger refresh. Known-key bad signatures cannot force outbound requests.
+    The process-wide rate limit also bounds attacker-generated kid traffic.
+    With no on-disk cache ``load_jwks`` already fetched current keys, so it is
+    never fetched a second time here.
+    """
+    path = keycloak_config.get("jwks_cache_path")
+    if not path or not os.path.isfile(path):
+        return jwks
+    try:
+        encoded = token.split(".", 1)[0]
+        header = json.loads(base64.urlsafe_b64decode(encoded + "=" * (-len(encoded) % 4)))
+    except (AttributeError, ValueError, TypeError):
+        return jwks
+    kid = header.get("kid") if isinstance(header, dict) else None
+    if (not isinstance(kid, str) or not kid or len(kid) > 256
+            or header.get("alg") not in ("RS256", "RS384", "RS512", "ES256", "ES384", "ES512")
+            or any(key.get("kid") == kid for key in (jwks.get("keys") or []) if isinstance(key, dict))):
+        return jwks
+    key = (str(keycloak_config.get("issuer") or ""), os.path.abspath(path))
+    interval = max(5, min(300, float(keycloak_config.get("jwks_unknown_kid_refresh_seconds", 30))))
+    now = time.monotonic()
+    with _JWKS_REFRESH_LOCK:
+        previous = _JWKS_REFRESH_ATTEMPTS.get(key)
+        if previous is not None and now - previous < interval:
+            # A parallel verifier may already have refreshed the shared file.
+            return _read_jwks_cache(path, int(keycloak_config.get("jwks_cache_ttl", 3600))) or jwks
+        _JWKS_REFRESH_ATTEMPTS[key] = now
+    return refresh_jwks_cache(keycloak_config)
 
 
 def _read_jwks_cache(path, ttl):
@@ -333,11 +391,22 @@ class KeycloakDeviceClient(object):
         self.poll_timeout = int(self.config.get("poll_timeout", 300))
         self.tls_verify = bool(self.config.get("tls_verify", True))
 
-    def start(self):
+    def start(self, acr_values=None, max_age=None):
         payload = {
             "client_id": self.client_id,
             "scope": " ".join(self.scopes),
         }
+        # These request an IdP-specific device-flow step-up policy. Resource
+        # authorization still checks the resulting signed acr/auth_time claims;
+        # sending a request parameter never proves that MFA actually happened.
+        if acr_values is not None:
+            if not isinstance(acr_values, (list, tuple)) or not all(isinstance(value, str) and value for value in acr_values):
+                raise IdentityError("acr_values must be a list of nonempty strings")
+            payload["acr_values"] = " ".join(acr_values)
+        if max_age is not None:
+            if isinstance(max_age, bool) or not isinstance(max_age, int) or max_age < 0:
+                raise IdentityError("max_age must be a nonnegative integer")
+            payload["max_age"] = max_age
         if self.client_secret:
             payload["client_secret"] = self.client_secret
         return self._post(self.device_endpoint, payload)
@@ -410,7 +479,8 @@ class KeycloakDeviceClient(object):
         if not self.tls_verify:
             context = ssl._create_unverified_context()
         try:
-            with request.urlopen(req, timeout=15, context=context) as resp:
+            timeout = max(1, min(60, float(self.config.get("http_read_timeout", 15))))
+            with request.urlopen(req, timeout=timeout, context=context) as resp:
                 return json.loads(resp.read().decode("utf-8"))
         except error.HTTPError as exc:
             if allow_error:

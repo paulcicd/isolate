@@ -9,7 +9,7 @@ import ipaddress
 from isolate_redis import create_redis_client
 
 
-SUPPORTED_AUDIT_SINKS = {"jsonl", "syslog"}
+SUPPORTED_AUDIT_SINKS = {"jsonl", "syslog", "sql"}
 
 
 def validate_config(config, check_paths=False):
@@ -434,6 +434,10 @@ def validate_config(config, check_paths=False):
     if backup.get("redis_patterns") is not None and not isinstance(backup.get("redis_patterns"), list):
         errors.append("backup.redis_patterns must be a list")
 
+    from isolate_runtime_config import validate_runtime_config
+    runtime_validation = validate_runtime_config(config, check_paths)
+    errors.extend(runtime_validation["errors"])
+    warnings.extend(runtime_validation["warnings"])
     return {"valid": not errors, "errors": errors, "warnings": warnings}
 
 

@@ -1,0 +1,74 @@
+name: isolate-gateway-integration
+
+x-runner: &runner
+  build:
+    context: ../../..
+    dockerfile: tests/integration/gateway/Dockerfile
+  volumes:
+    - ../../..:/opt/auth:ro
+    - gateway-fixtures:/fixtures
+
+services:
+  fixtures:
+    <<: *runner
+    command: [python3, /opt/auth/tests/integration/gateway/prepare.py]
+    restart: 'no'
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.7.3
+    command:
+      - start-dev
+      - --import-realm
+      - --http-enabled=false
+      - --https-port=8443
+      - --hostname=https://keycloak:8443
+      - --hostname-strict=false
+      - --https-certificate-file=/fixtures/keycloak.pem
+      - --https-certificate-key-file=/fixtures/keycloak.key
+      - --truststore-paths=/fixtures/ca.pem
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: integration-admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: isolated-integration-admin-password
+      JAVA_OPTS_KC_HEAP: -Xms128m -Xmx512m
+    volumes:
+      - gateway-fixtures:/fixtures:ro
+      - gateway-fixtures:/opt/keycloak/data/import:ro
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, 'yes']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: isolate_test
+      POSTGRES_PASSWORD: isolated-integration-database-password
+      POSTGRES_DB: isolate_test
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U isolate_test]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  runner:
+    <<: *runner
+    environment:
+      REQUESTS_CA_BUNDLE: /fixtures/ca.pem
+      SSL_CERT_FILE: /fixtures/ca.pem
+      NO_PROXY: '*'
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+      keycloak:
+        condition: service_started
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
+volumes:
+  gateway-fixtures:

@@ -11,7 +11,7 @@ _project_zsh () {
     # project complete
     local -a _1st_arguments
     _1st_arguments=(
-        $(isolate-redis-cli get "projects_list")
+        $(isolate-complete 2>/dev/null)
         )
 
     _arguments '*:: :->subcmds' && return 0

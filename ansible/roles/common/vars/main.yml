@@ -1,4 +1,5 @@
 common_utils_yum:
+  - acl
   - lftp
   - acpid
   - atop
@@ -63,6 +64,7 @@ common_utils_yum:
   - pwgen
 
 common_utils_apt:
+  - acl
   - aptitude
   - acpid # for proper shutdown on KVM vms
   - man

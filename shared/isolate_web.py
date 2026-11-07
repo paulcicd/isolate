@@ -835,6 +835,8 @@ def _html(title, body, config=None, notice=None):
     if has_permission(identity, config or {}, "sessions.approve") or has_permission(identity, config or {}, "sessions.read"):
         admin_nav += '<a class="nav-link" href="/session-approvals">{}</a>'.format("Согласования сессий" if locale == "ru" else "Session approvals")
     portal_nav += '<a class="nav-link" href="/me/session-approvals">{}</a>'.format("Мои согласования" if locale == "ru" else "My approvals")
+    if (config or {}).get("api", {}).get("enabled") and (config or {}).get("audit_index", {}).get("enabled"):
+        portal_nav += '<a class="nav-link" href="/audit/search">{}</a>'.format("Поиск по аудиту" if locale == "ru" else "Audit search")
     rendered = """<!doctype html>
 <html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
 <script>{theme_bootstrap_script}</script>
@@ -1169,6 +1171,9 @@ def create_app(config=None):
     @app.after_request
     def attach_request_id(response):
         response.headers["X-Request-ID"] = g.request_id
+        if request.path.startswith("/api/") or request.path.startswith("/me/terminal/"):
+            response.headers["Cache-Control"] = "no-store"
+            response.headers["X-Content-Type-Options"] = "nosniff"
         return response
 
     @app.errorhandler(500)
@@ -1198,7 +1203,28 @@ def create_app(config=None):
         if identity.get("exp") and int(identity["exp"]) <= int(time.time()):
             session.clear()
             return None
+        security = config.get("identity_security", {})
+        if security.get("backchannel_logout", {}).get("enabled") or security.get("introspection", {}).get("enabled"):
+            from isolate_identity_security import assert_identity_active
+            from isolate_identity import IdentityError
+            try:
+                assert_identity_active(redis_client(config), config, identity, token=browser_token())
+            except IdentityError:
+                session.clear()
+                return None
         return identity
+
+    def browser_token():
+        key = session.get("runtime_session")
+        if not key:
+            return None
+        value = redis_client(config).get("isolate_browser_" + key)
+        if not value:
+            return None
+        record = json.loads(value)
+        if record.get("sub") != (session.get("identity") or {}).get("keycloak_sub"):
+            return None
+        return record.get("token")
 
     def require_admin():
         identity = current_identity()
@@ -1248,6 +1274,9 @@ def create_app(config=None):
             token = secrets.token_urlsafe(32)
             session["csrf_token"] = token
         return token
+
+    from isolate_api import register_api_routes
+    register_api_routes(app, config, lambda cfg: redis_client(cfg), current_identity, csrf_token, browser_token)
 
     def validate_csrf():
         expected = session.get("csrf_token")
@@ -1394,7 +1423,13 @@ def create_app(config=None):
     def login():
         redirect_uri = config.get("dashboard", {}).get("public_url", "").rstrip("/") + url_for("callback")
         try:
-            return oauth.keycloak.authorize_redirect(redirect_uri)
+            options = {}
+            if request.args.get("step_up") == "true":
+                step_up = config.get("identity_security", {}).get("step_up", {})
+                if step_up.get("enabled"):
+                    options = {"acr_values": " ".join(step_up.get("acr_values") or []),
+                               "max_age": int(step_up.get("max_age_seconds", 300)), "prompt": "login"}
+            return oauth.keycloak.authorize_redirect(redirect_uri, **options)
         except RequestException as exc:
             return identity_provider_unavailable(exc)
 
@@ -1420,12 +1455,28 @@ def create_app(config=None):
         identity = normalize_claims(claims)
         if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config) and not role_names(identity, config):
             abort(403)
+        return_to = session.get("return_to")
         session.clear()
         session["identity"] = identity
+        # Flask cookies are signed, not encrypted. Keep bearer credentials only
+        # in the private server-side store, keyed by an opaque session handle.
+        if config.get("api", {}).get("enabled") or config.get("identity_security", {}).get("introspection", {}).get("enabled"):
+            kind = config.get("keycloak", {}).get("token_kind", "id_token")
+            bearer_token = token.get(kind)
+            if bearer_token and identity.get("exp"):
+                handle = secrets.token_urlsafe(32)
+                redis_client(config).set("isolate_browser_" + handle, json.dumps({"token": bearer_token, "sub": identity.get("keycloak_sub")}),
+                                        ex=max(1, int(identity["exp"]) - int(time.time())))
+                session["runtime_session"] = handle
+        if isinstance(return_to, str) and re.fullmatch(r"/me/terminal/[0-9]{1,20}", return_to):
+            return redirect(return_to)
         return redirect(url_for("index") if is_dashboard_admin(identity, config) else "/me")
 
     @app.route("/logout")
     def logout():
+        handle = session.get("runtime_session")
+        if handle:
+            redis_client(config).delete("isolate_browser_" + handle)
         session.clear()
         return redirect(url_for("login"))
 
@@ -1532,12 +1583,14 @@ def create_app(config=None):
             host=request.args.get("host") or None,
             job_type=request.args.get("type") or None,
         )[: int(config.get("dashboard", {}).get("jobs_max_results") or 250)]
-        status_counts = {name: sum(1 for row in all_jobs if row.get("status") == name) for name in ("queued", "running", "completed", "failed")}
+        status_counts = {name: sum(1 for row in all_jobs if row.get("status") == name) for name in ("queued", "claimed", "running", "recovery_required", "completed", "failed")}
         body = """<h1>Jobs &amp; Runbooks</h1>
 <p class="page-lead">Queue policy-authorized diagnostics, monitor execution, inspect output, and retry failed hosts.</p>
 <div class="summary-list">
 <div class="summary-item"><strong>{queued}</strong><span class="muted">queued</span></div>
 <div class="summary-item"><strong>{running}</strong><span class="muted">running</span></div>
+<div class="summary-item"><strong>{claimed}</strong><span class="muted">claimed</span></div>
+<div class="summary-item"><strong>{recovery_required}</strong><span class="muted">recovery required</span></div>
 <div class="summary-item"><strong>{completed}</strong><span class="muted">completed</span></div>
 <div class="summary-item"><strong>{failed}</strong><span class="muted">failed</span></div>
 </div>""".format(**status_counts)
@@ -1576,8 +1629,9 @@ def create_app(config=None):
                 row["progress"] = '<div class="progress" title="{percent}%"><span style="width:{percent}%"></span></div><small>{finished}/{total} finished</small>'.format(
                     percent=int(fleet["progress_percent"]), finished=fleet["finished"], total=fleet["total"]
                 )
-                row["counts"] = "ok={} failed={} running={} queued={}".format(
-                    fleet["completed"], fleet["failed"] + fleet["timed_out"], fleet["running"], fleet["queued"]
+                row["counts"] = "ok={} failed={} running={} queued={} claimed={} recovery={}".format(
+                    fleet["completed"], fleet["failed"] + fleet["timed_out"], fleet["running"], fleet["queued"],
+                    fleet["claimed"], fleet["recovery_required"]
                 )
                 if fleet["failed_job_ids"]:
                     row["actions"] = """<form class="inline" method="post"><input type="hidden" name="csrf_token" value="{token}"><input type="hidden" name="action" value="retry_fleet"><input type="hidden" name="fleet_id" value="{fleet_id}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button class="button-secondary">Retry failed</button></form>""".format(
@@ -1593,7 +1647,7 @@ def create_app(config=None):
 <select name="status"><option value="">all statuses</option>{status_options}</select>
 <select name="type"><option value="">all types</option><option value="runbook">runbook</option><option value="remote-command">remote command</option></select>
 <input name="user" value="{user}" placeholder="user"><input name="project" value="{project}" placeholder="project"><input name="host" value="{host}" placeholder="host id"><button>Filter</button></form>""".format(
-            status_options="".join('<option value="{0}">{0}</option>'.format(value) for value in ("queued", "running", "completed", "failed", "cancelled", "timed_out")),
+            status_options="".join('<option value="{0}">{0}</option>'.format(value) for value in ("queued", "claimed", "running", "recovery_required", "completed", "failed", "cancelled", "timed_out")),
             user=html.escape(request.args.get("user", "")), project=html.escape(request.args.get("project", "")), host=html.escape(request.args.get("host", "")),
         )
         job_rows = []
@@ -1645,7 +1699,9 @@ def create_app(config=None):
             error=html.escape(str(job.get("error") or "")), fleet=html.escape(str(job.get("fleet_id") or "single")),
             attempt=html.escape(str(job.get("attempt") or 1)),
         )
-        if job.get("status") in ("queued", "running"):
+        if job.get("status") == "recovery_required":
+            body += '<div class="notice warning">The remote outcome is unknown. Inspect the target before submitting a new job. Automatic retry is disabled.</div>'
+        if job.get("status") in ("queued", "claimed", "running"):
             body += """<form class="inline" method="post" action="/job/{}/cancel"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button class="button-danger">Cancel job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))
         if job.get("status") in ("failed", "timed_out"):
             body += """<form class="inline" method="post" action="/job/{}/retry"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Retry job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))

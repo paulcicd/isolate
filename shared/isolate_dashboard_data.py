@@ -88,7 +88,9 @@ def fleet_progress(jobs):
                 "created_at": job.get("created_at"),
                 "total": 0,
                 "queued": 0,
+                "claimed": 0,
                 "running": 0,
+                "recovery_required": 0,
                 "completed": 0,
                 "failed": 0,
                 "cancelled": 0,
@@ -113,8 +115,12 @@ def fleet_progress(jobs):
         done = sum(fleet[name] for name in FINAL_JOB_STATUSES)
         fleet["finished"] = done
         fleet["progress_percent"] = int((done * 100) / fleet["total"]) if fleet["total"] else 0
-        if fleet["running"]:
+        if fleet["recovery_required"]:
+            fleet["status"] = "recovery_required"
+        elif fleet["running"]:
             fleet["status"] = "running"
+        elif fleet["claimed"]:
+            fleet["status"] = "claimed"
         elif fleet["queued"]:
             fleet["status"] = "queued"
         elif fleet["failed"] or fleet["timed_out"]:
@@ -263,15 +269,15 @@ def collect_alerts(redis, config, status=None, kind=None, user=None, project=Non
             }))
 
     for job in list_jobs(redis, limit=10000):
-        if job.get("status") not in FAILED_JOB_STATUSES:
+        if job.get("status") not in FAILED_JOB_STATUSES + ("recovery_required",):
             continue
         alerts.append(_apply_alert_state(redis, {
             "id": _alert_id("failed_job", "job", job.get("id")),
-            "kind": "failed_job",
+            "kind": "job_recovery_required" if job.get("status") == "recovery_required" else "failed_job",
             "source_type": "job",
             "source_id": str(job.get("id")),
-            "severity": "high" if job.get("status") == "failed" else "medium",
-            "title": "{} job {}".format(job.get("status", "failed").title(), job.get("id")),
+            "severity": "high" if job.get("status") in ("failed", "recovery_required") else "medium",
+            "title": "{} job {}".format(job.get("status", "failed").replace("_", " ").title(), job.get("id")),
             "username": job.get("username"),
             "project": job.get("project"),
             "host_id": str(job.get("host_id") or ""),

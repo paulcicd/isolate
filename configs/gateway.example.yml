@@ -1,0 +1,53 @@
+# Merge with trusted production config; do not replace current identity/policy.
+keycloak:
+  issuer: https://identity.example.org/realms/company
+  client_id: isolate-bastion
+  expected_audience: isolate-bastion
+  token_kind: id_token
+  verify_tokens: true
+  tls_verify: true
+api:
+  enabled: true
+  ticket_ttl: 60
+  bind_ticket_ip: false
+gateway:
+  enabled: true
+  listen_host: 0.0.0.0
+  ssh_port: 2222
+  public_ssh_host: bastion.example.org
+  host_key_file: /opt/auth/keys/gateway_ed25519
+  known_hosts: /opt/auth/known_hosts
+  web_host: 127.0.0.1
+  web_port: 8092
+  public_web_url: https://bastion.example.org/gateway
+  allowed_origins: [https://bastion.example.org]
+  max_connections: 100
+  recheck_interval: 2
+credentials:
+  default: legacy
+  known_hosts: /opt/auth/known_hosts
+  targets: {}
+  providers: {}
+cluster:
+  node_id: gateway-01
+  draining: false
+  lease_ttl: 30
+  node_ttl: 30
+identity_security:
+  backchannel_logout:
+    enabled: false
+    max_token_lifetime_seconds: 86400
+  introspection:
+    enabled: false
+  step_up:
+    enabled: false
+    require_privileged: true
+    acr_values: ['2']
+    max_age_seconds: 300
+audit_index:
+  enabled: false
+  driver: postgresql
+  dsn_file: /opt/auth/keys/audit_postgres.dsn
+protocols:
+  enabled: false
+  targets: {}

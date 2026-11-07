@@ -4,6 +4,7 @@
 
 import json
 import os
+import copy
 
 try:
     import yaml
@@ -18,6 +19,25 @@ DEFAULT_CONFIG_PATHS = (
 
 DEFAULT_CONFIG = {
     "schema_version": 2,
+    "api": {"enabled": False, "client_url": None, "ticket_ttl": 60, "bind_ticket_ip": False},
+    "gateway": {
+        "enabled": False, "listen_host": "127.0.0.1", "ssh_port": 2222,
+        "web_host": "127.0.0.1", "web_port": 8092,
+        "host_key_file": "/opt/auth/keys/gateway_ed25519", "known_hosts": "/opt/auth/known_hosts",
+        "public_ssh_host": None, "public_web_url": None, "allowed_origins": [],
+        "max_connections": 100, "recheck_interval": 2,
+    },
+    "identity_security": {
+        "backchannel_logout": {"enabled": False, "max_logout_age_seconds": 300, "max_token_lifetime_seconds": 86400},
+        "introspection": {"enabled": False},
+        "step_up": {"enabled": False, "require_privileged": True, "all_connections": False,
+                    "required_projects": [], "required_project_globs": [], "acr_values": [],
+                    "required_amr": [], "max_age_seconds": 300},
+    },
+    "credentials": {"default": "legacy", "targets": {}, "providers": {}, "known_hosts": None},
+    "protocols": {"enabled": False, "targets": {}},
+    "audit_index": {"enabled": False, "driver": "sqlite", "path": "/opt/auth/spool/audit.sqlite3"},
+    "cluster": {"node_id": None, "draining": False, "lease_ttl": 30, "node_ttl": 30},
     "connection_authorization": {
         "connections_enabled": True,
         "require_explicit_mapping": False,
@@ -287,6 +307,7 @@ DEFAULT_CONFIG = {
             "project_set_*",
             "access_request_*",
             "session_approval_*",
+            "identity_revocation_*",
             "active_session_*",
             "job_*",
             "dashboard_alert_state_*",
@@ -328,7 +349,7 @@ def _load_file(path):
 
 def load_config(path=None, use_env=True):
     """Load config from env/file and merge it with v2 defaults."""
-    config = DEFAULT_CONFIG
+    config = copy.deepcopy(DEFAULT_CONFIG)
     config_path = path or (os.getenv("ISOLATE_CONFIG") if use_env else None)
     if config_path:
         if os.path.exists(config_path):
@@ -365,6 +386,7 @@ def load_config(path=None, use_env=True):
             {"path": "/etc/systemd/system/isolate-backup.timer", "required": False},
             {"path": "/etc/systemd/system/isolate-mcp.service", "required": False},
             {"path": "/etc/systemd/system/isolate-job-worker.service", "required": False},
+            {"path": "/etc/systemd/system/isolate-gateway.service", "required": False},
             {"path": "/etc/systemd/system/isolate-policy-sync.service", "required": False},
             {"path": "/etc/systemd/system/isolate-policy-sync.timer", "required": False},
             {"path": "/etc/default/isolate-mcp", "required": False},

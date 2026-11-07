@@ -52,7 +52,7 @@ def trusted_config():
     raise ConnectionDenied("trusted wrapper configuration is missing")
 
 
-def prepare_authorization_file():
+def prepare_authorization_file(config=None):
     """Pass bearer tokens without exposing them in argv or relaxing home permissions.
 
     The sudo wrapper reads the caller-owned file through a service-UID ACL. Shell
@@ -60,14 +60,15 @@ def prepare_authorization_file():
     """
     import pwd
     cache = _load_token_cache()
-    if not cache.get("id_token"):
+    kind = (config or {}).get("keycloak", {}).get("token_kind", "id_token")
+    if not cache.get(kind):
         raise IdentityError("run isolate login before connecting")
     fd, path = tempfile.mkstemp(prefix="isolate-authorization-{}-".format(os.getuid()), dir="/tmp")
     try:
         os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as output:
             fd = None
-            json.dump({"id_token": cache["id_token"]}, output)
+            json.dump({"id_token": cache[kind]}, output)
         # Grant only the service UID read access, not every member of group auth.
         subprocess.run(["/usr/bin/setfacl", "-m", "u:{}:r--".format(pwd.getpwnam("auth").pw_uid), path],
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -152,6 +153,8 @@ def authorize_connection(args, token, config, redis, username, now=None):
     if ports and port not in ports:
         raise ConnectionDenied("target port is not permitted")
     decision = policy_for_host(redis, config, identity, host)
+    from isolate_identity_security import assert_identity_active
+    assert_identity_active(redis, config, identity, token=token, host=host, decision=decision)
     sudo_mode = decision.get("sudo_mode") or "none"
     if sudo_mode not in ("none", "sudo-i"):
         raise ConnectionDenied("unsupported sudo mode")

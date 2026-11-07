@@ -357,7 +357,7 @@ class ServerConnection(object):
         # Unknown helper arguments must never become wrapper identity/target options.
         allowed = [arg for arg in self.helper.config.get("ssh", {}).get("allowed_extra_args", []) if arg != "-A"]
         extras = filter_extra_args(self.unknown_args, allowed + ["--debug"])
-        authorization_file = prepare_authorization_file()
+        authorization_file = prepare_authorization_file(self.helper.config) if self.helper.config.get("keycloak", {}).get("token_kind") else prepare_authorization_file()
         self.ssh_wrapper_argv.extend(['--authorization-file', authorization_file])
         self.session_exports.append('ISOLATE_AUTHORIZATION_FILE={};'.format(shlex.quote(authorization_file)))
 
@@ -926,6 +926,14 @@ class AuthHelper(object):
 
 def main():
     args, unknown_args = init_args()
+    config = load_config()
+    if config.get("api", {}).get("client_url") and args.action[0] != "cron":
+        from isolate_client import ClientError, console
+        try:
+            return console(args, unknown_args, config)
+        except (ClientError, IdentityError, OSError) as exc:
+            print("Isolate: {}".format(exc), file=sys.stderr)
+            return 2
     helper = AuthHelper(args, unknown_args)
 
     conn = ServerConnection(helper=helper, unknown_args=unknown_args)
@@ -1055,4 +1063,4 @@ def main():
     LOGGER.debug('run time: ' + str(done_delta) + ' sec')
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

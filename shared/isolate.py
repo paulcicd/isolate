@@ -564,7 +564,7 @@ def _require_platform_admin(config):
 
 def authorize_cli_command(args, config):
     """Restrict the CLI as well as the dashboard; Redis credentials are privileged."""
-    public_functions = {cmd_login, cmd_logout, cmd_whoami, cmd_history, cmd_access_request,
+    public_functions = {cmd_login, cmd_logout, cmd_whoami, cmd_history, cmd_access_request, cmd_connect,
                         cmd_access_list, cmd_access_show, cmd_access_comment, cmd_access_repeat,
                         cmd_access_cancel, cmd_access_renew, cmd_job_list, cmd_job_show,
                         cmd_job_output, cmd_job_cancel, cmd_job_retry, cmd_runbook,
@@ -1027,23 +1027,25 @@ def cmd_logout(args, config):
 def cmd_login(args, config):
     client = KeycloakDeviceClient(config["keycloak"])
     try:
-        device = client.start()
+        options = {}
+        if getattr(args, "step_up", False):
+            step = config.get("identity_security", {}).get("step_up", {})
+            options = {"acr_values": step.get("acr_values") or [], "max_age": int(step.get("max_age_seconds", 300))}
+        device = client.start(**options)
         url = device.get("verification_uri_complete") or device.get("verification_uri")
         print("Open this URL to authorize Isolate:")
         print(url)
         if device.get("user_code"):
             print("Code: {}".format(device["user_code"]))
         tokens = client.poll(device["device_code"], interval=int(device.get("interval", 5)))
-        claims = {}
-        if tokens.get("access_token"):
-            introspected = client.introspect(tokens["access_token"])
-            if introspected:
-                claims.update(introspected)
-        if tokens.get("id_token"):
-            claims.update(decode_jwt_payload(tokens["id_token"]))
+        from isolate_identity import verify_jwt_claims
+        kind = config.get("keycloak", {}).get("token_kind", "id_token")
+        if not tokens.get(kind):
+            raise IdentityError("Keycloak did not issue the configured token kind")
+        claims = verify_jwt_claims(tokens[kind], config["keycloak"])
         identity = normalize_claims(claims)
         save_token_cache(tokens, identity)
-        print(json.dumps(identity, indent=2, sort_keys=True))
+        print(json.dumps({key: identity.get(key) for key in ("username", "keycloak_sub", "groups", "exp")}, indent=2, sort_keys=True))
     except IdentityError as exc:
         print("isolate login failed: {}".format(exc), file=sys.stderr)
         return 2
@@ -2196,12 +2198,27 @@ def cmd_runbook(args, config):
         return 2
 
 
+def cmd_connect(args, config):
+    import asyncio
+    from isolate_client import ClientError, connect
+    try:
+        return asyncio.run(connect(config, args.host_id, args.command))
+    except (IdentityError, ClientError, OSError, ValueError) as exc:
+        print("Connection denied: {}".format(exc), file=sys.stderr)
+        return 2
+
+
 def build_parser():
     parser = argparse.ArgumentParser(prog="isolate")
     sub = parser.add_subparsers(dest="command", required=True)
 
     login = sub.add_parser("login")
+    login.add_argument("--step-up", action="store_true", help="request fresh Keycloak authentication at the configured assurance level")
     login.set_defaults(func=cmd_login)
+    connect_parser = sub.add_parser("connect", help="connect through the authenticated native SSH gateway")
+    connect_parser.add_argument("host_id")
+    connect_parser.add_argument("--command", help="execute one command instead of opening an interactive terminal")
+    connect_parser.set_defaults(func=cmd_connect)
 
     whoami = sub.add_parser("whoami")
     whoami.set_defaults(func=cmd_whoami)
@@ -2555,7 +2572,7 @@ def build_parser():
     job_sub = job.add_subparsers(dest="job_command", required=True)
     job_list = job_sub.add_parser("list")
     job_list.add_argument("--user")
-    job_list.add_argument("--status", choices=["queued", "running", "completed", "failed", "cancelled", "timed_out"])
+    job_list.add_argument("--status", choices=["queued", "claimed", "running", "recovery_required", "completed", "failed", "cancelled", "timed_out"])
     job_list.add_argument("--limit", type=int, default=50)
     job_list.add_argument("--json", action="store_true")
     job_list.set_defaults(func=cmd_job_list)
@@ -2766,6 +2783,23 @@ def main():
     parser = build_parser()
     args = parser.parse_args()
     config = load_config()
+    if config.get("api", {}).get("client_url") and args.func in (cmd_history, cmd_whoami):
+        from isolate_client import APIClient, ClientError
+        try:
+            client = APIClient(config)
+            if args.func == cmd_whoami:
+                print(json.dumps(client.call("/api/v1/me"), indent=2, sort_keys=True))
+                return 0
+            import urllib.parse
+            values = {key: getattr(args, key, None) for key in ("query", "project", "host", "limit", "since", "until", "result")}
+            if getattr(args, "user", None):
+                raise ClientError("API console history is scoped to the signed identity")
+            rows = client.call("/api/v1/history?" + urllib.parse.urlencode({k: v for k, v in values.items() if v is not None}))["history"]
+            print(json.dumps(rows, indent=2, sort_keys=True) if getattr(args, "json", False) else format_history_table(rows))
+            return 0
+        except (ClientError, IdentityError, ValueError) as exc:
+            print("Isolate: {}".format(exc), file=sys.stderr)
+            return 2
     try:
         authorize_cli_command(args, config)
     except (AccessDenied, IdentityError) as exc:
