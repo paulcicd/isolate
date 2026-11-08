@@ -1025,8 +1025,10 @@ def cmd_logout(args, config):
 
 
 def cmd_login(args, config):
-    client = KeycloakDeviceClient(config["keycloak"])
     try:
+        from isolate_oidc import identity_provider_config
+        provider = identity_provider_config(config)
+        client = KeycloakDeviceClient(provider)
         options = {}
         if getattr(args, "step_up", False):
             step = config.get("identity_security", {}).get("step_up", {})
@@ -1039,11 +1041,17 @@ def cmd_login(args, config):
             print("Code: {}".format(device["user_code"]))
         tokens = client.poll(device["device_code"], interval=int(device.get("interval", 5)))
         from isolate_identity import verify_jwt_claims
-        kind = config.get("keycloak", {}).get("token_kind", "id_token")
+        kind = provider.get("token_kind", "id_token")
         if not tokens.get(kind):
-            raise IdentityError("Keycloak did not issue the configured token kind")
-        claims = verify_jwt_claims(tokens[kind], config["keycloak"])
-        identity = normalize_claims(claims)
+            raise IdentityError("Identity provider did not issue the configured token kind")
+        claims = verify_jwt_claims(tokens[kind], provider)
+        identity = normalize_claims(claims, provider)
+        if config.get("api", {}).get("client_url"):
+            from isolate_client import verify_client_identity
+            identity = verify_client_identity(config, tokens[kind], identity)
+        elif provider["provider"] == "oidc":
+            from isolate_identity_binding import ensure_provider_binding
+            ensure_provider_binding(config, redis_client(config))
         save_token_cache(tokens, identity)
         print(json.dumps({key: identity.get(key) for key in ("username", "keycloak_sub", "groups", "exp")}, indent=2, sort_keys=True))
     except IdentityError as exc:
@@ -1052,6 +1060,8 @@ def cmd_login(args, config):
 
 
 def _subject_from_args(args):
+    if getattr(args, "service", None):
+        return "service", args.service
     if getattr(args, "user", None):
         return "user", args.user
     if getattr(args, "group", None):
@@ -1534,10 +1544,10 @@ def _export_rows(kind, args, config):
     if kind == "grants":
         return list_grant_records(redis, project=args.project)
     if kind == "users":
-        return list_user_profiles(config["logging"]["base_path"])
+        return list_user_profiles(config["logging"]["base_path"], archive_config=config, state_client=redis)
     if kind == "history":
         return read_history(
-            config["logging"]["base_path"], identity, query=args.query, user=args.user, project=args.project,
+            config["logging"]["base_path"], identity, archive_config=config, state_client=redis, query=args.query, user=args.user, project=args.project,
             host=args.host, limit=min(args.limit, int(config.get("history", {}).get("max_limit", 100))),
             admin_groups=identity.get("groups") if identity.get("_local_root") else config.get("history", {}).get("admin_groups") or config.get("dashboard", {}).get("admin_groups") or [],
             permission_config=None if identity.get("_local_root") else config,
@@ -1577,7 +1587,7 @@ def cmd_user_activity(args, config):
         return 2
     redis = redis_client(config)
     result = user_activity_summary(
-        config["logging"]["base_path"], username, limit=args.limit,
+        config["logging"]["base_path"], username, limit=args.limit, archive_config=config, state_client=redis,
         active_sessions=list_active_sessions(redis), grants=list_grant_records(redis),
         access_requests=list_access_requests(redis),
     )
@@ -1674,6 +1684,7 @@ def cmd_history(args, config):
         rows = read_history(
             config["logging"]["base_path"],
             identity,
+            archive_config=config,
             query=args.query,
             user=args.user,
             project=args.project,
@@ -1976,17 +1987,20 @@ def cmd_command_log_append(args, config):
 
 def cmd_jwks_refresh(args, config):
     try:
-        jwks = refresh_jwks_cache(config.get("keycloak", {}))
+        from isolate_oidc import identity_provider_config
+        provider = identity_provider_config(config)
+        jwks = refresh_jwks_cache(provider)
     except IdentityError as exc:
         print("jwks refresh failed: {}".format(exc), file=sys.stderr)
         return 2
-    print(json.dumps({"keys": len(jwks.get("keys") or []), "cache_path": config.get("keycloak", {}).get("jwks_cache_path")}, indent=2, sort_keys=True))
+    print(json.dumps({"keys": len(jwks.get("keys") or []), "cache_path": provider.get("jwks_cache_path")}, indent=2, sort_keys=True))
 
 
 def _job_context():
     """Bind operational CLI calls to root-managed configuration and the Unix user."""
     from isolate_connection_auth import ConnectionDenied, bind_identity, trusted_config
     from isolate_identity import _load_token_cache
+    from isolate_oidc import identity_provider_config
 
     try:
         if os.name != "posix":
@@ -1995,10 +2009,22 @@ def _job_context():
         import pwd
 
         username = pwd.getpwuid(os.getuid()).pw_name
-        identity = bind_identity(_load_token_cache().get("id_token"), config, username)
+        token = _load_token_cache().get(identity_provider_config(config).get("token_kind", "id_token"))
+        identity = bind_identity(token, config, username, redis=redis_client(config))
     except (ConnectionDenied, OSError) as exc:
         raise AccessDenied(str(exc)) from exc
     return config, identity
+
+
+def _delegation_options(config):
+    if not config.get("identity_security", {}).get("delegation", {}).get("enabled"):
+        return {}
+    from isolate_identity import _load_token_cache
+    from isolate_oidc import identity_provider_config
+    token = _load_token_cache().get(identity_provider_config(config).get("token_kind", "id_token"))
+    if not token:
+        raise IdentityError("verified credentials are required for job delegation")
+    return {"token": token}
 
 
 def _job_admin(identity, config):
@@ -2109,9 +2135,9 @@ def cmd_job_retry(args, config):
         if not args.yes:
             raise JobError("explicit --yes is required to retry a job")
         if _owns_job(original, identity):
-            record = retry_job(redis, config, args.id, identity, current_identity=identity)
+            record = retry_job(redis, config, args.id, identity, current_identity=identity, **_delegation_options(config))
         else:
-            record = retry_job(redis, config, args.id, identity)
+            record = retry_job(redis, config, args.id, identity, **_delegation_options(config))
         print(json.dumps(record, indent=2, sort_keys=True))
     except (IdentityError, AccessDenied, JobError, ValueError, AuditSinkError) as exc:
         print("job retry failed: {}".format(exc), file=sys.stderr)
@@ -2181,7 +2207,7 @@ def cmd_runbook(args, config):
             raise JobError("timeout is outside the configured range")
         if args.runbook_command == "preview":
             rendered, planned, _ = _runbook_submission_plan(redis, config, identity, args.runbook, host_ids,
-                                                            parameters=parameters, timeout=args.timeout)
+                                                            parameters=parameters, timeout=args.timeout, **_delegation_options(config))
             print(json.dumps({"runbook": rendered["runbook"]["id"], "command": rendered["command"],
                               "parameters": rendered["parameters"], "count": len(planned),
                               "hosts": [{"host_id": str(host["server_id"]), "project": host.get("project_name"),
@@ -2191,7 +2217,7 @@ def cmd_runbook(args, config):
             if not args.yes:
                 raise JobError("explicit --yes is required; use runbook preview to inspect the fleet")
             result = create_runbook_fleet(redis, config, identity, args.runbook, host_ids,
-                                          parameters=parameters, timeout=args.timeout, confirmed=True)
+                                          parameters=parameters, timeout=args.timeout, confirmed=True, **_delegation_options(config))
             print(json.dumps(result, indent=2, sort_keys=True))
     except (IdentityError, AccessDenied, JobError, RunbookError, HostValidationError, ValueError, AuditSinkError) as exc:
         print("runbook {} failed: {}".format(args.runbook_command, exc), file=sys.stderr)
@@ -2213,7 +2239,7 @@ def build_parser():
     sub = parser.add_subparsers(dest="command", required=True)
 
     login = sub.add_parser("login")
-    login.add_argument("--step-up", action="store_true", help="request fresh Keycloak authentication at the configured assurance level")
+    login.add_argument("--step-up", action="store_true", help="request fresh OIDC authentication at the configured assurance level")
     login.set_defaults(func=cmd_login)
     connect_parser = sub.add_parser("connect", help="connect through the authenticated native SSH gateway")
     connect_parser.add_argument("host_id")
@@ -2382,6 +2408,7 @@ def build_parser():
     subject = grant_add.add_mutually_exclusive_group(required=True)
     subject.add_argument("--user")
     subject.add_argument("--group")
+    subject.add_argument("--service", help="Keycloak workload client ID; grants never match human identities")
     selector = grant_add.add_mutually_exclusive_group(required=True)
     selector.add_argument("--project")
     selector.add_argument("--project-glob")
@@ -2397,6 +2424,7 @@ def build_parser():
     revoke_subject = grant_revoke.add_mutually_exclusive_group()
     revoke_subject.add_argument("--user")
     revoke_subject.add_argument("--group")
+    revoke_subject.add_argument("--service")
     grant_revoke.add_argument("--project")
     grant_revoke.add_argument("--project-glob")
     grant_revoke.add_argument("--project-set")

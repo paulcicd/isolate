@@ -19,6 +19,16 @@ DEFAULT_CONFIG_PATHS = (
 
 DEFAULT_CONFIG = {
     "schema_version": 2,
+    "state": {"backend": "redis", "migration_guard": True, "require_tls": True, "dsn_file": None, "sqlite_path": None},
+    "recordings": {
+        "enabled": False, "backend": "s3", "bucket": None, "prefix": "isolate",
+        "capture_path": "/opt/auth/spool/evidence",
+        "endpoint_url": None, "region": None, "ca_bundle": None,
+        "outbox_path": "/opt/auth/spool/recordings", "cache_path": "/opt/auth/cache/recordings",
+        "signing_key_file": "/opt/auth/keys/recordings_hmac.key",
+        "chunk_bytes": 262144, "upload_interval_seconds": 2, "max_outbox_age_seconds": 300,
+    },
+    "admission": {"enabled": False, "per_subject_per_minute": 60, "global_per_minute": 1000},
     "api": {"enabled": False, "client_url": None, "ticket_ttl": 60, "bind_ticket_ip": False},
     "gateway": {
         "enabled": False, "listen_host": "127.0.0.1", "ssh_port": 2222,
@@ -26,6 +36,10 @@ DEFAULT_CONFIG = {
         "host_key_file": "/opt/auth/keys/gateway_ed25519", "known_hosts": "/opt/auth/known_hosts",
         "public_ssh_host": None, "public_web_url": None, "allowed_origins": [],
         "max_connections": 100, "recheck_interval": 2,
+        "ssh_features": {"multiple_channels": False, "max_channels": 8, "sftp": False,
+            "scp": False, "forwarding": False, "proxy_hops": False, "max_proxy_hops": 3},
+        "forwarding_targets": {},
+        "browser_auth": {"enabled": False, "timeout_seconds": 120},
     },
     "identity_security": {
         "backchannel_logout": {"enabled": False, "max_logout_age_seconds": 300, "max_token_lifetime_seconds": 86400},
@@ -33,6 +47,10 @@ DEFAULT_CONFIG = {
         "step_up": {"enabled": False, "require_privileged": True, "all_connections": False,
                     "required_projects": [], "required_project_globs": [], "acr_values": [],
                     "required_amr": [], "max_age_seconds": 300},
+        "membership": {"enabled": False, "source": "keycloak-admin", "token_file": None,
+                       "group_name_style": "name", "include_realm_roles": True, "max_groups": 1000},
+        "delegation": {"enabled": False, "max_seconds": 300, "recheck_interval": 2},
+        "workloads": {"enabled": False, "clients": {}},
     },
     "credentials": {"default": "legacy", "targets": {}, "providers": {}, "known_hosts": None},
     "protocols": {"enabled": False, "targets": {}},
@@ -191,6 +209,7 @@ DEFAULT_CONFIG = {
         "admin_groups": [],
         "refresh_seconds": 15,
         "self_service_enabled": True,
+        "workspace_enabled": True,
         "self_service_groups": [],
         "role_bindings": [],
         "require_mutation_confirmation": True,
@@ -391,7 +410,25 @@ def load_config(path=None, use_env=True):
             {"path": "/etc/systemd/system/isolate-policy-sync.timer", "required": False},
             {"path": "/etc/default/isolate-mcp", "required": False},
         ]
-    return config
+    return canonical_identity_config(config)
+
+
+def canonical_identity_config(config):
+    """Keep the internal legacy alias while selecting exactly one provider."""
+    from isolate_oidc import identity_provider_config
+    result = copy.deepcopy(config)
+    result["keycloak"] = identity_provider_config(result)
+    return result
+
+
+def with_identity_provider(config, provider):
+    result = copy.deepcopy(config)
+    result["keycloak"] = copy.deepcopy(provider)
+    if provider.get("provider") == "oidc":
+        result["oidc"] = dict(provider, enabled=True)
+    else:
+        result.pop("oidc", None)
+    return result
 
 
 def _env_overrides():
@@ -410,6 +447,8 @@ def _env_overrides():
         redis["username"] = os.getenv("ISOLATE_REDIS_USER")
     if os.getenv("ISOLATE_REDIS_PASS"):
         redis["password"] = os.getenv("ISOLATE_REDIS_PASS")
+    if os.getenv("ISOLATE_REDIS_PASSWORD_FILE"):
+        redis["password_file"] = os.getenv("ISOLATE_REDIS_PASSWORD_FILE")
     if os.getenv("ISOLATE_REDIS_SSL"):
         redis["ssl"] = os.getenv("ISOLATE_REDIS_SSL").strip().lower() in ("1", "true", "yes", "on")
     if os.getenv("ISOLATE_REDIS_CA_CERT"):
@@ -430,5 +469,13 @@ def _env_overrides():
         keycloak["client_secret"] = os.getenv("ISOLATE_KEYCLOAK_CLIENT_SECRET")
     if keycloak:
         overrides["keycloak"] = keycloak
+
+    oidc = {}
+    for suffix, key in (("ISSUER", "issuer"), ("CLIENT_ID", "client_id"),
+                        ("AUDIENCE", "expected_audience"), ("CLIENT_SECRET_FILE", "client_secret_file")):
+        if os.getenv("ISOLATE_OIDC_" + suffix):
+            oidc[key] = os.getenv("ISOLATE_OIDC_" + suffix)
+    if oidc:
+        overrides["oidc"] = dict(oidc, enabled=True)
 
     return overrides

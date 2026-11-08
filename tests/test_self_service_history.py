@@ -104,9 +104,10 @@ class SelfServiceHistoryTest(unittest.TestCase):
         self.assertEqual({r["connection_id"] for r in rows}, {"renamed", "legacy"})
 
     def test_portal_routes_deny_all_admin_surfaces_and_foreign_export(self):
-        for url in ("/inventory", "/access", "/history", "/jobs", "/grants", "/packages", "/policy/matrix", "/export/history", "/session/foreign", "/raw/bob/foreign", "/replay/foreign", "/inventory/10001/services"):
+        for url in ("/inventory", "/access", "/history", "/jobs", "/grants", "/packages", "/policy/matrix", "/export/history", "/session/foreign", "/raw/bob/foreign", "/inventory/10001/services"):
             with self.subTest(url=url):
                 self.assertEqual(self.client.get(url).status_code, 403)
+        self.assertEqual(self.client.get("/replay/foreign").status_code, 404)
         self.event("alice", "mine", 100, subject="sub-alice")
         self.event("bob", "theirs", 100, subject="sub-bob")
         response = self.client.get("/me/history/export?format=json&user=bob")

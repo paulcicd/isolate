@@ -25,6 +25,12 @@ class Redis:
     def get(self, key):
         return self.values.get(key)
 
+    def set(self, key, value, ex=None, nx=False):
+        if nx and key in self.values:
+            return False
+        self.values[key] = value
+        return True
+
     def pipeline(self):
         return Pipeline(self)
 

@@ -6,8 +6,26 @@ from urllib.parse import urlsplit
 
 def validate_runtime_config(config, check_paths=False):
     errors, warnings = [], []
+    from isolate_config import canonical_identity_config
+    try:
+        config = canonical_identity_config(config)
+    except Exception:
+        return {"errors": ["identity provider configuration is invalid"], "warnings": []}
+    provider = config.get("keycloak", {})
+    if provider.get("provider") == "oidc":
+        try:
+            from isolate_oidc import validate_endpoint, read_client_secret
+            validate_endpoint(provider, provider.get("issuer"))
+            if provider.get("verify_tokens", True) is not True or provider.get("tls_verify", True) is not True:
+                raise ValueError("verification is required")
+            if not provider.get("client_id") or not (provider.get("expected_audience") or provider.get("client_id")):
+                raise ValueError("client and audience are required")
+            if check_paths:
+                read_client_secret(provider)
+        except Exception:
+            errors.append("generic OIDC requires a trusted HTTPS issuer, verified tokens, client/audience and safe credential files")
     sections = {}
-    for name in ("api", "gateway", "credentials", "identity_security", "protocols", "audit_index", "cluster"):
+    for name in ("api", "gateway", "credentials", "identity_security", "protocols", "audit_index", "cluster", "state", "recordings", "admission"):
         value = config.get(name, {})
         if not isinstance(value, dict):
             errors.append(name + " must be an object")
@@ -16,7 +34,94 @@ def validate_runtime_config(config, check_paths=False):
         if "enabled" in value and not isinstance(value["enabled"], bool):
             errors.append(name + ".enabled must be a boolean")
     api, gateway = sections["api"], sections["gateway"]
+    features = gateway.get("ssh_features", {})
+    if not isinstance(features, dict):
+        errors.append("gateway.ssh_features must be an object")
+        features = {}
+    for name in ("multiple_channels", "sftp", "scp", "forwarding", "proxy_hops"):
+        if name in features and not isinstance(features[name], bool):
+            errors.append("gateway.ssh_features." + name + " must be a boolean")
+    for name, low, high, default in (("max_channels", 1, 32, 8), ("max_proxy_hops", 1, 5, 3)):
+        if type(features.get(name, default)) is not int or not low <= features.get(name, default) <= high:
+            errors.append("gateway.ssh_features." + name + " is outside the supported range")
+    forwards = gateway.get("forwarding_targets", {})
+    if not isinstance(forwards, dict):
+        errors.append("gateway.forwarding_targets must be an object")
+    else:
+        import ipaddress
+        import re
+        for host_id, destinations in forwards.items():
+            if not str(host_id).isdigit() or not isinstance(destinations, list) or len(destinations) > 100:
+                errors.append("forwarding targets require inventory IDs and bounded destination lists")
+                continue
+            for destination in destinations:
+                try:
+                    if (not isinstance(destination, dict) or set(destination) != {"host", "port", "address"}
+                            or not isinstance(destination["host"], str) or not re.fullmatch(r"[A-Za-z0-9_.:-]{1,253}", destination["host"])
+                            or type(destination["port"]) is not int or not 1 <= destination["port"] <= 65535):
+                        raise ValueError("invalid destination")
+                    ipaddress.ip_address(destination["address"])
+                except (ValueError, KeyError, TypeError):
+                    errors.append("forwarding destinations require an exact host, port and pinned IP address")
+    browser_auth = gateway.get("browser_auth", {})
+    if not isinstance(browser_auth, dict):
+        errors.append("gateway.browser_auth must be an object")
+    elif browser_auth.get("enabled"):
+        parsed = urlsplit(str(config.get("dashboard", {}).get("public_url") or ""))
+        if parsed.scheme != "https" or not parsed.hostname or not api.get("enabled") or not gateway.get("enabled"):
+            errors.append("browser SSH sign-in requires API, gateway and a public HTTPS dashboard")
+        timeout = browser_auth.get("timeout_seconds", 120)
+        if type(timeout) is not int or not 30 <= timeout <= 300:
+            errors.append("browser SSH sign-in timeout must be between 30 and 300 seconds")
     identity = sections["identity_security"]
+    state = sections["state"]
+    backend = state.get("backend", "redis")
+    if backend not in ("redis", "postgresql", "sqlite"):
+        errors.append("state.backend must be redis, postgresql, or sqlite")
+    if backend in ("postgresql", "sqlite"):
+        if state.get("require_tls", True) is False:
+            warnings.append("state.require_tls is disabled; use only an explicitly isolated test network")
+        name = "dsn_file" if backend == "postgresql" else "sqlite_path"
+        path = state.get(name)
+        if not path or not os.path.isabs(str(path)):
+            errors.append("state.{} must be an absolute path".format(name))
+        elif check_paths and backend == "postgresql":
+            try:
+                from isolate_state import _protected_dsn
+                _protected_dsn(path)
+            except Exception:
+                errors.append("state.dsn_file is missing or has unsafe ownership/permissions")
+        if backend == "sqlite":
+            warnings.append("SQLite state is intended for development or a single installation, not a multi-node cluster")
+    for name in ("membership", "delegation", "workloads"):
+        if not isinstance(identity.get(name, {}), dict):
+            errors.append("identity_security.{} must be an object".format(name))
+    membership = identity.get("membership", {})
+    if isinstance(membership, dict) and membership.get("enabled"):
+        if config.get("keycloak", {}).get("provider") == "oidc":
+            errors.append("Keycloak Admin membership is unavailable for a generic OIDC provider; disable it or use the Keycloak adapter")
+        if membership.get("source", "keycloak-admin") != "keycloak-admin":
+            errors.append("authoritative membership requires the Keycloak Admin source")
+        if not membership.get("token_file") and not (membership.get("client_id") and membership.get("client_secret_file")):
+            errors.append("membership requires token_file or a client_id and protected client_secret_file")
+    recording = sections["recordings"]
+    if recording.get("enabled"):
+        if recording.get("backend", "s3") != "s3" or not recording.get("bucket"):
+            errors.append("shared recordings require an S3 bucket")
+        if backend == "redis":
+            errors.append("shared recordings require authoritative SQL state for publication pointers")
+        for name in ("capture_path", "outbox_path", "cache_path", "signing_key_file"):
+            if not recording.get(name) or not os.path.isabs(str(recording[name])):
+                errors.append("recordings.{} must be an absolute path".format(name))
+        endpoint = urlsplit(str(recording.get("endpoint_url") or "https://s3.amazonaws.com"))
+        if endpoint.scheme != "https" or not endpoint.hostname or endpoint.username or endpoint.password or endpoint.query or endpoint.fragment:
+            errors.append("recordings.endpoint_url must use verified HTTPS")
+        if check_paths:
+            try:
+                from isolate_recordings import RecordingArchive
+                RecordingArchive(config)
+            except Exception:
+                errors.append("recordings private directories or signing key are unavailable or unsafe")
     keycloak = config.get("keycloak") or {}
     if isinstance(keycloak, dict):
         if keycloak.get("token_kind", "id_token") not in ("id_token", "access_token"):
@@ -74,8 +179,8 @@ def validate_runtime_config(config, check_paths=False):
             errors.append("identity_security.{} must be an object".format(key))
     introspection = identity.get("introspection", {})
     if isinstance(introspection, dict) and introspection.get("enabled"):
-        if keycloak.get("token_kind", "id_token") != "access_token" or not keycloak.get("client_secret"):
-            errors.append("online introspection requires access_token and a confidential Keycloak client")
+        if keycloak.get("token_kind", "id_token") != "access_token" or not (keycloak.get("client_secret") or keycloak.get("client_secret_file")):
+            errors.append("online introspection requires access_token and a confidential OIDC client")
     step = identity.get("step_up", {})
     if isinstance(step, dict) and step.get("enabled"):
         if not (step.get("acr_values") or step.get("required_amr")):

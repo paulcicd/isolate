@@ -760,7 +760,11 @@ def _page_help(title, locale):
 
 def _html(title, body, config=None, notice=None):
     locale = _dashboard_locale(config)
-    words = _SHELL_I18N[locale]
+    words = dict(_SHELL_I18N[locale])
+    from isolate_oidc import identity_provider_config
+    display_provider = identity_provider_config(config or {})
+    if display_provider.get("provider") == "oidc":
+        words["secured"] = ("Вход через " if locale == "ru" else "Sign-in with ") + str(display_provider.get("display_name") or "OpenID Connect")
     build = _build_info(config)
     refresh = ""
     refresh_seconds = int((config or {}).get("dashboard", {}).get("refresh_seconds") or 0)
@@ -785,6 +789,8 @@ def _html(title, body, config=None, notice=None):
     admin_groups = (config or {}).get("dashboard", {}).get("admin_groups") or (config or {}).get("history", {}).get("admin_groups") or []
     matched_groups = sorted(set(identity.get("groups") or []) & set(admin_groups))
     labels = ("Роль Dashboard", "Группы доступа", "Группы OIDC", "Роли Keycloak") if locale == "ru" else ("Dashboard role", "Access groups", "OIDC groups", "Keycloak roles")
+    if display_provider.get("provider") == "oidc":
+        labels = labels[:3] + (("Роли OIDC" if locale == "ru" else "OIDC roles"),)
     identity_details = '<details class="identity-details"><summary>{}: {}</summary>{}</details>'.format(
         labels[0], "Admin" if is_dashboard_admin(identity, config or {}) else ", ".join(role_names(identity, config or {})) or "User",
         "".join('<div><strong>{}</strong>: {}</div>'.format(html.escape(label), html.escape(", ".join(values) or "—")) for label, values in zip(labels[1:], (matched_groups, identity.get("groups") or [], identity.get("roles") or []))),
@@ -816,6 +822,13 @@ def _html(title, body, config=None, notice=None):
         )),
     )
     admin_nav = ""
+    if (config or {}).get("api", {}).get("enabled"):
+        workspace_links = '<a class="nav-link" href="/workspace">{}</a>'.format("Ресурсы" if locale == "ru" else "Resources")
+        if (config or {}).get("gateway", {}).get("enabled"):
+            workspace_links += '<a class="nav-link" href="/me/terminal">{}</a>'.format("Терминал" if locale == "ru" else "Terminal")
+        if admin_view or role_names(identity, config or {}):
+            workspace_links += '<a class="nav-link" href="/workspace/admin">{}</a>'.format("Управление" if locale == "ru" else "Administration")
+        portal_nav = '<div class="nav-section"><span class="nav-label">Workspace</span>' + workspace_links + '</div>' + portal_nav
     if admin_view:
         for section, entries in (
             ("operations", (("/", "summary"), ("/jobs", "jobs"), ("/alerts", "alerts"), ("/sessions/active", "active_sessions"), ("/history", "history"), ("/inventory", "inventory"), ("/announcements", "announcements"))),
@@ -837,8 +850,14 @@ def _html(title, body, config=None, notice=None):
     portal_nav += '<a class="nav-link" href="/me/session-approvals">{}</a>'.format("Мои согласования" if locale == "ru" else "My approvals")
     if (config or {}).get("api", {}).get("enabled") and (config or {}).get("audit_index", {}).get("enabled"):
         portal_nav += '<a class="nav-link" href="/audit/search">{}</a>'.format("Поиск по аудиту" if locale == "ru" else "Audit search")
+    try:
+        from flask import has_request_context, request
+        if has_request_context() and (request.path == "/workspace" or request.path.startswith(("/me/terminal", "/replay/"))):
+            admin_nav = ""
+    except ImportError:
+        pass
     rendered = """<!doctype html>
-<html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">{refresh}<title>{title}</title>
+<html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="icon" type="image/svg+xml" href="/static/favicon.svg">{refresh}<title>{title}</title>
 <script>{theme_bootstrap_script}</script>
 <style>{css}</style></head><body>
 <div class="app-shell">
@@ -1045,10 +1064,10 @@ isolate export history --format csv --output history.csv</pre>
             ("lifecycle", "Backup, GitOps и обновление", """
 <p>Перед релизом создайте service backup и проверьте health. GitOps для grants/project sets остаётся opt-in; при <code>enforce_git</code> ручные policy mutations блокируются.</p>
 <pre>sudo /opt/auth/scripts/isolate-backup.sh create
-git pull --ff-only
-sudo bash /opt/auth/scripts/fix-perms.sh
+python scripts/isolate-setup.py doctor --config /etc/isolate/isolate.yml
+python scripts/isolate-install.py --root /opt/isolate status
 curl -fsS http://127.0.0.1:8080/health</pre>
-<p>Для бесшовного обновления запускайте два dashboard экземпляра за reverse proxy и выводите старый instance после успешной health-проверки нового. Активные SSH-сессии wrapper не следует перезапускать принудительно.</p>"""),
+<p>Проверяйте источник и зависимости через plan/stage/verify, затем выбирайте release через activate. Откат выбирает совместимый код и не восстанавливает базу или старые права. Перед заменой процессов проверьте readiness и выведите старый ingress из работы; принудительная остановка завершает активные SSH-сессии.</p>"""),
         ]
     else:
         title = "Isolate Documentation"
@@ -1098,10 +1117,10 @@ isolate export history --format csv --output history.csv</pre>
             ("lifecycle", "Backup, GitOps, and updates", """
 <p>Create a service backup and verify health before a release. GitOps for grants and project sets is opt-in; <code>enforce_git</code> blocks manual policy mutations.</p>
 <pre>sudo /opt/auth/scripts/isolate-backup.sh create
-git pull --ff-only
-sudo bash /opt/auth/scripts/fix-perms.sh
+python scripts/isolate-setup.py doctor --config /etc/isolate/isolate.yml
+python scripts/isolate-install.py --root /opt/isolate status
 curl -fsS http://127.0.0.1:8080/health</pre>
-<p>For a seamless dashboard update, run two instances behind a reverse proxy and remove the old instance after the new health check passes. Do not forcibly restart active SSH wrapper sessions.</p>"""),
+<p>Review source and dependencies with plan/stage/verify, then select a release with activate. Rollback selects compatible code without restoring databases or old permissions. Check readiness and drain old ingress before replacing processes; forced termination closes active SSH streams.</p>"""),
         ]
     toc = "".join('<a href="#{}">{}</a>'.format(section_id, html.escape(heading)) for section_id, heading, _ in sections)
     content = "".join('<section class="docs-section" id="{}"><h2>{}</h2>{}</section>'.format(
@@ -1158,10 +1177,21 @@ def create_app(config=None):
     from joserfc.errors import JoseError
     from requests.exceptions import RequestException
 
+    from isolate_oidc import identity_provider_config, normalize_identity_claims, read_client_secret
+    from isolate_identity import IdentityError
+    from isolate_connection_auth import ConnectionDenied
     config = config or load_config()
+    provider = identity_provider_config(config)
+    config["keycloak"] = provider
+    generic_oidc = provider.get("provider") == "oidc"
     app = Flask(__name__)
     app.secret_key = _secret_key(config)
+    app.config["MAX_CONTENT_LENGTH"] = int(config.get("dashboard", {}).get("max_request_bytes", 1048576))
     app.extensions["isolate_build_info"] = get_build_info(config, _DASHBOARD_STARTED_AT)
+    from isolate_recordings import RecordingError
+    @app.errorhandler(RecordingError)
+    def recording_unavailable(error):
+        return '<h1>Recording temporarily unavailable</h1><p>Evidence could not be verified. Request ID: {}</p>'.format(g.request_id), 503
     oauth = OAuth(app)
 
     @app.before_request
@@ -1171,7 +1201,7 @@ def create_app(config=None):
     @app.after_request
     def attach_request_id(response):
         response.headers["X-Request-ID"] = g.request_id
-        if request.path.startswith("/api/") or request.path.startswith("/me/terminal/"):
+        if request.path.startswith(("/api/", "/me/terminal", "/replay/", "/workspace", "/ssh/authorize")):
             response.headers["Cache-Control"] = "no-store"
             response.headers["X-Content-Type-Options"] = "nosniff"
         return response
@@ -1185,10 +1215,12 @@ def create_app(config=None):
     oauth.register(
         name="keycloak",
         client_id=config.get("keycloak", {}).get("client_id"),
-        client_secret=config.get("keycloak", {}).get("client_secret"),
+        client_secret=read_client_secret(provider),
         server_metadata_url=issuer + "/.well-known/openid-configuration",
         client_kwargs={
             "scope": " ".join(config.get("keycloak", {}).get("scopes") or ["openid", "profile", "email"]),
+            "code_challenge_method": "S256",
+            "verify": provider.get("ca_file") or provider.get("ca_bundle") or provider.get("tls_verify", True),
             "default_timeout": (
                 float(config.get("keycloak", {}).get("http_connect_timeout", 2)),
                 float(config.get("keycloak", {}).get("http_read_timeout", 3)),
@@ -1203,12 +1235,31 @@ def create_app(config=None):
         if identity.get("exp") and int(identity["exp"]) <= int(time.time()):
             session.clear()
             return None
-        security = config.get("identity_security", {})
-        if security.get("backchannel_logout", {}).get("enabled") or security.get("introspection", {}).get("enabled"):
-            from isolate_identity_security import assert_identity_active
-            from isolate_identity import IdentityError
+        if (identity.get("raw_claims") or {}).get("iss") not in (None, provider.get("issuer")):
+            session.clear()
+            return None
+        if provider.get("issuer"):
+            from isolate_identity_binding import ensure_provider_binding
             try:
-                assert_identity_active(redis_client(config), config, identity, token=browser_token())
+                ensure_provider_binding(config, redis_client(config))
+            except (IdentityError, ConnectionDenied):
+                session.clear()
+                return None
+        if generic_oidc:
+            from isolate_runtime import Runtime
+            try:
+                identity = Runtime(config, redis=redis_client(config)).authenticate(browser_token() or "")
+                session["identity"] = identity
+                return identity
+            except (IdentityError, ConnectionDenied):
+                session.clear()
+                return None
+        security = config.get("identity_security", {})
+        if any(security.get(name, {}).get("enabled") for name in ("backchannel_logout", "introspection", "membership")):
+            from isolate_identity_security import refresh_identity
+            try:
+                identity = refresh_identity(redis_client(config), config, identity, token=browser_token())
+                session["identity"] = identity
             except IdentityError:
                 session.clear()
                 return None
@@ -1225,6 +1276,11 @@ def create_app(config=None):
         if record.get("sub") != (session.get("identity") or {}).get("keycloak_sub"):
             return None
         return record.get("token")
+
+    def delegation_options():
+        if not config.get("identity_security", {}).get("delegation", {}).get("enabled"):
+            return {}
+        return {"token": browser_token()}
 
     def require_admin():
         identity = current_identity()
@@ -1262,11 +1318,29 @@ def create_app(config=None):
         return re.sub(r'(<(?:input|select)\b[^>]*\bname="(?:' + fields + r')")', r'\1 disabled', body)
 
     def scoped_session(connection_id, identity):
-        details = find_session(config["logging"]["base_path"], connection_id)
+        details = find_session(config["logging"]["base_path"], connection_id, archive_config=config,
+            authorize_archive=lambda metadata: require_object_permission(identity, "audit.read", metadata.get("project")))
         if details is None:
             abort(404)
         require_object_permission(identity, "audit.read", (details.get("summary") or {}).get("project"))
         return details
+
+    def replay_session(connection_id):
+        identity = current_identity()
+        if identity is None:
+            return None, redirect("/login")
+        def authorize(metadata):
+            owned = (metadata.get("keycloak_sub") == identity.get("keycloak_sub") if metadata.get("keycloak_sub")
+                     else metadata.get("username") == identity.get("username"))
+            if not owned and not (metadata.get("project") and has_permission(identity, config, "audit.read", metadata["project"])):
+                abort(404)
+            return True
+        details = find_session(config["logging"]["base_path"], connection_id, archive_config=config,
+            authorize_archive=authorize)
+        if details is None:
+            abort(404)
+        authorize(details.get("summary") or {})
+        return identity, details
 
     def csrf_token():
         token = session.get("csrf_token")
@@ -1277,6 +1351,10 @@ def create_app(config=None):
 
     from isolate_api import register_api_routes
     register_api_routes(app, config, lambda cfg: redis_client(cfg), current_identity, csrf_token, browser_token)
+    from isolate_ssh_browser import register_ssh_browser_routes
+    register_ssh_browser_routes(app, config, lambda cfg: redis_client(cfg), current_identity, csrf_token, browser_token)
+    from isolate_workspace_ui import register_workspace_routes
+    register_workspace_routes(app, config, current_identity, csrf_token)
 
     def validate_csrf():
         expected = session.get("csrf_token")
@@ -1424,13 +1502,16 @@ def create_app(config=None):
         redirect_uri = config.get("dashboard", {}).get("public_url", "").rstrip("/") + url_for("callback")
         try:
             options = {}
+            if generic_oidc:
+                from isolate_oidc_web import configure_browser_provider
+                configure_browser_provider(oauth.keycloak, provider)
             if request.args.get("step_up") == "true":
                 step_up = config.get("identity_security", {}).get("step_up", {})
                 if step_up.get("enabled"):
                     options = {"acr_values": " ".join(step_up.get("acr_values") or []),
                                "max_age": int(step_up.get("max_age_seconds", 300)), "prompt": "login"}
             return oauth.keycloak.authorize_redirect(redirect_uri, **options)
-        except RequestException as exc:
+        except (RequestException, IdentityError) as exc:
             return identity_provider_unavailable(exc)
 
     def identity_provider_unavailable(error):
@@ -1440,8 +1521,11 @@ def create_app(config=None):
     @app.route("/auth/callback")
     def callback():
         try:
+            if generic_oidc:
+                from isolate_oidc_web import configure_browser_provider
+                configure_browser_provider(oauth.keycloak, provider)
             token = oauth.keycloak.authorize_access_token()
-        except RequestException as exc:
+        except (RequestException, IdentityError) as exc:
             return identity_provider_unavailable(exc)
         except (OAuthError, JoseError) as exc:
             error_code = str(getattr(exc, "error", "") or "unknown")
@@ -1452,7 +1536,29 @@ def create_app(config=None):
         claims = token.get("userinfo") or {}
         if not isinstance(claims, dict) or not claims:
             abort(401, description="Keycloak did not return verified OIDC claims")
-        identity = normalize_claims(claims)
+        if generic_oidc:
+            from isolate_identity import verify_jwt_claims
+            from isolate_identity_binding import ensure_provider_binding
+            try:
+                if not token.get("id_token"):
+                    raise IdentityError("OIDC sign-in requires a verified ID token")
+                verified = verify_jwt_claims(token["id_token"], dict(provider, expected_audience=provider.get("client_id"), token_kind="id_token"))
+                if verified.get("sub") != claims.get("sub"):
+                    raise IdentityError("OIDC browser subject mismatch")
+                from isolate_runtime import Runtime
+                selected = token.get(provider.get("token_kind", "id_token"))
+                identity = Runtime(config, redis=redis_client(config)).authenticate(selected or "")
+                if identity.get("oidc_sub") != verified.get("sub"):
+                    raise IdentityError("OIDC access token and ID token subjects differ")
+            except (IdentityError, ConnectionDenied):
+                abort(401, description="OIDC sign-in could not be verified or the provider is not bound")
+        else:
+            identity = normalize_claims(claims)
+            from isolate_identity_binding import ensure_provider_binding
+            try:
+                ensure_provider_binding(config, redis_client(config))
+            except IdentityError:
+                abort(401, description="Identity provider binding does not match this installation")
         if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config) and not role_names(identity, config):
             abort(403)
         return_to = session.get("return_to")
@@ -1460,7 +1566,7 @@ def create_app(config=None):
         session["identity"] = identity
         # Flask cookies are signed, not encrypted. Keep bearer credentials only
         # in the private server-side store, keyed by an opaque session handle.
-        if config.get("api", {}).get("enabled") or config.get("identity_security", {}).get("introspection", {}).get("enabled"):
+        if generic_oidc or config.get("api", {}).get("enabled") or any(config.get("identity_security", {}).get(name, {}).get("enabled") for name in ("introspection", "delegation")):
             kind = config.get("keycloak", {}).get("token_kind", "id_token")
             bearer_token = token.get(kind)
             if bearer_token and identity.get("exp"):
@@ -1468,8 +1574,10 @@ def create_app(config=None):
                 redis_client(config).set("isolate_browser_" + handle, json.dumps({"token": bearer_token, "sub": identity.get("keycloak_sub")}),
                                         ex=max(1, int(identity["exp"]) - int(time.time())))
                 session["runtime_session"] = handle
-        if isinstance(return_to, str) and re.fullmatch(r"/me/terminal/[0-9]{1,20}", return_to):
+        if isinstance(return_to, str) and re.fullmatch(r"(?:/me/terminal(?:/[0-9]{1,20})?|/ssh/authorize\?code=[A-Z2-7-]{12,14}|/workspace(?:/admin)?)", return_to):
             return redirect(return_to)
+        if config.get("api", {}).get("enabled") and config.get("dashboard", {}).get("workspace_enabled", True):
+            return redirect("/workspace")
         return redirect(url_for("index") if is_dashboard_admin(identity, config) else "/me")
 
     @app.route("/logout")
@@ -1492,7 +1600,7 @@ def create_app(config=None):
         active = list_active_sessions(redis)
         pending = list_access_requests(redis, status="pending")
         notices = list_announcements(redis, active_only=True)
-        recent = read_history(config["logging"]["base_path"], admin, limit=10, admin_groups=config.get("dashboard", {}).get("admin_groups") or [])
+        recent = read_history(config["logging"]["base_path"], admin, archive_config=config, limit=10, admin_groups=config.get("dashboard", {}).get("admin_groups") or [])
         body = """
 <h1>Operations Overview</h1>
 <p class="page-lead">Current bastion activity, access requests, and recent SSH connections.</p>
@@ -1553,6 +1661,7 @@ def create_app(config=None):
                         parameters=parameters,
                         timeout=int(timeout) if timeout else None,
                         confirmed=True,
+                        **delegation_options(),
                     )
                     audit_admin("runbook_fleet_queue", admin, "success", {
                         "fleet_id": result["fleet_id"], "job_count": result["count"],
@@ -1563,7 +1672,7 @@ def create_app(config=None):
                     summary = next((row for row in fleet_progress(list_jobs(redis, limit=10000)) if row["fleet_id"] == fleet_id), None)
                     if summary is None:
                         raise JobError("fleet was not found")
-                    retried = [retry_job(redis, config, job_id, admin) for job_id in summary["failed_job_ids"]]
+                    retried = [retry_job(redis, config, job_id, admin, **delegation_options()) for job_id in summary["failed_job_ids"]]
                     if not retried:
                         raise JobError("fleet has no failed hosts to retry")
                     audit_admin("job_fleet_retry", admin, "success", {"fleet_id": fleet_id, "job_count": len(retried)})
@@ -1737,7 +1846,7 @@ def create_app(config=None):
         validate_csrf()
         try:
             require_mutation_confirmation()
-            record = retry_job(redis_client(config), config, job_id, admin)
+            record = retry_job(redis_client(config), config, job_id, admin, **delegation_options())
             audit_admin("job_retry", admin, "success", {"job_id": record["id"], "retry_of": job_id})
         except (JobError, ValueError) as exc:
             audit_admin("job_retry", admin, "denied", {"job_id": job_id, "error": str(exc)})
@@ -1962,8 +2071,10 @@ def create_app(config=None):
         if not isinstance(admin, dict):
             return admin
         try:
-            rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
+            rows = read_history(config["logging"]["base_path"], admin, archive_config=config, **history_filters(request.args),
                                 admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [], permission_config=config)
+        except RecordingError:
+            raise
         except ValueError as exc:
             abort(400, description=str(exc))
         redis = redis_client(config)
@@ -2007,11 +2118,13 @@ def create_app(config=None):
         elif kind == "grants":
             rows = list_grant_records(redis, project=request.args.get("project"))
         elif kind == "users":
-            rows = list_user_profiles(config["logging"]["base_path"])
+            rows = list_user_profiles(config["logging"]["base_path"], archive_config=config)
         elif kind == "history":
             try:
-                rows = read_history(config["logging"]["base_path"], admin, **history_filters(request.args),
+                rows = read_history(config["logging"]["base_path"], admin, archive_config=config, **history_filters(request.args),
                                     admin_groups=config.get("dashboard", {}).get("admin_groups") or config.get("history", {}).get("admin_groups") or [], permission_config=config)
+            except RecordingError:
+                raise
             except ValueError as exc:
                 abort(400, description=str(exc))
         elif kind == "access-matrix":
@@ -2466,7 +2579,8 @@ Until <input name="maintenance_until" value="{maintenance_until}"> Reason <input
             return admin
         redis = redis_client(config)
         active = get_session(redis, connection_id)
-        details = find_session(config["logging"]["base_path"], connection_id)
+        details = find_session(config["logging"]["base_path"], connection_id, archive_config=config,
+            authorize_archive=lambda metadata: require_object_permission(admin, "audit.read", metadata.get("project")))
         if details is None and active is None:
             abort(404)
         if details is not None:
@@ -2530,10 +2644,9 @@ refreshLive();
 
     @app.route("/replay/<connection_id>.json")
     def replay_json(connection_id):
-        admin = require_permission("audit.read")
-        if not isinstance(admin, dict):
-            return admin
-        details = scoped_session(connection_id, admin)
+        identity, details = replay_session(connection_id)
+        if identity is None:
+            return details
         replay = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         return app.response_class(
             response=json.dumps(replay, indent=2, sort_keys=True),
@@ -2543,10 +2656,15 @@ refreshLive();
 
     @app.route("/replay/<connection_id>")
     def replay(connection_id):
-        admin = require_permission("audit.read")
-        if not isinstance(admin, dict):
-            return admin
-        details = scoped_session(connection_id, admin)
+        identity, details = replay_session(connection_id)
+        if identity is None:
+            return details
+        if config.get("api", {}).get("enabled"):
+            from isolate_terminal_ui import render_replay_workspace
+            body = render_replay_workspace(connection_id, csrf_token(), _dashboard_locale(config),
+                default_speed=config.get("replay", {}).get("default_speed", 1))
+            return _html("Session Replay", body, config=dict(config,
+                dashboard=dict(config.get("dashboard", {}), refresh_seconds=0)))
         replay_data = parse_raw_replay(details.get("raw_log_path"), max_bytes=int(config.get("replay", {}).get("max_bytes", 10485760)))
         readable = html.escape(replay_data.get("readable") or replay_data.get("plain") or "")
         error = replay_data.get("error")
@@ -2737,7 +2855,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         admin = require_admin()
         if not isinstance(admin, dict):
             return admin
-        profiles = list_user_profiles(config["logging"]["base_path"])
+        profiles = list_user_profiles(config["logging"]["base_path"], archive_config=config)
         active_users = {row.get("username") for row in list_active_sessions(redis_client(config))}
         for profile in profiles:
             username = str(profile.get("username") or "")
@@ -2756,12 +2874,12 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         admin = require_admin()
         if not isinstance(admin, dict):
             return admin
-        profiles = {row["username"]: row for row in list_user_profiles(config["logging"]["base_path"])}
+        profiles = {row["username"]: row for row in list_user_profiles(config["logging"]["base_path"], archive_config=config)}
         profile = profiles.get(username, {"username": username, "groups": [], "roles": []})
         redis = redis_client(config)
         active = [row for row in list_active_sessions(redis) if row.get("username") == username]
         history_rows = read_history(
-            config["logging"]["base_path"], admin, user=username, limit=200,
+            config["logging"]["base_path"], admin, archive_config=config, user=username, limit=200,
             admin_groups=config.get("dashboard", {}).get("admin_groups") or [],
         )
         subjects = {("user", username)}
@@ -2769,7 +2887,7 @@ fetch("/replay/{connection_id}.json").then(r => r.json()).then(data => {{
         subjects.update(("role", role) for role in profile.get("roles") or [])
         grants = [row for row in list_grant_records(redis) if (row.get("subject"), row.get("name")) in subjects]
         activity = user_activity_summary(
-            config["logging"]["base_path"], username, limit=20, active_sessions=active,
+            config["logging"]["base_path"], username, limit=20, active_sessions=active, archive_config=config, state_client=redis,
             grants=list_grant_records(redis), access_requests=list_access_requests(redis),
         )
         metrics = activity.get("metrics") or {}

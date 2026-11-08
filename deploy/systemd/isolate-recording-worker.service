@@ -1,0 +1,22 @@
+[Unit]
+Description=Isolate shared recording outbox publisher
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=auth
+Group=auth
+WorkingDirectory=/opt/auth/shared
+ExecStart=/usr/bin/python3 /opt/auth/scripts/isolate-recording-worker.py --config /opt/auth/configs/isolate.yml
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/opt/auth/spool /opt/auth/cache
+
+[Install]
+WantedBy=multi-user.target

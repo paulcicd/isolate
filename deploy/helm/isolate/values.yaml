@@ -1,0 +1,66 @@
+# Build Dockerfile.prod and push to your registry before installing this chart.
+image:
+  repository: isolate
+  tag: "0.1.0"
+  digest: ""
+  pullPolicy: IfNotPresent
+imagePullSecrets: []
+nameOverride: ""
+serviceAccount:
+  create: true
+  name: ""
+# This existing Secret includes isolate.yml and all referenced private files.
+# The chart never creates or renders secret values.
+secrets:
+  existingSecret: isolate-runtime
+  configFile: isolate.yml
+init:
+  enabled: true
+# All components must share a private RWX filesystem, provisioned separately.
+# The chart deliberately does not create or delete persistent volumes.
+runtime:
+  existingClaim: isolate-runtime
+  mountPath: /var/lib/isolate
+  # Used only with init.enabled=false: CSI/Secret store must supply uid2000 0600 files.
+  privateSecretsClaim: ""
+api:
+  enabled: true
+  replicas: 1
+  port: 8080
+gateway:
+  enabled: false
+  replicas: 1
+  sshPort: 2222
+  webPort: 8092
+  sshService:
+    type: ClusterIP
+    port: 2222
+jobs:
+  enabled: false
+  replicas: 1
+recordings:
+  enabled: false
+  replicas: 1
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+ingress:
+  enabled: false
+  className: ""
+  host: isolate.example.com
+  tlsSecret: isolate-tls
+  annotations: {}
+  # Configure this for your ingress controller: gateway upstream is TLS.
+  gatewayAnnotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+  # Route exactly /ssh (WSS upgrade) and /protocols to TLS gateway.
+migration:
+  enabled: false
+  acknowledgement: ""
+  command: []
+nodeSelector: {}
+tolerations: []
+affinity: {}

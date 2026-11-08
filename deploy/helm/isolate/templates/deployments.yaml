@@ -1,0 +1,112 @@
+{{- $root := . -}}
+{{- range $name := list "api" "gateway" "jobs" "recordings" }}
+{{- $component := index $root.Values $name }}
+{{- if $component.enabled }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "isolate.fullname" $root }}-{{ $name }}
+  labels:
+    app.kubernetes.io/name: {{ include "isolate.name" $root }}
+    app.kubernetes.io/instance: {{ $root.Release.Name }}
+    app.kubernetes.io/component: {{ $name }}
+spec:
+  replicas: {{ $component.replicas }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ $root.Release.Name }}
+      app.kubernetes.io/component: {{ $name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "isolate.name" $root }}
+        app.kubernetes.io/instance: {{ $root.Release.Name }}
+        app.kubernetes.io/component: {{ $name }}
+    spec:
+      serviceAccountName: {{ include "isolate.account" $root }}
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 60
+      securityContext:
+        seccompProfile:
+          type: RuntimeDefault
+      {{- with $root.Values.imagePullSecrets }}
+      imagePullSecrets: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- include "isolate.init" $root | nindent 6 }}
+      containers:
+        - name: {{ $name }}
+          image: {{ include "isolate.image" $root | quote }}
+          imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+          command: ["python", "-I", "-B", "/opt/auth/scripts/isolate-service.py"]
+          args: [{{ ternary "dashboard" $name (eq $name "api") | quote }}, "--config", {{ printf "/run/isolate/secrets/%s" $root.Values.secrets.configFile | quote }}]
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 2000
+            runAsGroup: 2000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: [ALL]
+          env:
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+          {{- if eq $name "api" }}
+          ports:
+            - name: http
+              containerPort: {{ $component.port }}
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+            periodSeconds: 15
+            timeoutSeconds: 10
+          livenessProbe:
+            tcpSocket:
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 20
+          {{- else }}
+          {{- if eq $name "gateway" }}
+          ports:
+            - name: ssh
+              containerPort: {{ $component.sshPort }}
+            - name: web
+              containerPort: {{ $component.webPort }}
+          {{- end }}
+          readinessProbe:
+            exec:
+              command: ["python", "-I", "-B", "/opt/auth/scripts/isolate-service.py", {{ $name | quote }}, "--config", {{ printf "/run/isolate/secrets/%s" $root.Values.secrets.configFile | quote }}, "--check"]
+            periodSeconds: 30
+            timeoutSeconds: 25
+          livenessProbe:
+            exec:
+              command: ["python", "-I", "-B", "-c", "import os; os.kill(1, 0)"]
+            initialDelaySeconds: 30
+            periodSeconds: 30
+          {{- end }}
+          startupProbe:
+            exec:
+              command: ["python", "-I", "-B", "/opt/auth/scripts/isolate-service.py", {{ ternary "dashboard" $name (eq $name "api") | quote }}, "--config", {{ printf "/run/isolate/secrets/%s" $root.Values.secrets.configFile | quote }}, "--check"]
+            periodSeconds: 15
+            timeoutSeconds: 25
+            failureThreshold: 20
+          resources: {{ toYaml $root.Values.resources | nindent 12 }}
+          volumeMounts: {{ include "isolate.mounts" $root | nindent 12 }}
+      volumes: {{ include "isolate.volumes" $root | nindent 8 }}
+      {{- with $root.Values.nodeSelector }}
+      nodeSelector: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.affinity }}
+      affinity: {{ toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $root.Values.tolerations }}
+      tolerations: {{ toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}
+{{- end }}

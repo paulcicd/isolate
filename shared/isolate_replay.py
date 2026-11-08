@@ -46,7 +46,24 @@ def _event_matches(event, connection_id):
     )
 
 
-def find_session(base_path, connection_id):
+def find_session(base_path, connection_id, archive_config=None, state_client=None, authorize_archive=None):
+    if (archive_config or {}).get("recordings", {}).get("enabled"):
+        from isolate_recordings import capture_root, RecordingNotFound
+        private_root = capture_root(archive_config)
+        private = _find_local_session(private_root, connection_id)
+        if private is not None:
+            return private
+        try:
+            return find_archived_session(archive_config, connection_id, state_client=state_client, authorize=authorize_archive)
+        except RecordingNotFound:
+            # Only an absent authority pointer permits legacy fallback. An S3
+            # outage, corrupt evidence or denied access must never downgrade.
+            if os.path.realpath(private_root) == os.path.realpath(base_path):
+                return None
+    return _find_local_session(base_path, connection_id)
+
+
+def _find_local_session(base_path, connection_id):
     matched_events = []
     matched_paths = []
     for path in _iter_session_files(base_path):
@@ -60,6 +77,32 @@ def find_session(base_path, connection_id):
     matched_events.sort(key=lambda event: float(event.get("ts") or 0))
     preferred_path = next((path for path, has_raw in matched_paths if has_raw), matched_paths[0][0])
     return build_session_details(preferred_path, matched_events)
+
+
+def find_archived_session(config, connection_id, state_client=None, authorize=None):
+    """Authorize signed metadata before fetching any remote recording contents.
+
+    Callers must supply their existing project/ownership permission check. There
+    is deliberately no implicit 'authenticated user may download everything'.
+    """
+    from isolate_recordings import RecordingArchive, RecordingError, RecordingIntegrityError
+    archive = RecordingArchive(config, state_client=state_client)
+    description = archive.describe(connection_id)
+    if authorize is None or authorize(description["metadata"]) is False:
+        raise RecordingError("archived recording permission check is required")
+    local = archive.materialize(connection_id, expected_revision=description["revision"])
+    session_path = local.get("session_path")
+    if not session_path:
+        raise RecordingIntegrityError("archived session metadata is missing")
+    events = [event for event in _load_events(session_path) if _event_matches(event, connection_id)]
+    if not events:
+        raise RecordingIntegrityError("archived events do not match the recording identity")
+    details = build_session_details(session_path, events)
+    details.update(raw_log_path=local.get("raw_log_path"), raw_meta_path=local.get("raw_meta_path"),
+                   archive_complete=local["complete"], archive_revision=description["revision"],
+                   archive_updated_at=description["updated_at"])
+    details["summary"]["raw_log_path"] = local.get("raw_log_path")
+    return details
 
 
 def build_session_details(session_path, events):

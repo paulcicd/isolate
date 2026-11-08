@@ -1,0 +1,32 @@
+name: isolate-state-integration
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: isolate_state_test
+      POSTGRES_PASSWORD: isolated-state-integration-password
+      POSTGRES_DB: isolate_state_test
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U isolate_state_test]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  redis:
+    image: redis:7.4-alpine
+    command: [redis-server, --appendonly, 'yes']
+    healthcheck:
+      test: [CMD, redis-cli, ping]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  runner:
+    build:
+      context: ../../..
+      dockerfile: tests/integration/state/Dockerfile
+    volumes:
+      - ../../..:/opt/auth:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy

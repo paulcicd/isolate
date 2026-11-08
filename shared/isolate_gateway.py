@@ -6,7 +6,7 @@ runtime authorization context. No interactive Unix login is needed here.
 """
 
 import asyncio
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 import ipaddress
 import json
 import logging
@@ -16,6 +16,8 @@ import shlex
 import signal
 import ssl
 import threading
+import time
+import uuid
 from urllib.parse import urlsplit
 
 import asyncssh
@@ -42,7 +44,7 @@ def _profile(context, config):
     audit = config.get("command_audit", {})
     if audit.get("enabled") and audit.get("mode") == "managed":
         raise GatewayError("This resource requires the managed command console")
-    if context.get("proxy"):
+    if context.get("proxy") and not context.get("proxy_chain"):
         # Chained gateways require independent authorization of each hop.
         raise GatewayError("Proxy hops are not enabled for gateway SSH")
     if context.get("decision", {}).get("sudo_mode", "none") not in ("none", "sudo-i"):
@@ -160,8 +162,8 @@ async def _prepare(runtime, context, disconnected):
 
 
 @asynccontextmanager
-async def upstream(runtime, context):
-    """Keep generated credentials alive until the target SSH connection closes."""
+async def _upstream_hop(runtime, context, tunnel=None):
+    """Keep credentials alive until this strictly pinned SSH hop closes."""
     from isolate_credentials import ssh_credentials
 
     config = runtime.config
@@ -202,6 +204,7 @@ async def upstream(runtime, context):
         options.update(known_hosts=known_hosts, config=[])
         connection = await asyncssh.connect(
             address, port=port, username=username,
+            tunnel=tunnel,
             agent_path=None,
             agent_forwarding=False,
             connect_timeout=max(1, min(60, float(_options(config).get("connect_timeout", 10)))),
@@ -216,6 +219,20 @@ async def upstream(runtime, context):
                 await asyncio.wait_for(connection.wait_closed(), 5)
         finally:
             await asyncio.to_thread(credentials.__exit__, None, None, None)
+
+
+@asynccontextmanager
+async def upstream(runtime, context):
+    """Open only the independently authorized, revision-bound inventory hops."""
+    _profile(context, runtime.config)
+    chain = list(context.get("proxy_chain") or [])
+    if len(chain) > 8:
+        raise GatewayError("SSH proxy chain exceeds the supported limit")
+    async with AsyncExitStack() as stack:
+        connection = None
+        for hop in chain + [context]:
+            connection = await stack.enter_async_context(_upstream_hop(runtime, hop, tunnel=connection))
+        yield connection
 
 
 async def _copy_output(runtime, context, reader, writer):
@@ -248,14 +265,156 @@ async def _copy_native_input(reader, process):
         await process.stdin.drain()
 
 
+def _ssh_features(config):
+    return _options(config).get("ssh_features") or {}
+
+
+class _NativeProcess(asyncssh.SSHServerProcess):
+    """Reserve channels before shell/subsystem negotiation, including idle ones."""
+
+    def __init__(self, owner, token):
+        self.owner = owner
+        self.token = token
+        self.active_handler = False
+        features = _ssh_features(owner.runtime.config)
+        factory = self._sftp if features.get("sftp") or features.get("scp") else None
+        super().__init__(owner.handle_process, factory, 3, features.get("scp") is True)
+
+    async def _sftp(self, channel):
+        from isolate_sftp_proxy import ProxySFTPServer
+        self.active_handler = True
+        try:
+            if self.owner.context["decision"].get("sudo_mode", "none") != "none":
+                raise GatewayError("File transfer requires a no-sudo target policy")
+            await self.owner.activate(self.token, "sftp")
+            connection = await self.owner.ensure_started()
+            client = await connection.start_sftp_client(path_encoding=None, sftp_version=3)
+            await self.owner.event("sftp_channel_start", channel_id=self.token,
+                                   transfer="scp" if self.command else "sftp")
+            return ProxySFTPServer(channel, self.owner, self.token, client)
+        except BaseException:
+            await self.owner.release(self.token)
+            raise
+
+    def subsystem_requested(self, subsystem):
+        return subsystem == "sftp" and _ssh_features(self.owner.runtime.config).get("sftp") is True
+
+    def exec_requested(self, command):
+        if command.startswith("scp ") and _ssh_features(self.owner.runtime.config).get("scp") is not True:
+            return False
+        return super().exec_requested(command)
+
+    def connection_lost(self, exc):
+        super().connection_lost(exc)
+        if not self.active_handler:
+            self.owner.spawn(self.owner.release(self.token, 255))
+
+
+class _ForwardSession(asyncssh.SSHTCPSession):
+    """Bounded, backpressured streams through the already-authorized target."""
+
+    def __init__(self, owner, token, reader, writer):
+        self.owner, self.token = owner, token
+        self.reader, self.writer = reader, writer
+        self.channel, self.task = None, None
+        self.queue = asyncio.Queue(maxsize=16)
+        self.writable = asyncio.Event()
+        self.writable.set()
+        self.counts = {"sent_bytes": 0, "received_bytes": 0}
+
+    def connection_made(self, channel):
+        self.channel = channel
+        self.task = self.owner.spawn(self.run())
+
+    def data_received(self, data, datatype):
+        self.channel.pause_reading()
+        try:
+            self.queue.put_nowait(data)
+        except asyncio.QueueFull:
+            self.channel.close()
+
+    def eof_received(self):
+        try:
+            self.queue.put_nowait(None)
+        except asyncio.QueueFull:
+            self.channel.close()
+        return True
+
+    def pause_writing(self):
+        self.writable.clear()
+
+    def resume_writing(self):
+        self.writable.set()
+
+    def connection_lost(self, exc):
+        self.writer.close()
+        if self.task and not self.task.done():
+            self.task.cancel()
+
+    async def run(self):
+        async def incoming():
+            while True:
+                data = await self.queue.get()
+                if data is None:
+                    self.writer.write_eof()
+                    return
+                self.writer.write(data)
+                self.counts["sent_bytes"] += len(data)
+                await self.writer.drain()
+                self.channel.resume_reading()
+        async def outgoing():
+            while True:
+                data = await self.reader.read(CHUNK_SIZE)
+                if not data:
+                    self.channel.write_eof()
+                    return
+                self.channel.write(data)
+                self.counts["received_bytes"] += len(data)
+                await self.writable.wait()
+        tasks = [asyncio.create_task(incoming()), asyncio.create_task(outgoing())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            await _cancel(tasks)
+            self.writer.close()
+            self.channel.close()
+            try:
+                await self.owner.event("ssh_forward_end", channel_id=self.token, **self.counts)
+            finally:
+                await self.owner.release(self.token)
+
+
 class _TicketSSHServer(asyncssh.SSHServer):
-    def __init__(self, runtime, state):
+    def __init__(self, runtime, state, handlers=None):
         self.runtime = runtime
         self.state = state
+        self.handlers = handlers if handlers is not None else set()
         self.connection = None
         self.context = None
         self.channel_started = False
         self.auth_attempts = 0
+        self.channels = {}
+        self._channels_empty = asyncio.Event()
+        self._channels_empty.set()
+        self._start_lock = asyncio.Lock()
+        self._upstream_manager = None
+        self._upstream = None
+        self._watcher = None
+        self._auth_expiry = None
+        self._shutdown_task = None
+        self._finalized = False
+        self._startup_failed = False
+        self.exit_code = 0
+
+    def spawn(self, coroutine):
+        task = asyncio.create_task(coroutine)
+        self.handlers.add(task)
+        def finished(item):
+            self.handlers.discard(item)
+            if not item.cancelled():
+                item.exception()
+        task.add_done_callback(finished)
+        return task
 
     def connection_made(self, connection):
         self.connection = connection
@@ -267,8 +426,10 @@ class _TicketSSHServer(asyncssh.SSHServer):
 
     def connection_lost(self, exc):
         self.state.discard(self.connection)
-        if self.context is not None and not self.channel_started:
-            asyncio.create_task(_finish(self.runtime, self.context, 255))
+        if exc is not None or self.channels:
+            self.exit_code = 255
+        if self._shutdown_task is None:
+            self._shutdown_task = self.spawn(self.shutdown())
 
     def begin_auth(self, username):
         return True
@@ -280,7 +441,31 @@ class _TicketSSHServer(asyncssh.SSHServer):
         return False
 
     def kbdint_auth_supported(self):
-        return False
+        return _options(self.runtime.config).get("browser_auth", {}).get("enabled") is True
+
+    async def get_kbdint_challenge(self, username, lang, submethods):
+        from isolate_ssh_browser import ssh_challenge
+        return await ssh_challenge(self, username)
+
+    async def validate_kbdint_response(self, username, responses):
+        from isolate_ssh_browser import ssh_response
+        return await ssh_response(self, username, responses)
+
+    async def set_context(self, context, username):
+        if self.context is not None or str(context["host"]["server_id"]) != username:
+            raise GatewayError("SSH username must be the authorized resource ID")
+        _profile(context, self.runtime.config)
+        self.context = context
+        if type(context.get("deadline")) in (int, float):
+            self._auth_expiry = self.spawn(self.expire_authentication())
+        return True
+
+    async def expire_authentication(self):
+        # An authenticated ControlMaster/-N transport may not open a channel at
+        # all. Bound its lifetime even before prepare starts the active watch.
+        await asyncio.sleep(max(0, self.context["deadline"] - time.time()))
+        self.exit_code = 255
+        self.connection.close()
 
     async def validate_password(self, username, password):
         self.auth_attempts += 1
@@ -292,17 +477,161 @@ class _TicketSSHServer(asyncssh.SSHServer):
         try:
             peer = self.connection.get_extra_info("peername")
             context = await _call(self.runtime, "consume_ticket", password, protocol="ssh", source_ip=peer[0])
-            self.context = context
-            if str(context["host"]["server_id"]) != username:
-                raise GatewayError("SSH username must be the authorized resource ID")
-            _profile(context, self.runtime.config)
-            return True
+            return await self.set_context(context, username)
         except Exception:
             # Never disclose or log credentials, tokens, or a detailed auth error.
             return False
 
-    def connection_requested(self, *args):
-        return False
+    def reserve(self):
+        features = _ssh_features(self.runtime.config)
+        if self.context is None or self._finalized or self.connection.is_closed():
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "Session is unavailable")
+        if features.get("multiple_channels") is not True and self.channel_started:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "Additional channels are disabled")
+        maximum = max(1, min(32, int(features.get("max_channels", 8))))
+        if len(self.channels) >= maximum:
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_RESOURCE_SHORTAGE, "Channel limit reached")
+        token = uuid.uuid4().hex
+        self.channels[token] = {"action": "pending"}
+        self._channels_empty.clear()
+        self.channel_started = True
+        return token
+
+    def session_requested(self):
+        return _NativeProcess(self, self.reserve())
+
+    async def authorize(self, action, destination=None):
+        if self.context is None or self._finalized:
+            raise GatewayError("Session is unavailable")
+        if hasattr(self.runtime, "authorize_channel"):
+            return await _call(self.runtime, "authorize_channel", self.context, action, destination=destination)
+        if action != "ssh":
+            raise GatewayError("Channel authorization is unavailable")
+        await _call(self.runtime, "recheck", self.context)
+        return None
+
+    async def activate(self, token, action, destination=None):
+        if token not in self.channels:
+            raise GatewayError("Channel is no longer available")
+        pinned = await self.authorize(action, destination)
+        self.channels[token].update(action=action, destination=destination, pinned=pinned)
+        return pinned
+
+    async def event(self, event, **fields):
+        if hasattr(self.runtime, "channel_event"):
+            await _call(self.runtime, "channel_event", self.context, event, **fields)
+        elif any(value.get("action") in ("sftp", "forward") for value in self.channels.values()):
+            raise GatewayError("Channel auditing is unavailable")
+
+    async def ensure_started(self):
+        async with self._start_lock:
+            if self._finalized or self._startup_failed:
+                raise GatewayError("Session is unavailable")
+            if self._upstream is None:
+                try:
+                    await _prepare(self.runtime, self.context, self.connection.wait_closed())
+                    await _call(self.runtime, "start", self.context)
+                    self._watcher = self.spawn(self.watch_channels())
+                    self._upstream_manager = upstream(self.runtime, self.context)
+                    self._upstream = await self._upstream_manager.__aenter__()
+                except BaseException:
+                    self.exit_code = 255
+                    self._startup_failed = True
+                    raise
+            return self._upstream
+
+    async def watch_channels(self):
+        interval = max(0.2, min(30.0, float(_options(self.runtime.config).get("recheck_interval", 2))))
+        try:
+            while True:
+                await asyncio.sleep(interval)
+                if hasattr(self.runtime, "recheck_channels"):
+                    snapshot = {key: dict(value) for key, value in self.channels.items()}
+                    checked = await _call(self.runtime, "recheck_channels", self.context, snapshot)
+                    if any(checked[key] != snapshot[key].get("pinned") for key in checked):
+                        raise GatewayError("Channel route or authorization changed")
+                    continue
+                await _call(self.runtime, "recheck", self.context)
+                for channel in tuple(self.channels.values()):
+                    if channel["action"] in ("sftp", "forward"):
+                        fresh = await self.authorize(channel["action"], channel.get("destination"))
+                        if fresh != channel.get("pinned"):
+                            raise GatewayError("Channel route or authorization changed")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.exit_code = 255
+            self.connection.close()
+
+    async def release(self, token, exit_code=None):
+        removed = self.channels.pop(token, None)
+        if removed is None:
+            return
+        if exit_code:
+            self.exit_code = exit_code
+        if not self.channels:
+            self._channels_empty.set()
+        if _ssh_features(self.runtime.config).get("multiple_channels") is not True:
+            await self.shutdown()
+
+    async def shutdown(self):
+        if self._finalized:
+            return
+        self._finalized = True
+        if self.context is not None:
+            self.context.setdefault("_cancel_event", threading.Event()).set()
+        if self._watcher and self._watcher is not asyncio.current_task():
+            await _cancel([self._watcher])
+        if self._auth_expiry and self._auth_expiry is not asyncio.current_task():
+            await _cancel([self._auth_expiry])
+        async with self._start_lock:
+            if self._upstream_manager and self._upstream is not None:
+                try:
+                    await self._upstream_manager.__aexit__(None, None, None)
+                except Exception:
+                    LOG.error("Could not close the upstream SSH context")
+            self._upstream = None
+            if self.channels:
+                try:
+                    await asyncio.wait_for(self._channels_empty.wait(), 5)
+                except asyncio.TimeoutError:
+                    self.exit_code = 255
+            if self.context is not None:
+                await _finish(self.runtime, self.context, self.exit_code)
+
+    async def handle_process(self, process):
+        process.active_handler = True
+        task = asyncio.current_task()
+        self.handlers.add(task)
+        try:
+            await native_process(process, self.runtime)
+        finally:
+            self.handlers.discard(task)
+
+    def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
+        if _ssh_features(self.runtime.config).get("forwarding") is not True:
+            return False
+        return self.open_forward(dest_host, dest_port)
+
+    async def open_forward(self, dest_host, dest_port):
+        token, writer = self.reserve(), None
+        try:
+            destination = {"host": dest_host, "port": dest_port}
+            pinned = await self.activate(token, "forward", destination)
+            if (not isinstance(pinned, dict) or type(pinned.get("port")) is not int
+                    or not 1 <= pinned["port"] <= 65535):
+                raise GatewayError("Forwarding requires a pinned target")
+            address = str(ipaddress.ip_address(pinned["host"]))
+            connection = await self.ensure_started()
+            await self.event("ssh_forward_start", channel_id=token, destination_host=address, destination_port=pinned["port"])
+            reader, writer = await connection.open_connection(address, pinned["port"], encoding=None)
+        except BaseException:
+            if writer:
+                writer.close()
+            await self.release(token)
+            raise asyncssh.ChannelOpenError(asyncssh.OPEN_ADMINISTRATIVELY_PROHIBITED, "Forwarding is not permitted") from None
+
+        return _ForwardSession(self, token, reader, writer)
 
     def server_requested(self, *args):
         return False
@@ -316,49 +645,44 @@ class _TicketSSHServer(asyncssh.SSHServer):
 
 async def native_process(process, runtime):
     server = process.get_extra_info("isolate_server")
-    if server is None or server.context is None or server.channel_started or process.subsystem:
+    token = getattr(process, "token", None)
+    if server is None or server.context is None or token not in server.channels or process.subsystem:
         process.stderr.write(b"Session refused\r\n")
         process.exit(126)
         return
-    server.channel_started = True
-    context = server.context
-    exit_code = 255
-    tasks = []
-    remote = None
+    context, exit_code, tasks, remote = server.context, 255, [], None
     try:
         _profile(context, runtime.config)
-        await _prepare(runtime, context, process.wait_closed())
-        await _call(runtime, "start", context)
-        async with upstream(runtime, context) as connection:
-            term_type = process.term_type
-            term_size = process.term_size[:2] if term_type else (80, 24)
-            if term_type:
-                term_type = _terminal(term_type)
-                term_size = _size(*term_size)
-            remote = await connection.create_process(
-                _command(context, process.command), term_type=term_type,
-                term_size=term_size, encoding=None, env={},
+        await server.activate(token, "ssh")
+        connection = await server.ensure_started()
+        await server.event("ssh_channel_start", channel_id=token, channel_type="exec" if process.command else "shell")
+        term_type = process.term_type
+        term_size = process.term_size[:2] if term_type else (80, 24)
+        if term_type:
+            term_type = _terminal(term_type)
+            term_size = _size(*term_size)
+        remote = await connection.create_process(
+            _command(context, process.command), term_type=term_type,
+            term_size=term_size, encoding=None, env={},
+        )
+        tasks.append(asyncio.create_task(_copy_native_input(process.stdin, remote)))
+
+        async def transfer():
+            await asyncio.gather(
+                _copy_output(runtime, context, remote.stdout, process.stdout),
+                _copy_output(runtime, context, remote.stderr, process.stderr),
             )
-            input_task = asyncio.create_task(_copy_native_input(process.stdin, remote))
-            tasks.append(input_task)
+            result = await remote.wait()
+            return result.exit_status if result.exit_status is not None else 255
 
-            async def transfer():
-                await asyncio.gather(
-                    _copy_output(runtime, context, remote.stdout, process.stdout),
-                    _copy_output(runtime, context, remote.stderr, process.stderr),
-                )
-                result = await remote.wait()
-                return result.exit_status if result.exit_status is not None else 255
-
-            output = asyncio.create_task(transfer())
-            watch = asyncio.create_task(_watch(runtime, context, runtime.config))
-            closed = asyncio.create_task(process.wait_closed())
-            tasks.extend([output, watch, closed])
-            done, _ = await asyncio.wait([output, watch, closed], return_when=asyncio.FIRST_COMPLETED)
-            for item in done:
-                result = await item
-                if item is output:
-                    exit_code = result
+        output = asyncio.create_task(transfer())
+        closed = asyncio.create_task(process.wait_closed())
+        tasks.extend([output, closed])
+        done, _ = await asyncio.wait([output, closed], return_when=asyncio.FIRST_COMPLETED)
+        for item in done:
+            result = await item
+            if item is output:
+                exit_code = result
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -371,8 +695,9 @@ async def native_process(process, runtime):
         if remote:
             remote.close()
         try:
-            await _finish(runtime, context, exit_code)
+            await server.event("ssh_channel_end", channel_id=token, exit_code=exit_code)
         finally:
+            await server.release(token, exit_code)
             process.exit(exit_code)
 
 
@@ -384,20 +709,14 @@ async def create_native_listener(runtime, host=None, port=None):
     state = set()
     handlers = set()
 
-    async def handle(process):
-        task = asyncio.current_task()
-        handlers.add(task)
-        try:
-            await native_process(process, runtime)
-        finally:
-            handlers.discard(task)
-
+    browser = options.get("browser_auth") or {}
+    login_timeout = max(15, min(610, int(browser.get("timeout_seconds", 120)) + 10)) if browser.get("enabled") else 15
     listener = await asyncssh.create_server(
-        lambda: _TicketSSHServer(runtime, state),
+        lambda: _TicketSSHServer(runtime, state, handlers),
         host if host is not None else options.get("listen_host", "127.0.0.1"),
         port if port is not None else int(options.get("ssh_port", 2222)),
-        server_host_keys=[key], process_factory=handle,
-        encoding=None, login_timeout=15, config=[], line_editor=False, line_echo=False,
+        server_host_keys=[key],
+        encoding=None, login_timeout=login_timeout, config=[], line_editor=False, line_echo=False,
         allow_pty=True, agent_forwarding=False, x11_forwarding=False,
         allow_scp=False, window=262144, max_pktsize=CHUNK_SIZE,
     )
@@ -496,7 +815,8 @@ async def websocket_ssh(request):
                 await ws.send_json({"type": "exit", "code": exit_code})
     except asyncio.CancelledError:
         raise
-    except Exception:
+    except Exception as exc:
+        LOG.warning("Web SSH connection failed: %s", type(exc).__name__)
         if not ws.closed and ws.prepared:
             await ws.send_json({"type": "error", "message": "Authorization or upstream SSH connection failed"})
     finally:

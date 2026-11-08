@@ -25,6 +25,10 @@ def _project_name(project):
 def _subject_matches(grant, identity):
     subject = grant.get("subject")
     name = grant.get("name")
+    if identity.get("principal_type") == "service":
+        return subject == "service" and bool(identity.get("service_client_id")) and name == identity["service_client_id"]
+    if subject == "service":
+        return False
     if subject == "user":
         if "keycloak_sub" in grant:
             return bool(grant["keycloak_sub"]) and grant["keycloak_sub"] == identity.get("keycloak_sub")

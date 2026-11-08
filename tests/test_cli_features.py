@@ -219,7 +219,7 @@ class CLIFeatureTests(unittest.TestCase):
             config, identity = isolate._job_context()
         self.assertIs(config, self.config)
         self.assertEqual(identity, self.identity)
-        bind.assert_called_once_with("signed-token", self.config, "unix-alex")
+        bind.assert_called_once_with("signed-token", self.config, "unix-alex", redis=mock.ANY)
 
     def test_operational_context_rejects_unbound_non_linux_calls(self):
         with mock.patch.object(isolate_connection_auth, "trusted_config", return_value=self.config), \

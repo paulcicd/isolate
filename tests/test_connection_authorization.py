@@ -22,8 +22,11 @@ from isolate_ssh import SSHArgumentError, build_ssh_argv
 class Redis:
     def __init__(self):
         self.values = {}
-    def set(self, key, value):
+    def set(self, key, value, nx=False):
+        if nx and key in self.values:
+            return False
         self.values[key] = value
+        return True
     def get(self, key):
         return self.values.get(key)
     def keys(self, pattern):

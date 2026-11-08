@@ -13,6 +13,11 @@ SUPPORTED_AUDIT_SINKS = {"jsonl", "syslog", "sql"}
 
 
 def validate_config(config, check_paths=False):
+    from isolate_config import canonical_identity_config
+    try:
+        config = canonical_identity_config(config)
+    except Exception:
+        return {"valid": False, "errors": ["identity provider configuration is invalid"], "warnings": []}
     errors = []
     warnings = []
 
@@ -451,11 +456,39 @@ def run_health_checks(config, redis_factory=create_redis_client):
         }
     }
 
+    sql = config.get("state", {}).get("backend", "redis") != "redis"
+    control = None
     try:
-        redis_factory(config).ping()
+        control = redis_factory(config)
+        (control.redis if sql else control).ping()
         checks["redis"] = {"ok": True}
-    except Exception as exc:
-        checks["redis"] = {"ok": False, "error": str(exc)}
+    except Exception:
+        checks["redis"] = {"ok": False, "error": "ephemeral store is unavailable"}
+    if sql:
+        try:
+            if control is None:
+                raise RuntimeError("control store is unavailable")
+            with control.state.connection():
+                pass
+            metadata = control.metadata()
+            checks["state"] = {"ok": metadata.get("status") == "active",
+                **{key: metadata.get(key) for key in ("schema_version", "generation", "status")}}
+        except Exception:
+            checks["state"] = {"ok": False, "error": "SQL authority is unavailable or inactive"}
+
+    if config.get("recordings", {}).get("enabled"):
+        try:
+            from isolate_recordings import RecordingArchive
+            archive = RecordingArchive(config)
+            pending = os.path.join(archive.outbox, "pending")
+            paths = [os.path.join(pending, name) for name in os.listdir(pending) if name.endswith(".json")]
+            import time
+            oldest = max((max(0, time.time() - os.stat(path).st_mtime) for path in paths), default=0)
+            limit = max(1, float(config["recordings"].get("max_outbox_age_seconds", 300)))
+            checks["recordings"] = {"ok": oldest < limit, "pending": len(paths),
+                "oldest_pending_seconds": int(oldest), "scope": "local_outbox"}
+        except Exception:
+            checks["recordings"] = {"ok": False, "error": "private recording outbox is unavailable"}
 
     log_path = config.get("logging", {}).get("base_path")
     log_ok = bool(log_path and os.path.isdir(log_path) and os.access(log_path, os.W_OK | os.X_OK))

@@ -134,8 +134,8 @@ def validate_bundle(bundle):
             continue
         grant = grant or {}
         label = "grants[{}]".format(index)
-        if grant.get("subject") not in ("user", "group", "role"):
-            errors.append("{}.subject must be user, group, or role".format(label))
+        if grant.get("subject") not in ("user", "group", "role", "service"):
+            errors.append("{}.subject must be user, group, role, or service".format(label))
         if not grant.get("name"):
             errors.append("{}.name is required".format(label))
         selectors = [key for key in ("project", "project_glob", "project_set") if grant.get(key) is not None]
@@ -324,6 +324,8 @@ def _principal_identity(subject, name):
         identity["groups"] = [name]
     elif subject == "role":
         identity["roles"] = [name]
+    elif subject == "service":
+        identity.update(principal_type="service", service_client_id=name)
     return identity
 
 

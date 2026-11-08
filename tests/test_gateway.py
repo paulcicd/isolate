@@ -34,6 +34,7 @@ class FixtureRuntime:
         self.started = []
         self.finished = []
         self.output = []
+        self.events = []
         self.revoked = threading.Event()
         self.lock = threading.Lock()
 
@@ -69,6 +70,22 @@ class FixtureRuntime:
     def record_output(self, context, value):
         self.output.append(value)
 
+    def authorize_channel(self, context, action, destination=None):
+        self.recheck(context)
+        if action == "ssh":
+            return None
+        if action not in context.get("channel_actions", []):
+            raise ValueError("Channel action is not permitted")
+        if action == "forward":
+            for item in self.config.get("gateway", {}).get("forwarding_targets", {}).get("42", []):
+                if destination == {"host": item["host"], "port": item["port"]}:
+                    return {"host": item["address"], "port": item["port"]}
+            raise ValueError("Forward destination is not permitted")
+        return None
+
+    def channel_event(self, context, event, **fields):
+        self.events.append({"event": event, **fields})
+
 
 @unittest.skipUnless(asyncssh, "Gateway integration requires asyncssh and aiohttp")
 class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
@@ -79,12 +96,17 @@ class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.gateway_key = asyncssh.generate_private_key("ssh-ed25519")
         self.gateway_key.write_private_key(str(self.root / "gateway_key"))
         self.target_users = []
+        self.sftp_root = self.root / "target-files"
+        self.sftp_root.mkdir()
         owner = self
 
         class Target(asyncssh.SSHServer):
             def begin_auth(self, username):
                 owner.target_users.append(username)
                 return False
+
+            def connection_requested(self, dest_host, dest_port, orig_host, orig_port):
+                return True
 
         async def target_process(process):
             if process.command:
@@ -105,6 +127,7 @@ class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
         self.target = await asyncssh.create_server(
             Target, "127.0.0.1", 0, server_host_keys=[self.upstream_key],
             process_factory=target_process, encoding=None,
+            sftp_factory=lambda channel: asyncssh.SFTPServer(channel, chroot=str(self.sftp_root)),
         )
         target_port = self.target.get_port()
         (self.root / "known_hosts").write_bytes(
@@ -154,6 +177,11 @@ class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
             agent_path=None, preferred_auth="password", login_timeout=3,
         )
 
+    async def wait_finished(self, connection_id):
+        async with asyncio.timeout(5):
+            while not any(item[0] == connection_id for item in self.runtime.finished):
+                await asyncio.sleep(0.01)
+
     async def test_native_exec_preserves_exit_status_and_policy_remote_user(self):
         ticket = self.runtime.ticket("native-exec")
         async with await self.connect(ticket) as client:
@@ -179,8 +207,8 @@ class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
                 await client.open_connection("127.0.0.1", self.target.get_port())
             process = await client.create_process()
             self.assertEqual(await process.stdout.readline(), "target-ready\n")
-            second = await client.run("id", check=False)
-            self.assertEqual(second.exit_status, 126)
+            with self.assertRaises(asyncssh.ChannelOpenError):
+                await client.run("id", check=False)
             process.stdin.write("exit\n")
             await asyncio.wait_for(process.wait(), 3)
 
@@ -190,7 +218,8 @@ class GatewayIntegrationTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(await process.stdout.readline(), "target-ready\n")
             self.runtime.revoked.set()
             result = await asyncio.wait_for(process.wait(), 3)
-            self.assertEqual(result.exit_status, 255)
+            self.assertIn(result.exit_status, (None, 255))
+        await self.wait_finished("revoke")
         self.assertIn(("revoke", 255), self.runtime.finished)
 
     async def test_upstream_host_key_mismatch_fails_closed(self):

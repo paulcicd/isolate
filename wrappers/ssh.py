@@ -249,6 +249,8 @@ def _write_raw_log(raw_log, data):
     text = data.decode('utf-8', errors='replace')
     raw_log.write('{0:.6f}\n{1}'.format(time.time(), text))
     raw_log.flush()
+    if getattr(raw_log, "_isolate_private_capture", False):
+        os.fsync(raw_log.fileno())
 
 
 def _terminate_child(proc):
@@ -441,6 +443,8 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
             LOGGER.warning("active session registry start failed: {}".format(exc))
 
     def session_control(force=False):
+        if (config or {}).get("recordings", {}).get("enabled") and os.path.isfile(raw_log_path):
+            audit.archive_file(raw_log_path)
         if authorization is not None:
             now = time.time()
             interval = max(1, min(60, int((config or {}).get("connection_authorization", {}).get("recheck_interval", 5))))
@@ -488,12 +492,13 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
                 alert_record["duration_seconds"] = int(now) - int(alert_record.get("started_at") or now)
                 audit.event("session_alert", alert=alert_name, **metadata)
                 dispatch_alert_async(config, alert_name, alert_record, redis=redis)
-            if control_cfg.get("terminate_enabled", False) and record and record.get("terminate_requested"):
+            from isolate_sessions import termination_requested
+            if control_cfg.get("terminate_enabled", False) and termination_requested(redis, metadata["connection_id"]):
                 control_state["terminated"] = True
                 audit.event(
                     "session_termination_received",
-                    requested_by=record.get("terminate_requested_by"),
-                    reason=record.get("terminate_reason"),
+                    requested_by=(record or {}).get("terminate_requested_by"),
+                    reason=(record or {}).get("terminate_reason"),
                     **metadata
                 )
         except Exception as exc:
@@ -501,8 +506,10 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
         return control_state["terminated"]
 
     with open(raw_log_path, 'a', encoding='utf-8', errors='replace') as raw_log:
+        private_capture = (config or {}).get("recordings", {}).get("enabled", False)
+        raw_log._isolate_private_capture = private_capture
         try:
-            os.chmod(raw_log_path, 0o660)
+            os.chmod(raw_log_path, 0o600 if private_capture else 0o660)
         except PermissionError:
             pass
         if authorization is not None and audit_mode(config) != "managed" and session_control(force=True):
@@ -529,6 +536,8 @@ def run_command(argv, raw_log_path, audit, metadata, config=None, authorization=
         duration=round(time.time() - started, 3),
         **metadata
     )
+    if (config or {}).get("recordings", {}).get("enabled"):
+        audit.close_archive(raw_log_path)
     if redis is not None and metadata.get("connection_id"):
         try:
             mark_session_end(redis, metadata["connection_id"], exit_code=exit_code)
@@ -608,7 +617,11 @@ if __name__ == '__main__':
         identity,
         session_id=connection_id,
         logging_config=config.get("logging", {}),
+        archive_config=config,
+        state_client=redis,
     )
+    if config.get("recordings", {}).get("enabled"):
+        raw_log_path = os.path.join(audit.session_dir, "terminal.log")
     remote_command = None if managed_commands or host_meta['nosudo'] else 'sudo -i'
     proxy = authorization["proxy"]
     try:

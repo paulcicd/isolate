@@ -60,7 +60,8 @@ def prepare_authorization_file(config=None):
     """
     import pwd
     cache = _load_token_cache()
-    kind = (config or {}).get("keycloak", {}).get("token_kind", "id_token")
+    from isolate_oidc import identity_provider_config
+    kind = identity_provider_config(config or {}).get("token_kind", "id_token")
     if not cache.get(kind):
         raise IdentityError("run isolate login before connecting")
     fd, path = tempfile.mkstemp(prefix="isolate-authorization-{}-".format(os.getuid()), dir="/tmp")
@@ -103,15 +104,19 @@ def read_authorization_file(path, uid):
     return token
 
 
-def bind_identity(token, config, username):
-    keycloak = config.get("keycloak", {})
+def bind_identity(token, config, username, redis=None):
+    from isolate_oidc import identity_provider_config
+    keycloak = identity_provider_config(config)
     if not keycloak.get("issuer") or not keycloak.get("verify_tokens", True) or not keycloak.get("tls_verify", True):
         raise ConnectionDenied("verified Keycloak identity and TLS are required")
     claims = verify_jwt_claims(token, keycloak)
     audiences = claims.get("aud") if isinstance(claims.get("aud"), list) else [claims.get("aud")]
     if (keycloak.get("expected_audience") or keycloak.get("client_id")) not in audiences:
         raise ConnectionDenied("identity token has the wrong audience")
-    identity = normalize_claims(claims)
+    identity = normalize_claims(claims, keycloak)
+    workload_clients = config.get("identity_security", {}).get("workloads", {}).get("clients", {})
+    if claims.get("isolate_principal_type") == "service" or claims.get("azp") in workload_clients:
+        raise ConnectionDenied("workload identities must use the authenticated API")
     if not identity.get("keycloak_sub") or not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", str(identity.get("username") or "")) or identity["username"] in (".", ".."):
         raise ConnectionDenied("invalid identity subject or username")
     options = config.get("connection_authorization", {})
@@ -121,6 +126,11 @@ def bind_identity(token, config, username):
             raise ConnectionDenied("Keycloak subject is not assigned to this Unix account")
     elif options.get("require_explicit_mapping") or identity["username"] != username:
         raise ConnectionDenied("Keycloak identity is not assigned to this Unix account")
+    if redis is not None:
+        from isolate_identity_security import refresh_identity
+        identity = refresh_identity(redis, config, identity, token=token)
+    elif keycloak.get("provider") == "oidc":
+        raise ConnectionDenied("OIDC requires a bound control store")
     return identity
 
 
@@ -139,7 +149,7 @@ def authorize_connection(args, token, config, redis, username, now=None):
     options = config.get("connection_authorization", {})
     if options.get("connections_enabled", True) is not True:
         raise ConnectionDenied("new SSH connections are disabled")
-    identity = bind_identity(token, config, username)
+    identity = bind_identity(token, config, username, redis=redis)
     if not args.host_id or not str(args.host_id).isdigit():
         raise ConnectionDenied("an inventory host ID is required")
     host = get_host(redis, args.host_id)
@@ -192,12 +202,16 @@ def authorize_connection(args, token, config, redis, username, now=None):
     if expires <= now:
         raise ConnectionDenied("connection authorization expired")
     return {"identity": identity, "host": host, "decision": decision, "proxy": proxy,
+            "authority_epoch": __import__("isolate_recovery").authority_epoch(redis, config),
             "deadline": expires, "username": username, "token": token, "args": args}
 
 
 def recheck_connection(context, config, redis):
     if time.time() >= context["deadline"]:
         raise ConnectionDenied("session authorization expired")
+    from isolate_recovery import authority_epoch
+    if context.get("authority_epoch") != authority_epoch(redis, config):
+        raise ConnectionDenied("session predates the recovery boundary")
     current = authorize_connection(context["args"], context["token"], config, redis, context["username"])
     if current["proxy"] != context["proxy"]:
         raise ConnectionDenied("proxy authorization changed")
@@ -243,6 +257,8 @@ def wait_for_connection_approval(context, config, redis, connection_id, source_i
         while True:
             current_config = refresh_config() if refresh_config else config
             current = authorize_connection(context["args"], context["token"], current_config, redis, context["username"])
+            if current.get("authority_epoch") != context.get("authority_epoch"):
+                raise ConnectionDenied("pending session predates the recovery boundary")
             if current["proxy"] != context["proxy"]:
                 raise ConnectionDenied("proxy authorization changed while awaiting approval")
             latest = get_session_approval(redis, request_id, config=current_config)

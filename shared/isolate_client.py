@@ -34,8 +34,9 @@ class APIClient:
         self.opener = request.build_opener(request.HTTPSHandler(context=ssl.create_default_context(
             cafile=config.get("api", {}).get("ca_file"))), _NoRedirect())
 
-    def call(self, path, body=None):
-        token = _load_token_cache().get(self.config.get("keycloak", {}).get("token_kind", "id_token"))
+    def call(self, path, body=None, token=None):
+        from isolate_oidc import identity_provider_config
+        token = token or _load_token_cache().get(identity_provider_config(self.config).get("token_kind", "id_token"))
         if not token:
             raise IdentityError("run isolate login before using the API")
         payload = json.dumps(body).encode() if body is not None else None
@@ -65,6 +66,21 @@ class APIClient:
                 return rows
             offset = int(page["next_offset"])
         raise ClientError("inventory exceeds client pagination limit")
+
+
+def verify_client_identity(config, token, identity):
+    """The control API checks binding/lifecycle; public clients never need Redis."""
+    try:
+        current = APIClient(config).call("/api/v1/me", token=token)
+    except ClientError as exc:
+        raise IdentityError("control API could not verify the current identity") from exc
+    if not isinstance(current, dict) or current.get("keycloak_sub") != identity.get("keycloak_sub"):
+        raise IdentityError("control API returned a different identity subject")
+    result = dict(identity)
+    for key in ("username", "email", "groups", "roles", "exp"):
+        if key in current:
+            result[key] = current[key]
+    return result
 
 
 async def connect(config, host_id, command=None):

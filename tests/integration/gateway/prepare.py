@@ -65,6 +65,21 @@ def main():
             'credentials': [{'type': 'password', 'value': 'isolated-integration-user-password', 'temporary': False}],
             'groups': ['/Integration-Operators']}],
     }
+    realm['clients'][0]['protocolMappers'].append({
+        'name': 'integration-job-scope', 'protocol': 'openid-connect',
+        'protocolMapper': 'oidc-hardcoded-claim-mapper', 'consentRequired': False,
+        'config': {'claim.name': 'scp', 'claim.value': 'isolate.execute',
+                   'jsonType.label': 'String', 'id.token.claim': 'true', 'access.token.claim': 'true'}})
+    for name, roles in (
+            ('membership-reader', ['view-users', 'query-users', 'view-realm']),
+            ('fixture-admin', ['manage-users', 'view-users', 'query-users', 'query-groups'])):
+        realm['clients'].append({'clientId': 'isolate-' + name, 'enabled': True,
+            'protocol': 'openid-connect', 'publicClient': False,
+            'secret': 'isolated-' + name + '-secret', 'standardFlowEnabled': False,
+            'directAccessGrantsEnabled': False, 'serviceAccountsEnabled': True,
+            'fullScopeAllowed': True})
+        realm['users'].append({'username': 'service-account-isolate-' + name, 'enabled': True,
+            'serviceAccountClientId': 'isolate-' + name, 'clientRoles': {'realm-management': roles}})
     (directory / 'isolate-integration-realm.json').write_text(json.dumps(realm), encoding='utf-8')
     print('Generated isolated test CA and realm; user password grant is disabled', flush=True)
 

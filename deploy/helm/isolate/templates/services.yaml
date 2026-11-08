@@ -1,0 +1,43 @@
+{{- if .Values.api.enabled }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "isolate.fullname" . }}-api
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: api
+  ports:
+    - name: http
+      port: {{ .Values.api.port }}
+      targetPort: http
+{{- end }}
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "isolate.fullname" . }}-web
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: web
+      port: {{ .Values.gateway.webPort }}
+      targetPort: web
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "isolate.fullname" . }}-ssh
+spec:
+  type: {{ .Values.gateway.sshService.type }}
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gateway
+  ports:
+    - name: ssh
+      port: {{ .Values.gateway.sshService.port }}
+      targetPort: ssh
+{{- end }}

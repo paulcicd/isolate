@@ -2721,6 +2721,13 @@ class OperationsConvenienceFeaturesTest(unittest.TestCase):
 
 
 class DashboardTest(unittest.TestCase):
+    def setUp(self):
+        # Browser identity binding is authoritative even for local replay pages.
+        # Never let an isolated dashboard fixture contact the operator's Redis.
+        patch = mock.patch.object(isolate_web, "redis_client", return_value=FakeRedis())
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_oidc_metadata_timeout_is_bounded_and_returns_503(self):
         from requests.exceptions import Timeout
         app = isolate_web.create_app({"dashboard": {"public_url": "https://bastion.example"}, "keycloak": {"issuer": "https://id.example", "client_id": "isolate"}, "logging": {}})

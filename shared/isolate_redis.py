@@ -12,6 +12,9 @@ def redis_options(config):
         "password": redis_cfg.get("password"),
         "socket_timeout": float(redis_cfg.get("socket_timeout", 3)),
     }
+    if redis_cfg.get("password_file"):
+        from isolate_oidc import read_client_secret
+        options["password"] = read_client_secret({"client_secret_file": redis_cfg["password_file"]})
     if redis_cfg.get("username"):
         options["username"] = redis_cfg["username"]
     if redis_cfg.get("ssl", False):
@@ -23,7 +26,8 @@ def redis_options(config):
     return options
 
 
-def create_redis_client(config):
+def create_ephemeral_redis_client(config):
+    """Construct raw Redis; migration tooling uses it explicitly as a source."""
     from redis import Redis
     sentinel = (config or {}).get("redis", {}).get("sentinel") or {}
     if sentinel.get("enabled"):
@@ -45,3 +49,20 @@ def create_redis_client(config):
                     sentinel_options[name] = sentinel[name]
         return Sentinel(endpoints, sentinel_kwargs=sentinel_options, **options).master_for(sentinel["master_name"])
     return Redis(**redis_options(config))
+
+
+def create_redis_client(config):
+    """Construct the shared state facade without changing legacy record schemas.
+
+    SQL is authoritative when selected. It is never populated automatically and
+    a failed SQL request never retries against the old Redis domain records.
+    """
+    redis = create_ephemeral_redis_client(config)
+    options = (config or {}).get("state") or {}
+    backend = options.get("backend", "redis")
+    from isolate_state import LegacyGuard, StateClient
+    if backend == "redis":
+        return LegacyGuard(redis) if options.get("migration_guard", True) else redis
+    if backend in ("postgresql", "sqlite"):
+        return StateClient(redis, options)
+    raise ValueError("state.backend must be redis, postgresql, or sqlite")

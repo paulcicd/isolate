@@ -23,6 +23,20 @@ gateway:
   allowed_origins: [https://bastion.example.org]
   max_connections: 100
   recheck_interval: 2
+  # Enable individual capabilities after staging the matching grants.
+  # See deploy/SSH-WORKSPACE.md for browser login, IDE and jump-host setup.
+  browser_auth:
+    enabled: false
+    timeout_seconds: 120
+  ssh_features:
+    multiple_channels: false
+    max_channels: 8
+    sftp: false
+    scp: false
+    forwarding: false
+    proxy_hops: false
+    max_proxy_hops: 3
+  forwarding_targets: {}
 credentials:
   default: legacy
   known_hosts: /opt/auth/known_hosts

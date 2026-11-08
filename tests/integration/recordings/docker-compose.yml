@@ -1,0 +1,56 @@
+name: isolate-recording-integration
+
+x-runner: &runner
+  build:
+    context: ../../..
+    dockerfile: tests/integration/recordings/Dockerfile
+  volumes:
+    - ../../..:/opt/auth:ro
+    - recording-fixtures:/fixtures
+
+services:
+  fixtures:
+    <<: *runner
+    command: [python3, /opt/auth/tests/integration/recordings/prepare.py]
+    restart: 'no'
+  minio:
+    build:
+      context: ../../..
+      dockerfile: tests/integration/recordings/Dockerfile.minio
+    command: [server, /data, --address, ':9000', --certs-dir, /fixtures/minio-certs]
+    environment:
+      MINIO_ROOT_USER: recording-test
+      MINIO_ROOT_PASSWORD: isolated-recording-integration-password
+    volumes:
+      - recording-fixtures:/fixtures:ro
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: recording_test
+      POSTGRES_PASSWORD: isolated-recording-database-password
+      POSTGRES_DB: recording_test
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U recording_test]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+  runner:
+    <<: *runner
+    environment:
+      AWS_ACCESS_KEY_ID: recording-test
+      AWS_SECRET_ACCESS_KEY: isolated-recording-integration-password
+      AWS_EC2_METADATA_DISABLED: 'true'
+      NO_PROXY: '*'
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+      minio:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+
+volumes:
+  recording-fixtures:

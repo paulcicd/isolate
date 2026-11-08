@@ -13,6 +13,7 @@ import subprocess
 import time
 
 from isolate_audit import prepare_and_dispatch
+from isolate_identity import IdentityError
 from isolate_inventory import get_host
 from isolate_policy import PolicyDenied, resolve_grant
 from isolate_runbooks import RunbookError, render_runbook
@@ -40,6 +41,8 @@ SIGNED_RUNBOOK_FIELDS = (
     "runbook_id", "runbook_class", "runbook_parameters", "policy_action",
     "runbook_definition_sha256",
 )
+
+SIGNED_DELEGATION_FIELDS = ("delegation_id", "delegation_expires_at", "delegation_epoch", "principal_type", "service_client_id", "proxy_id")
 
 def decode(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
@@ -76,6 +79,8 @@ def _signature_payload(record):
     fields = SIGNED_JOB_FIELDS_V1
     if int(record.get("schema_version") or 1) >= 2:
         fields += SIGNED_RUNBOOK_FIELDS
+    if int(record.get("schema_version") or 1) >= 3:
+        fields += SIGNED_DELEGATION_FIELDS
     return json.dumps(
         {name: record.get(name) for name in fields},
         sort_keys=True,
@@ -133,15 +138,16 @@ def validate_command(command, config):
     return command
 
 
-def _reject_gated_job(redis, config, host, decision):
+def _reject_gated_job(redis, config, host, decision, delegated=False):
     """Unattended execution must not bypass a human per-connection gate."""
     security = config.get("identity_security", {})
-    if ((security.get("backchannel_logout") or {}).get("enabled")
-            or (security.get("introspection") or {}).get("enabled")):
+    if not delegated and ((security.get("backchannel_logout") or {}).get("enabled")
+            or (security.get("introspection") or {}).get("enabled")
+            or (security.get("membership") or {}).get("enabled")):
         raise JobError("unattended jobs require delegated Keycloak identity lifecycle support; "
                        "jobs are disabled while centralized identity revocation is enabled")
     from isolate_identity_security import step_up_required
-    if step_up_required(config, host, decision):
+    if not delegated and step_up_required(config, host, decision):
         raise JobError("target requires fresh step-up authentication; unattended jobs are not permitted")
     from isolate_session_approvals import SessionApprovalDenied, session_approval_required
     try:
@@ -158,9 +164,32 @@ def _reject_gated_job(redis, config, host, decision):
         raise JobError("target requires human session approval; unattended jobs are not permitted")
 
 
-def create_command_job(redis, config, identity, host, decision, command, timeout=None):
-    _reject_gated_job(redis, config, host, decision)
+def _job_identity(redis, config, identity, token, host, decision, action):
+    from isolate_delegation import submission_identity
+    try:
+        return submission_identity(redis, config, identity, token, host, decision, action)
+    except (IdentityError, PolicyDenied) as exc:
+        raise JobError("delegated Keycloak identity or current policy could not be authorized") from exc
+
+
+def _attach_job_delegation(redis, config, record, identity, token, host, decision):
+    from isolate_delegation import attach_delegation
+    try:
+        return attach_delegation(redis, config, record, identity, token, host, decision)
+    except IdentityError as exc:
+        raise JobError("delegated Keycloak authorization could not be stored") from exc
+
+
+def create_command_job(redis, config, identity, host, decision, command, timeout=None, token=None):
+    from isolate_delegation import attach_delegation, options, submission_identity
+    delegated = bool(token and options(config).get("enabled"))
+    _reject_gated_job(redis, config, host, decision, delegated=delegated)
+    identity, decision = _job_identity(redis, config, identity, token, host, decision, "command")
     execution = config.get("command_execution", {}) or {}
+    if delegated and not execution.get("enabled", False):
+        raise JobError("command execution is disabled")
+    if delegated and not set(identity.get("groups") or []).intersection(execution.get("allowed_groups") or []) and identity.get("principal_type") != "service":
+        raise JobError("current identity is not in an allowed command execution group")
     command = validate_command(command, config)
     timeout = int(timeout or execution.get("default_timeout", 60))
     if timeout <= 0 or timeout > int(execution.get("max_timeout", 900)):
@@ -196,12 +225,28 @@ def create_command_job(redis, config, identity, host, decision, command, timeout
         "output_bytes": 0,
         "output_truncated": False,
     }
+    record["proxy_id"] = host.get("proxy_id")
+    _attach_job_delegation(redis, config, record, identity, token, host, decision)
     sign_job(record, config)
     return _save(redis, record)
 
 
-def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None):
-    _reject_gated_job(redis, config, host, decision)
+def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None, token=None):
+    from isolate_delegation import attach_delegation, options, submission_identity
+    _reject_gated_job(redis, config, host, decision, delegated=bool(token and options(config).get("enabled")))
+    identity, decision = _job_identity(redis, config, identity, token, host, decision, rendered["policy_action"])
+    from isolate_identity_security import assert_workload_action
+    try:
+        assert_workload_action(config, identity, rendered["policy_action"], rendered["runbook"]["class"])
+    except IdentityError as exc:
+        raise JobError(str(exc)) from exc
+    if token and options(config).get("enabled"):
+        runbooks = config.get("runbooks") or {}
+        class_config = runbooks.get(rendered["runbook"]["class"]) or {}
+        if not runbooks.get("enabled") or (rendered["runbook"]["class"] == "operational" and not class_config.get("enabled")):
+            raise JobError("runbook execution is disabled")
+        if identity.get("principal_type") != "service" and not set(identity.get("groups") or []).intersection(class_config.get("allowed_groups") or []):
+            raise JobError("current identity is not allowed for this runbook class")
     execution = config.get("command_execution", {}) or {}
     runbook = rendered["runbook"]
     timeout = int(timeout or runbook.get("default_timeout") or execution.get("default_timeout", 60))
@@ -244,11 +289,13 @@ def create_runbook_job(redis, config, identity, host, decision, rendered, timeou
         "output_bytes": 0,
         "output_truncated": False,
     }
+    record["proxy_id"] = host.get("proxy_id")
+    _attach_job_delegation(redis, config, record, identity, token, host, decision)
     sign_job(record, config)
     return _save(redis, record)
 
 
-def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None):
+def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None, token=None):
     runbooks = config.get("runbooks", {}) or {}
     if not runbooks.get("enabled", False):
         raise JobError("runbooks are disabled")
@@ -260,7 +307,7 @@ def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, para
     class_config = runbooks.get(runbook["class"], {}) or {}
     if runbook["class"] == "operational" and not class_config.get("enabled", False):
         raise JobError("operational runbooks are disabled pending security review")
-    if not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
+    if identity.get("principal_type") != "service" and not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
         raise JobError("identity is not in an allowed {} runbook group".format(runbook["class"]))
     selected_ids = []
     for host_id in host_ids:
@@ -294,15 +341,25 @@ def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, para
             raise JobError("host {} is not allowed: {}".format(host_id, exc)) from exc
         if decision.get("sudo_mode") == "sudo-i" and not class_config.get("allow_sudo", False):
             raise JobError("sudo execution is disabled for this runbook class")
-        _reject_gated_job(redis, config, host, decision)
+        from isolate_delegation import options, submission_identity
+        _reject_gated_job(redis, config, host, decision, delegated=bool(token and options(config).get("enabled")))
+        identity, decision = _job_identity(redis, config, identity, token, host, decision, rendered["policy_action"])
+        from isolate_identity_security import assert_workload_action
+        try:
+            assert_workload_action(config, identity, rendered["policy_action"], runbook["class"])
+        except IdentityError as exc:
+            raise JobError(str(exc)) from exc
+        if identity.get("principal_type") != "service" and not set(identity.get("groups") or []).intersection(class_config.get("allowed_groups") or []):
+            raise JobError("current identity is no longer allowed for this runbook class")
+        _reject_gated_job(redis, config, host, decision, delegated=bool(token and options(config).get("enabled")))
         planned.append((host, decision))
     return rendered, planned, timeout
 
 
-def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None, confirmed=False):
+def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None, confirmed=False, token=None):
     """Queue a runbook for multiple hosts after validating the entire fleet."""
     rendered, planned, timeout = _runbook_submission_plan(
-        redis, config, identity, runbook_id, host_ids, parameters=parameters, timeout=timeout
+        redis, config, identity, runbook_id, host_ids, parameters=parameters, timeout=timeout, token=token
     )
     class_config = (config.get("runbooks", {}) or {}).get(rendered["runbook"]["class"], {}) or {}
     if class_config.get("require_confirmation", True) and not confirmed:
@@ -310,7 +367,7 @@ def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, paramete
     fleet_id = str(redis.incr("offset_fleet_id"))
     jobs = []
     for index, (host, decision) in enumerate(planned, start=1):
-        job = create_runbook_job(redis, config, identity, host, decision, rendered, timeout=timeout)
+        job = create_runbook_job(redis, config, identity, host, decision, rendered, timeout=timeout, token=token)
         job.update({
             "fleet_id": fleet_id,
             "fleet_index": index,
@@ -329,7 +386,7 @@ def create_runbook_fleet(redis, config, identity, runbook_id, host_ids, paramete
     return {"fleet_id": fleet_id, "jobs": jobs, "count": len(jobs)}
 
 
-def retry_job(redis, config, original_job_id, actor, current_identity=None):
+def retry_job(redis, config, original_job_id, actor, current_identity=None, token=None):
     """Requeue a terminal failed job using its original identity and current policy."""
     original = get_job(redis, original_job_id)
     if original is None:
@@ -338,6 +395,8 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None):
         raise JobError("only failed or timed-out jobs can be retried")
     if not verify_job_signature(original, config):
         raise JobError("job authorization signature is invalid")
+    if original.get("delegation_id") and not token:
+        raise JobError("retrying a delegated job requires fresh submitter authorization")
     identity = {
         "username": original.get("username"),
         "keycloak_sub": original.get("keycloak_sub"),
@@ -345,7 +404,8 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None):
         "roles": original.get("roles") or [],
     }
     if current_identity is not None:
-        if current_identity.get("username") != original.get("username"):
+        if (original.get("keycloak_sub") and current_identity.get("keycloak_sub") != original.get("keycloak_sub")
+                or not original.get("keycloak_sub") and current_identity.get("username") != original.get("username")):
             raise JobError("retry identity must match the original submitter")
         identity = dict(current_identity)
     host = get_host(redis, original.get("host_id"))
@@ -362,9 +422,9 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None):
             original.get("runbook_id"),
             [original.get("host_id")],
             parameters=original.get("runbook_parameters") or {},
-            timeout=original.get("timeout"),
+            timeout=original.get("timeout"), token=token,
         )
-        retried = create_runbook_job(redis, config, identity, planned[0][0], planned[0][1], rendered, timeout=timeout)
+        retried = create_runbook_job(redis, config, identity, planned[0][0], planned[0][1], rendered, timeout=timeout, token=token)
     elif original.get("type") == "remote-command":
         execution = config.get("command_execution", {}) or {}
         if not execution.get("enabled", False):
@@ -384,7 +444,7 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None):
         except PolicyDenied as exc:
             raise JobError("job authorization changed: {}".format(exc)) from exc
         retried = create_command_job(
-            redis, config, identity, host, decision, original.get("command"), timeout=original.get("timeout")
+            redis, config, identity, host, decision, original.get("command"), timeout=original.get("timeout"), token=token
         )
     else:
         raise JobError("unsupported job type")
@@ -554,10 +614,15 @@ def _execute_job_locked(redis, config, record, owner):
     policy_action = "command"
     authorization_config = execution
     try:
+        effective_identity = {"username": current.get("username"), "keycloak_sub": current.get("keycloak_sub"),
+                              "groups": current.get("groups") or [], "roles": current.get("roles") or []}
+        if current.get("delegation_id"):
+            from isolate_delegation import recheck_delegation
+            effective_identity, _ = recheck_delegation(redis, config, current, host)
         if job_type == "remote-command":
             if not execution.get("enabled", False):
                 raise JobError("command execution was disabled after the job was queued")
-            if not (set(current.get("groups") or []) & set(execution.get("allowed_groups") or [])):
+            if effective_identity.get("principal_type") != "service" and not (set(effective_identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
                 raise JobError("submitter group is no longer allowed by command execution config")
             validate_command(current.get("command"), config)
         elif job_type == "runbook":
@@ -569,7 +634,7 @@ def _execute_job_locked(redis, config, record, owner):
             authorization_config = runbooks.get(runbook["class"], {}) or {}
             if runbook["class"] == "operational" and not authorization_config.get("enabled", False):
                 raise JobError("operational runbooks were disabled after the job was queued")
-            if not (set(current.get("groups") or []) & set(authorization_config.get("allowed_groups") or [])):
+            if effective_identity.get("principal_type") != "service" and not (set(effective_identity.get("groups") or []) & set(authorization_config.get("allowed_groups") or [])):
                 raise JobError("submitter group is no longer allowed for this runbook class")
             if (
                 rendered["command"] != current.get("command")
@@ -582,12 +647,7 @@ def _execute_job_locked(redis, config, record, owner):
         else:
             raise JobError("unsupported job type")
         decision = resolve_grant(
-            {
-                "username": current.get("username"),
-                "keycloak_sub": current.get("keycloak_sub"),
-                "groups": current.get("groups") or [],
-                "roles": current.get("roles") or [],
-            },
+            effective_identity,
             project=host.get("project_name"),
             host=host,
             grants=_load_json_records(redis, "grant_*", "grant_"),
@@ -595,14 +655,14 @@ def _execute_job_locked(redis, config, record, owner):
             defaults={**config.get("policy", {}), **config.get("ssh", {})},
             action=policy_action,
         )
-    except (JobError, PolicyDenied, RunbookError) as exc:
+    except (JobError, PolicyDenied, RunbookError, IdentityError) as exc:
         return _fail_job(redis, config, current, "job authorization changed: {}".format(exc))
     if decision.get("remote_user") != current.get("remote_user") or decision.get("sudo_mode") != current.get("sudo_mode"):
         return _fail_job(redis, config, current, "command remote identity changed after the job was queued")
     if decision.get("sudo_mode") == "sudo-i" and not authorization_config.get("allow_sudo", False):
         return _fail_job(redis, config, current, "sudo execution is disabled for this job class")
     try:
-        _reject_gated_job(redis, config, host, decision)
+        _reject_gated_job(redis, config, host, decision, delegated=bool(current.get("delegation_id")))
     except JobError as exc:
         return _fail_job(redis, config, current, exc)
     proxy = None
@@ -659,6 +719,13 @@ def _execute_job_locked(redis, config, record, owner):
                                    {"status": "cancelled", "finished_at": now_ts()})
         _audit(config, "job_end", current, {"status": "cancelled"})
         return current
+    if current.get("delegation_id"):
+        try:
+            from isolate_delegation import recheck_delegation
+            live_host = get_host(redis, current["host_id"])
+            recheck_delegation(redis, config, current, live_host or {})
+        except Exception:
+            return _fail_job(redis, config, current, "delegated authorization failed before execution")
     _audit(config, "job_start", current)
 
     max_output = int(execution.get("max_output_bytes", 1048576))
@@ -666,6 +733,8 @@ def _execute_job_locked(redis, config, record, owner):
     status = "failed"
     error = None
     written = 0
+    next_identity_check = 0
+    delegation_interval = max(0.25, min(10, float((config.get("identity_security", {}).get("delegation") or {}).get("recheck_interval", 2))))
     with open(output_path, "wb") as output_f:
         try:
             proc = subprocess.Popen(
@@ -700,6 +769,20 @@ def _execute_job_locked(redis, config, record, owner):
                 _terminate_process(proc)
                 status = "cancelled"
                 break
+            if current.get("delegation_id") and time.monotonic() >= next_identity_check:
+                try:
+                    from isolate_delegation import recheck_delegation
+                    live_host = get_host(redis, current["host_id"])
+                    live_identity, live_decision = recheck_delegation(redis, config, current, live_host or {})
+                    _reject_gated_job(redis, config, live_host or {}, live_decision, delegated=True)
+                    if live_identity.get("principal_type") != "service" and not set(live_identity.get("groups") or []).intersection(authorization_config.get("allowed_groups") or []):
+                        raise JobError("current identity is not allowed for this job class")
+                    next_identity_check = time.monotonic() + delegation_interval
+                except Exception:
+                    _terminate_process(proc)
+                    status = "cancelled"
+                    error = "delegated authorization was revoked, expired or became unavailable"
+                    break
             if time.monotonic() >= deadline:
                 _terminate_process(proc)
                 status = "timed_out"

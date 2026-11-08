@@ -91,6 +91,16 @@ def touch_session(redis, connection_id, ttl=86400, now=None):
 
 
 def request_session_termination(redis, connection_id, actor, reason=None):
+    record = get_session(redis, connection_id)
+    if record is None or record.get("status") != "active":
+        raise SessionControlError("active session was not found")
+    # The durable marker is independent of the disposable heartbeat registry.
+    # A restored/lagging Redis replica must not undo an acknowledged termination.
+    marker = {"at": int(time.time()), "actor": (actor or {}).get("keycloak_sub") or (actor or {}).get("username"),
+              "reason": str(reason or "administrator request")[:1024]}
+    # Connection IDs are never reused. Keep the revocation until its session's
+    # explicit archival/retention workflow, not the short heartbeat TTL.
+    redis.set("session_termination_" + str(connection_id), json.dumps(marker))
     def change(record):
         if record is None or record.get("status") != "active":
             raise SessionControlError("active session was not found")
@@ -105,6 +115,8 @@ def request_session_termination(redis, connection_id, actor, reason=None):
 
 
 def termination_requested(redis, connection_id):
+    if redis.get("session_termination_" + str(connection_id)) is not None:
+        return True
     record = get_session(redis, connection_id)
     return bool(record and record.get("status") == "active" and record.get("terminate_requested"))
 

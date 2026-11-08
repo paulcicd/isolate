@@ -36,17 +36,47 @@ def ensure_dir(path, mode=0o700, group=None):
 
 
 class SessionLogger(object):
-    def __init__(self, base_path, identity, session_id=None, logging_config=None):
+    def __init__(self, base_path, identity, session_id=None, logging_config=None, archive_config=None, state_client=None):
         self.identity = identity or {}
         self.logging_config = logging_config or {}
         self.session_id = session_id or self.identity.get("session_id")
+        self._private_capture = bool((archive_config or {}).get("recordings", {}).get("enabled"))
+        if self._private_capture:
+            from isolate_recordings import capture_root
+            base_path = capture_root(archive_config)
         username = self.identity.get("username") or "unknown"
         for value in (username, self.session_id):
             if not isinstance(value, str) or not value or value in (".", "..") or any(char in value for char in ("/", "\\", "\x00", ":")):
                 raise ValueError("invalid audit path component")
-        self.user_dir = ensure_dir(os.path.join(base_path, username), 0o2770, group="auth")
-        self.session_dir = ensure_dir(os.path.join(self.user_dir, self.session_id), 0o2770, group="auth")
+        if self._private_capture:
+            from isolate_recordings import _directory
+            self.user_dir = _directory(os.path.join(base_path, username))
+            self.session_dir = _directory(os.path.join(self.user_dir, self.session_id))
+        else:
+            self.user_dir = ensure_dir(os.path.join(base_path, username), 0o2770, group="auth")
+            self.session_dir = ensure_dir(os.path.join(self.user_dir, self.session_id), 0o2770, group="auth")
         self.jsonl_path = os.path.join(self.session_dir, "session.jsonl")
+        self.archive = None
+        self._archive_metadata = {}
+        if (archive_config or {}).get("recordings", {}).get("enabled"):
+            from isolate_recordings import RecordingArchive
+            self.archive = RecordingArchive(archive_config, state_client=state_client)
+
+    def archive_file(self, path, artifact="terminal.log", closed=False):
+        """Queue append-only bytes locally; the publisher performs network I/O."""
+        if self.archive:
+            return self.archive.enqueue_file(self.session_id, artifact, path,
+                metadata=self._archive_metadata, closed=closed)
+        return None
+
+    def close_archive(self, raw_log_path=None):
+        if self.archive:
+            if raw_log_path and os.path.isfile(raw_log_path):
+                self.archive_file(raw_log_path)
+                if os.path.isfile(raw_log_path + ".meta"):
+                    self.archive_file(raw_log_path + ".meta", artifact="terminal.log.meta")
+            return self.archive_file(self.jsonl_path, artifact="session.jsonl", closed=True)
+        return None
 
     def event(self, event_type, **fields):
         return self._event(event_type, fields)
@@ -69,7 +99,7 @@ class SessionLogger(object):
         if durable:
             logging_config.update(fail_closed=True, sync=True)
         record = prepare_and_dispatch(record, logging_config)
-        append_jsonl_record(self.jsonl_path, record, mode=0o660, sync=durable)
+        append_jsonl_record(self.jsonl_path, record, mode=0o600 if self._private_capture else 0o660, sync=durable)
         if durable and os.name == "posix":
             # Persist newly created user/session directory entries as well.
             for path in (self.user_dir, os.path.dirname(self.user_dir)):
@@ -80,7 +110,15 @@ class SessionLogger(object):
                     os.close(directory)
         if os.name == "posix":
             try:
-                os.chmod(self.jsonl_path, 0o660)
+                os.chmod(self.jsonl_path, 0o600 if self._private_capture else 0o660)
             except PermissionError:
                 pass
+        if self.archive:
+            from isolate_recordings import METADATA
+            self._archive_metadata.update({key: value for key, value in record.items() if key in METADATA and value is not None})
+            if event_type in ("ssh_start", "protocol_start"):
+                self._archive_metadata["started_at"] = record["ts"]
+            if event_type in ("ssh_end", "protocol_end"):
+                self._archive_metadata["ended_at"] = record["ts"]
+            self.archive_file(self.jsonl_path, artifact="session.jsonl")
         return record

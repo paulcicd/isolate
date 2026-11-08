@@ -1,5 +1,14 @@
 # Isolate Bastion Platform v2
 
+Production installation and operations: [setup wizard and OIDC](deploy/SETUP.md),
+[verified releases and rollback](deploy/RELEASES.md),
+[Helm chart](deploy/helm/isolate/README.md),
+[Terraform provider](terraform-provider-isolate/README.md),
+[validation results](deploy/PLATFORM-VALIDATION.md).
+Generic OIDC providers use the explicit `oidc` configuration; existing `keycloak`
+configuration and realm/group behavior remain supported. The Keycloak examples
+below describe that compatible adapter.
+
 Optional native SSH, Web SSH and API console migration:
 [deployment guide](deploy/GATEWAY-MIGRATION.md),
 [identity and credentials](deploy/IDENTITY-CREDENTIALS.md),
@@ -13,8 +22,8 @@ Isolate Bastion Platform v2 is an SSH bastion access layer for large Linux fleet
 The main idea is simple:
 
 1. A human user logs in to the bastion.
-2. The user runs `isolate login` and authenticates through Keycloak.
-3. Isolate verifies the signed Keycloak JWT on every command and derives `username`, `groups`, and `roles` only from verified claims.
+2. The user runs `isolate login` or uses browser sign-in with the configured OIDC provider.
+3. Isolate verifies signed tokens and derives `username`, `groups`, and `roles` only from verified claims and configured mappings.
 4. The `s` command shows only servers allowed by grants.
 5. The `g` command checks policy, selects the correct remote user, and starts SSH.
 6. Every step is written to JSONL audit logs and legacy raw transcripts.
@@ -25,10 +34,12 @@ All examples in this document use fictional users, groups, domains, projects, an
 
 - Ubuntu 24.04 LTS and Debian 12/13 compatible bastion runtime.
 - Python 3 runtime.
-- Redis-backed host inventory, grants, project sets, access requests, and active sessions.
-- Keycloak OIDC Device Authorization Grant for CLI login.
-- Keycloak OIDC Authorization Code flow for the admin dashboard.
-- Grant-based RBAC using Keycloak groups.
+- Optional SQL authority for durable inventory/policy, with Redis for leases/cache and compatible legacy Redis mode.
+- OIDC Device Authorization Grant for CLI login when supported by the IdP.
+- OIDC Authorization Code flow with PKCE S256 for the dashboard; compatible Keycloak adapter.
+- Grant-based RBAC using verified, normalized groups and roles.
+- Private setup wizard, IdP/state diagnostics, revision-checked admin API and OpenAPI contract.
+- Versioned code staging/preflight/rollback, nonroot production image, Helm and Terraform.
 - Project sets and glob patterns for managing hundreds of projects.
 - Per-group or per-user remote SSH user selection.
 - Optional `sudo-i` or no-sudo remote shell behavior.
@@ -59,7 +70,7 @@ The real person using the bastion. Example fictional users:
 - `demo.casey`
 - `demo.drew`
 
-Human identity comes from Keycloak after `isolate login`.
+Human identity comes from the configured OIDC provider after sign-in.
 
 ### Remote User
 

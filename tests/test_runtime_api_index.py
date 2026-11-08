@@ -249,7 +249,7 @@ class RuntimeTest(unittest.TestCase):
         self.assertEqual(response.status_code, 201)
         terminal = client.get("/me/terminal/1")
         self.assertEqual(terminal.status_code, 200)
-        self.assertIn(b"isolate-webssh.js", terminal.data)
+        self.assertIn(b"terminal-workspace.js", terminal.data)
         self.assertNotIn(self.token.encode(), terminal.data)
         client.get("/logout")
         self.assertIsNone(self.redis.get("isolate_browser_opaque"))

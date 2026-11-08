@@ -1,0 +1,61 @@
+{{- if .Values.ingress.enabled }}
+{{- if not .Values.api.enabled }}{{ fail "ingress requires api.enabled" }}{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "isolate.fullname" . }}
+  {{- with .Values.ingress.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "isolate.fullname" . }}-api
+                port:
+                  name: http
+{{- if .Values.gateway.enabled }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "isolate.fullname" . }}-gateway
+  annotations: {{ toYaml (mergeOverwrite (deepCopy .Values.ingress.annotations) .Values.ingress.gatewayAnnotations) | nindent 4 }}
+spec:
+  {{- if .Values.ingress.className }}
+  ingressClassName: {{ .Values.ingress.className | quote }}
+  {{- end }}
+  tls:
+    - hosts: [{{ .Values.ingress.host | quote }}]
+      secretName: {{ .Values.ingress.tlsSecret | quote }}
+  rules:
+    - host: {{ .Values.ingress.host | quote }}
+      http:
+        paths:
+          - path: /ssh
+            pathType: Exact
+            backend:
+              service:
+                name: {{ include "isolate.fullname" . }}-web
+                port:
+                  name: web
+          - path: /protocols
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "isolate.fullname" . }}-web
+                port:
+                  name: web
+{{- end }}
+{{- end }}

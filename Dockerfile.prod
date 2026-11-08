@@ -1,0 +1,21 @@
+# Build from a trusted checkout; deploy the resulting image by registry digest.
+FROM python:3.12-slim AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1 PIP_DISABLE_PIP_VERSION_CHECK=1
+RUN apt-get update \
+    && apt-get install --no-install-recommends -y ca-certificates openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --gid 2000 auth \
+    && useradd --uid 2000 --gid 2000 --home-dir /var/lib/isolate --no-create-home auth
+WORKDIR /opt/auth
+COPY requirements.txt /opt/auth/requirements.txt
+RUN python -m pip install --no-cache-dir -r /opt/auth/requirements.txt \
+    && python -m pip freeze --all > /opt/auth/dependencies.txt
+COPY shared /opt/auth/shared
+COPY scripts /opt/auth/scripts
+COPY wrappers /opt/auth/wrappers
+RUN find /opt/auth -type d -name __pycache__ -prune -exec rm -rf {} + \
+    && chmod -R go-w /opt/auth
+USER 2000:2000
+EXPOSE 8080 2222 8092
+ENTRYPOINT ["python", "-I", "-B", "/opt/auth/scripts/isolate-service.py"]
+CMD ["dashboard", "--config", "/run/isolate/secrets/isolate.yml"]

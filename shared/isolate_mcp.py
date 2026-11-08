@@ -45,8 +45,11 @@ def token_scopes(claims):
 
 
 def mcp_keycloak_config(config):
-    keycloak = dict(config.get("keycloak", {}) or {})
+    from isolate_oidc import identity_provider_config
+    keycloak = identity_provider_config(config)
     mcp_cfg = config.get("mcp", {}) or {}
+    if mcp_cfg.get("issuer") is not None and mcp_cfg["issuer"] != keycloak.get("issuer"):
+        raise IdentityError("MCP must use the selected identity issuer")
     for source, target in (
         ("issuer", "issuer"),
         ("expected_audience", "expected_audience"),
@@ -546,6 +549,7 @@ class IsolateMCPService(object):
             rows = read_history(
                 self.config["logging"]["base_path"],
                 identity,
+                archive_config=self.config,
                 query=query,
                 user=identity.get("username"),
                 project=project,
@@ -765,8 +769,15 @@ class IsolateMCPService(object):
         scope = self.mcp_config.get("execute_scope", "isolate.execute")
         if not self._has_scope(scopes, scope):
             raise MCPAccessDenied("required scope is missing: {}".format(scope))
-        if not (set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
+        if identity.get("principal_type") == "service":
+            if "command" not in self._workload_options(identity).get("allowed_actions", []):
+                raise MCPAccessDenied("workload is not permitted to execute commands")
+        elif not (set(identity.get("groups") or []) & set(execution.get("allowed_groups") or [])):
             raise MCPAccessDenied("identity is not in a command execution group")
+
+    def _workload_options(self, identity):
+        return (self.config.get("identity_security", {}).get("workloads", {}).get("clients", {})
+                .get(identity.get("service_client_id"), {}))
 
     def _runbook_access_error(self, identity, scopes, runbook_class):
         runbooks = self.config.get("runbooks", {}) or {}
@@ -779,7 +790,12 @@ class IsolateMCPService(object):
         scope = self.mcp_config.get(scope_name)
         if not self._has_scope(scopes, scope):
             return "required scope is missing: {}".format(scope)
-        if not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
+        if identity.get("principal_type") == "service":
+            options = self._workload_options(identity)
+            action = "operate" if runbook_class == "operational" else "runbook"
+            if action not in options.get("allowed_actions", []) or runbook_class not in options.get("allowed_runbook_classes", []):
+                return "workload is not permitted to use this runbook class"
+        elif not (set(identity.get("groups") or []) & set(class_config.get("allowed_groups") or [])):
             return "identity is not in an allowed {} runbook group".format(runbook_class)
         return None
 
@@ -802,7 +818,8 @@ class IsolateMCPService(object):
 
     def _can_view_job(self, identity, scopes, record):
         return bool(record and (
-            record.get("username") == identity.get("username") or self._is_execution_admin(identity, scopes)
+            (record.get("keycloak_sub") == identity.get("keycloak_sub") if record.get("keycloak_sub") else record.get("username") == identity.get("username"))
+            or self._is_execution_admin(identity, scopes)
         ))
 
     def runbook_list(self, identity, scopes):
@@ -829,7 +846,7 @@ class IsolateMCPService(object):
         self._audit("runbook_show", identity, "allowed", started, {"runbook_id": runbook_id})
         return {"runbook": runbook}
 
-    def runbook_execute(self, identity, scopes, runbook_id, host_id, parameters=None, timeout=None, confirm=False):
+    def runbook_execute(self, identity, scopes, runbook_id, host_id, parameters=None, timeout=None, confirm=False, token=None):
         started = time.monotonic()
         runbook_id = _required_text(runbook_id, "runbook_id", 128)
         host_id = _required_id(host_id, "host_id")
@@ -855,7 +872,7 @@ class IsolateMCPService(object):
             if decision.get("sudo_mode") == "sudo-i" and not class_config.get("allow_sudo", False):
                 raise MCPAccessDenied("sudo execution is disabled for this runbook class")
             job = create_runbook_job(
-                self.redis, self.config, identity, host, decision, rendered, timeout=timeout
+                self.redis, self.config, identity, host, decision, rendered, timeout=timeout, **({"token": token} if token else {})
             )
             self._audit("runbook_execute", identity, "queued", started, {
                 "job_id": job.get("id"),
@@ -876,7 +893,7 @@ class IsolateMCPService(object):
             })
             raise
 
-    def command_job_create(self, identity, scopes, host_id, command, timeout=None, confirm=False):
+    def command_job_create(self, identity, scopes, host_id, command, timeout=None, confirm=False, token=None):
         started = time.monotonic()
         host_id = _required_id(host_id, "host_id")
         try:
@@ -898,7 +915,7 @@ class IsolateMCPService(object):
             )
             if decision.get("sudo_mode") == "sudo-i" and not execution.get("allow_sudo", False):
                 raise MCPAccessDenied("sudo command execution is disabled")
-            job = create_command_job(self.redis, self.config, identity, host, decision, command, timeout=timeout)
+            job = create_command_job(self.redis, self.config, identity, host, decision, command, timeout=timeout, **({"token": token} if token else {}))
             self._audit("command_job_create", identity, "queued", started, {
                 "job_id": job.get("id"),
                 "host_id": host_id,
@@ -917,7 +934,7 @@ class IsolateMCPService(object):
         started = time.monotonic()
         status = _optional_text(status, "status", 32)
         user = _optional_text(user, "user", 128)
-        valid_statuses = ("queued", "running", "completed", "failed", "cancelled", "timed_out")
+        valid_statuses = ("queued", "claimed", "running", "recovery_required", "completed", "failed", "cancelled", "timed_out")
         if status and status not in valid_statuses:
             raise ValueError("invalid job status")
         admin = self._is_execution_admin(identity, scopes)
@@ -1015,8 +1032,9 @@ def _request_token():
     return token
 
 
-def _request_identity():
-    return normalize_claims(_request_token().claims)
+def _request_identity(config=None):
+    from isolate_oidc import identity_provider_config
+    return normalize_claims(_request_token().claims, identity_provider_config(config or load_config()))
 
 
 def create_mcp_server(config=None, redis=None):
@@ -1032,6 +1050,20 @@ def create_mcp_server(config=None, redis=None):
     if not issuer or not public_url:
         raise RuntimeError("mcp.issuer/keycloak.issuer and mcp.public_url are required")
     service = IsolateMCPService(config, redis or create_redis_client(config))
+    def _effective_identity(token):
+        from isolate_config import with_identity_provider
+        provider = mcp_keycloak_config(config)
+        effective_config = with_identity_provider(config, provider)
+        from isolate_identity_security import refresh_identity, workload_identity
+        identity = normalize_claims(token.claims, provider)
+        clients = config.get("identity_security", {}).get("workloads", {}).get("clients", {})
+        if token.claims.get("isolate_principal_type") == "service" or token.claims.get("azp") in clients:
+            identity = workload_identity(effective_config, token.token)
+        return refresh_identity(service.redis, effective_config, identity, token=token.token)
+
+    def _request_identity():
+        return _effective_identity(_request_token())
+
     server = MCPServer(
         "Isolate Bastion Platform v2",
         description="Policy-aware inventory, history, and temporary access for Isolate v2",
@@ -1049,7 +1081,7 @@ def create_mcp_server(config=None, redis=None):
     def identity_whoami() -> dict[str, Any]:
         """Return the verified Keycloak identity and MCP scopes for this request."""
         token = _request_token()
-        identity = normalize_claims(token.claims)
+        identity = _effective_identity(token)
         return service.identity_whoami(identity, token.scopes, token.expires_at)
 
     @server.tool(structured_output=True)
@@ -1088,7 +1120,7 @@ def create_mcp_server(config=None, redis=None):
             "server_vip": vip, "proxy_id": proxy_id, "privileged_access_provider": privileged_provider,
             "privileged_access_url": privileged_url, "privileged_access_hint": privileged_hint,
         }
-        return service.inventory_host_add(normalize_claims(token.claims), token.scopes, values, dry_run=dry_run, confirm=confirm)
+        return service.inventory_host_add(_effective_identity(token), token.scopes, values, dry_run=dry_run, confirm=confirm)
 
     @server.tool(structured_output=True)
     def inventory_host_update(
@@ -1119,7 +1151,7 @@ def create_mcp_server(config=None, redis=None):
             "privileged_access_url": privileged_url, "privileged_access_hint": privileged_hint,
         }
         return service.inventory_host_update(
-            normalize_claims(token.claims), token.scopes, server_id, updates,
+            _effective_identity(token), token.scopes, server_id, updates,
             expected_revision=expected_revision, dry_run=dry_run, confirm=confirm,
         )
 
@@ -1139,25 +1171,25 @@ def create_mcp_server(config=None, redis=None):
     ) -> dict[str, Any]:
         """List grants for policy administrators with the configured policy-read scope."""
         token = _request_token()
-        return service.grant_list(normalize_claims(token.claims), token.scopes, user, group, project, project_set, project_glob, limit)
+        return service.grant_list(_effective_identity(token), token.scopes, user, group, project, project_set, project_glob, limit)
 
     @server.tool(structured_output=True)
     def grant_show(grant_id: str) -> dict[str, Any]:
         """Read one grant for a policy administrator."""
         token = _request_token()
-        return service.grant_show(normalize_claims(token.claims), token.scopes, grant_id)
+        return service.grant_show(_effective_identity(token), token.scopes, grant_id)
 
     @server.tool(structured_output=True)
     def project_set_list() -> dict[str, Any]:
         """List named project sets for a policy administrator."""
         token = _request_token()
-        return service.project_set_list(normalize_claims(token.claims), token.scopes)
+        return service.project_set_list(_effective_identity(token), token.scopes)
 
     @server.tool(structured_output=True)
     def project_set_show(name: str) -> dict[str, Any]:
         """Read one named project set for a policy administrator."""
         token = _request_token()
-        return service.project_set_show(normalize_claims(token.claims), token.scopes, name)
+        return service.project_set_show(_effective_identity(token), token.scopes, name)
 
     @server.tool(structured_output=True)
     def policy_preview(
@@ -1171,7 +1203,7 @@ def create_mcp_server(config=None, redis=None):
         """Simulate an ssh, command, runbook, or operate policy decision without changing policy."""
         token = _request_token()
         return service.policy_preview(
-            normalize_claims(token.claims), token.scopes, project=project, host_id=host_id,
+            _effective_identity(token), token.scopes, project=project, host_id=host_id,
             action=action, user=user, groups=groups, roles=roles,
         )
 
@@ -1192,7 +1224,7 @@ def create_mcp_server(config=None, redis=None):
     ) -> dict[str, Any]:
         """Create a pending break-glass request; this never grants access by itself."""
         token = _request_token()
-        identity = normalize_claims(token.claims)
+        identity = _effective_identity(token)
         scope_check_started = time.monotonic()
         try:
             service._require_self_service(token.scopes)
@@ -1221,7 +1253,7 @@ def create_mcp_server(config=None, redis=None):
         """List own requests, or all matching requests for callers with admin group and approval scope."""
         token = _request_token()
         return service.access_request_list(
-            normalize_claims(token.claims),
+            _effective_identity(token),
             token.scopes,
             status=status,
             user=user,
@@ -1234,13 +1266,13 @@ def create_mcp_server(config=None, redis=None):
     def access_request_show(request_id: str) -> dict[str, Any]:
         """Read one request when it belongs to the caller or the caller is an access admin."""
         token = _request_token()
-        return service.access_request_show(normalize_claims(token.claims), token.scopes, request_id)
+        return service.access_request_show(_effective_identity(token), token.scopes, request_id)
 
     @server.tool(structured_output=True)
     def access_request_comment(request_id: str, text: str) -> dict[str, Any]:
         """Append an attributed comment to an access request visible to the caller."""
         token = _request_token()
-        return service.access_request_comment(normalize_claims(token.claims), token.scopes, request_id, text)
+        return service.access_request_comment(_effective_identity(token), token.scopes, request_id, text)
 
     @server.tool(structured_output=True)
     def access_request_approve(
@@ -1254,7 +1286,7 @@ def create_mcp_server(config=None, redis=None):
         """Approve a pending request and create a temporary grant. Requires admin group, approval scope, and confirm=true."""
         token = _request_token()
         return service.access_request_approve(
-            normalize_claims(token.claims),
+            _effective_identity(token),
             token.scopes,
             request_id,
             ttl=ttl,
@@ -1274,7 +1306,7 @@ def create_mcp_server(config=None, redis=None):
         """Deny a pending request. Requires admin group, approval scope, and confirm=true."""
         token = _request_token()
         return service.access_request_deny(
-            normalize_claims(token.claims),
+            _effective_identity(token),
             token.scopes,
             request_id,
             reason=reason,
@@ -1286,13 +1318,13 @@ def create_mcp_server(config=None, redis=None):
     def runbook_list() -> dict[str, Any]:
         """List built-in runbooks whose class is allowed by the caller's verified scope and groups."""
         token = _request_token()
-        return service.runbook_list(normalize_claims(token.claims), token.scopes)
+        return service.runbook_list(_effective_identity(token), token.scopes)
 
     @server.tool(structured_output=True)
     def runbook_show(runbook_id: str) -> dict[str, Any]:
         """Show one allowed runbook, its typed parameters, and its authorization class."""
         token = _request_token()
-        return service.runbook_show(normalize_claims(token.claims), token.scopes, runbook_id)
+        return service.runbook_show(_effective_identity(token), token.scopes, runbook_id)
 
     @server.tool(structured_output=True)
     def runbook_execute(
@@ -1305,13 +1337,14 @@ def create_mcp_server(config=None, redis=None):
         """Queue a typed runbook after scope, group, grant-action, parameter, and confirmation checks."""
         token = _request_token()
         return service.runbook_execute(
-            normalize_claims(token.claims),
+            _effective_identity(token),
             token.scopes,
             runbook_id,
             host_id,
             parameters=parameters,
             timeout=timeout,
             confirm=confirm,
+            token=token.token,
         )
 
     @server.tool(structured_output=True)
@@ -1319,32 +1352,32 @@ def create_mcp_server(config=None, redis=None):
         """Queue a non-interactive remote command after scope, group, grant-action, and confirmation checks."""
         token = _request_token()
         return service.command_job_create(
-            normalize_claims(token.claims), token.scopes, host_id, command, timeout=timeout, confirm=confirm
+            _effective_identity(token), token.scopes, host_id, command, timeout=timeout, confirm=confirm, token=token.token
         )
 
     @server.tool(structured_output=True)
     def command_job_list(status: str | None = None, user: str | None = None, limit: int = 20) -> dict[str, Any]:
         """List own command jobs, or all jobs for execution administrators."""
         token = _request_token()
-        return service.command_job_list(normalize_claims(token.claims), token.scopes, status=status, user=user, limit=limit)
+        return service.command_job_list(_effective_identity(token), token.scopes, status=status, user=user, limit=limit)
 
     @server.tool(structured_output=True)
     def command_job_show(job_id: str) -> dict[str, Any]:
         """Read one command job visible to the caller."""
         token = _request_token()
-        return service.command_job_show(normalize_claims(token.claims), token.scopes, job_id)
+        return service.command_job_show(_effective_identity(token), token.scopes, job_id)
 
     @server.tool(structured_output=True)
     def command_job_output(job_id: str) -> dict[str, Any]:
         """Read capped output for one command job visible to the caller."""
         token = _request_token()
-        return service.command_job_output(normalize_claims(token.claims), token.scopes, job_id)
+        return service.command_job_output(_effective_identity(token), token.scopes, job_id)
 
     @server.tool(structured_output=True)
     def command_job_cancel(job_id: str, confirm: bool = False) -> dict[str, Any]:
         """Request cancellation of a queued or running command job; confirm=true is required."""
         token = _request_token()
-        return service.command_job_cancel(normalize_claims(token.claims), token.scopes, job_id, confirm=confirm)
+        return service.command_job_cancel(_effective_identity(token), token.scopes, job_id, confirm=confirm)
 
     @server.resource("isolate://inventory/projects", mime_type="application/json")
     def inventory_projects_resource() -> str:

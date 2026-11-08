@@ -84,7 +84,7 @@ def _row_from_events(events):
         "remote_user": source.get("remote_user"),
         "connection_id": source.get("connection_id"),
         "session_id": source.get("session_id"),
-        "raw_log_path": (ssh_end or ssh_start or {}).get("raw_log_path"),
+        "raw_log_path": (ssh_end or {}).get("raw_log_path") or (ssh_start or {}).get("raw_log_path"),
         "result": result,
     }
 
@@ -155,7 +155,7 @@ def _matches(row, query=None, user=None, project=None, host=None, since=None, un
     return True
 
 
-def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None, since=None, until=None, result=None, permission_config=None):
+def read_history(base_path, identity, query=None, user=None, project=None, host=None, limit=10, admin_groups=None, since=None, until=None, result=None, permission_config=None, archive_config=None, state_client=None):
     since = parse_history_time(since)
     until = parse_history_time(until, end_of_day=True)
     if since is not None and until is not None and since > until:
@@ -183,16 +183,37 @@ def read_history(base_path, identity, query=None, user=None, project=None, host=
         scan_users = None
 
     grouped_events = {}
-    for path in _iter_session_files(base_path, users=scan_users):
-        events = _load_events(path)
-        keyed = False
-        for event in events:
-            key = _connection_key(event)
-            if key:
-                keyed = True
-                grouped_events.setdefault(key, []).append(event)
-        if not keyed and _row_from_events(events) is not None:
-            grouped_events["legacy-file:{}".format(path)] = events
+    roots = [base_path]
+    if (archive_config or {}).get("recordings", {}).get("enabled"):
+        from isolate_recordings import capture_root
+        private_root = capture_root(archive_config)
+        if os.path.realpath(private_root) != os.path.realpath(base_path):
+            roots.append(private_root)
+        from isolate_archive_history import archived_history_groups
+        def archived_visible(metadata):
+            owned = (metadata.get("keycloak_sub") == identity.get("keycloak_sub") if metadata.get("keycloak_sub") else metadata.get("username") == username)
+            permitted = admin or (bool(metadata.get("project")) and has_permission(identity, permission_config, "audit.read", metadata["project"]) if scoped_audit else owned)
+            return permitted and (not user or metadata.get("username") == user)
+        grouped_events.update(archived_history_groups(archive_config, identity, archived_visible, state_client))
+    archived_keys = set(grouped_events)
+    for root in roots:
+        local_groups = {}
+        private = (archive_config or {}).get("recordings", {}).get("enabled") and root == private_root
+        for path in _iter_session_files(root, users=scan_users):
+            events = _load_events(path)
+            keyed = False
+            for event in events:
+                key = _connection_key(event)
+                if key:
+                    keyed = True
+                    # Anchored records cannot be shadowed by human-writable
+                    # legacy logs. Private capture may be newer and wins.
+                    if key in archived_keys and not private:
+                        continue
+                    local_groups.setdefault(key, []).append(event)
+            if not keyed and _row_from_events(events) is not None:
+                local_groups["legacy-file:{}".format(path)] = events
+        grouped_events.update(local_groups)
 
     rows = []
     for events in grouped_events.values():
@@ -237,11 +258,32 @@ def format_history_table(rows):
     return "\n".join(lines)
 
 
-def list_user_profiles(base_path):
+def _profile_event_batches(base_path, archive_config=None, state_client=None):
+    roots, archived, private_root = [base_path], {}, None
+    if (archive_config or {}).get("recordings", {}).get("enabled"):
+        from isolate_recordings import capture_root
+        from isolate_archive_history import archived_history_groups
+        private_root = capture_root(archive_config)
+        archived = archived_history_groups(archive_config, {}, lambda metadata: True, state_client)
+        if os.path.realpath(private_root) != os.path.realpath(base_path):
+            roots.append(private_root)
+    local_keys = set()
+    for root in roots:
+        for path in _iter_session_files(root):
+            events = _load_events(path)
+            if root == base_path and root != private_root:
+                events = [event for event in events if _connection_key(event) not in archived]
+            local_keys.update(_connection_key(event) for event in events)
+            yield events
+    for key, events in archived.items():
+        if key not in local_keys:
+            yield events
+
+
+def list_user_profiles(base_path, archive_config=None, state_client=None):
     profiles = {}
     connections = {}
-    for path in _iter_session_files(base_path):
-        events = _load_events(path)
+    for events in _profile_event_batches(base_path, archive_config, state_client):
         for event in events:
             username = event.get("username")
             if not username:
@@ -274,7 +316,7 @@ def list_user_profiles(base_path):
     return sorted(profiles.values(), key=lambda row: row.get("last_seen") or 0, reverse=True)
 
 
-def user_activity_summary(base_path, username, limit=10, active_sessions=None, grants=None, access_requests=None):
+def user_activity_summary(base_path, username, limit=10, active_sessions=None, grants=None, access_requests=None, archive_config=None, state_client=None):
     """Build a compact activity view from existing audit and authorization data."""
     identity = {"username": str(username), "groups": ["__activity_reader__"]}
     rows = read_history(
@@ -283,8 +325,9 @@ def user_activity_summary(base_path, username, limit=10, active_sessions=None, g
         user=str(username),
         limit=max(1, int(limit)),
         admin_groups=["__activity_reader__"],
+        archive_config=archive_config, state_client=state_client,
     )
-    profiles = {row.get("username"): row for row in list_user_profiles(base_path)}
+    profiles = {row.get("username"): row for row in list_user_profiles(base_path, archive_config, state_client)}
     profile = profiles.get(str(username), {
         "username": str(username), "groups": [], "roles": [], "connection_count": 0, "last_seen": 0,
     })

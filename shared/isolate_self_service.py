@@ -15,6 +15,7 @@ from isolate_inventory import HostValidationError, get_host, list_hosts
 from isolate_connectivity import get_last_check
 from isolate_permissions import has_permission
 from isolate_policy import PolicyDenied, resolve_grant
+from isolate_recordings import RecordingError
 from isolate_sessions import list_active_sessions
 
 
@@ -302,7 +303,7 @@ button.addEventListener('click', function() { if (navigator.clipboard) navigator
         labels = words()
         try:
             filters = history_filters(request.args, include_user=False)
-            rows = read_history(config["logging"]["base_path"], identity, user=identity["username"], admin_groups=[], **filters)
+            rows = read_history(config["logging"]["base_path"], identity, archive_config=config, user=identity["username"], admin_groups=[], **filters)
             columns = [("time", labels["time"]), ("project", labels["project"]), ("host_id", labels["host"]),
                        ("server_name", labels["server"]), ("remote_user", labels["remote_user"]), ("result", labels["result"])]
             if request.path.endswith("/export"):
@@ -312,6 +313,8 @@ button.addEventListener('click', function() { if (navigator.clipboard) navigator
                 content, mimetype = render_export(public_rows, output_format)
                 return Response(content, mimetype=mimetype, headers={
                     "Content-Disposition": "attachment; filename=my-history.{}".format(output_format)})
+        except RecordingError:
+            raise
         except (ValueError, ExportError) as exc:
             abort(400, description=str(exc))
         query = {key: value for key, value in request.args.items() if key != "format"}
