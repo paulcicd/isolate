@@ -1,0 +1,33 @@
+{{- if .Values.webApplications.enabled }}
+{{- if not (and .Values.gateway.enabled .Values.api.enabled) }}{{ fail "webApplications requires enabled gateway and API" }}{{- end }}
+{{- if not .Values.webApplications.hosts }}{{ fail "webApplications requires explicit application hosts" }}{{- end }}
+{{- $root := . }}
+{{- range $index, $application := .Values.webApplications.hosts }}
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "isolate.fullname" $root }}-app-{{ $index }}
+  {{- with $root.Values.webApplications.annotations }}
+  annotations: {{ toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  {{- if $root.Values.webApplications.className }}
+  ingressClassName: {{ $root.Values.webApplications.className | quote }}
+  {{- end }}
+  tls:
+    - hosts: [{{ $application.host | quote }}]
+      secretName: {{ $application.tlsSecret | quote }}
+  rules:
+    - host: {{ $application.host | quote }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "isolate.fullname" $root }}-web
+                port:
+                  name: web
+{{- end }}
+{{- end }}

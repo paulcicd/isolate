@@ -25,7 +25,7 @@ def validate_runtime_config(config, check_paths=False):
         except Exception:
             errors.append("generic OIDC requires a trusted HTTPS issuer, verified tokens, client/audience and safe credential files")
     sections = {}
-    for name in ("api", "gateway", "credentials", "identity_security", "protocols", "audit_index", "cluster", "state", "recordings", "admission"):
+    for name in ("api", "gateway", "credentials", "identity_security", "protocols", "audit_index", "cluster", "state", "recordings", "admission", "web_apps", "governance", "campaigns", "runbooks", "command_execution"):
         value = config.get(name, {})
         if not isinstance(value, dict):
             errors.append(name + " must be an object")
@@ -34,6 +34,26 @@ def validate_runtime_config(config, check_paths=False):
         if "enabled" in value and not isinstance(value["enabled"], bool):
             errors.append(name + ".enabled must be a boolean")
     api, gateway = sections["api"], sections["gateway"]
+    for section, field, default, low, high in (('governance', 'review_interval_days', 90, 1, 365),
+            ('campaigns', 'max_hosts', 100, 1, 1000), ('campaigns', 'max_batch_size', 50, 1, 50)):
+        value = sections[section].get(field, default)
+        if type(value) is not int or not low <= value <= high:
+            errors.append(section + '.' + field + ' is outside the supported range')
+    if sections['campaigns'].get('enabled'):
+        delegation = sections['identity_security'].get('delegation', {})
+        if not (api.get('enabled') and sections['runbooks'].get('enabled')
+                and sections['command_execution'].get('enabled')
+                and isinstance(delegation, dict) and delegation.get('enabled')):
+            errors.append('campaigns require the API, runbooks, command execution and bounded live delegation')
+    applications = sections["web_apps"]
+    if applications.get("enabled") and not (api.get("enabled") and gateway.get("enabled") and sections["protocols"].get("enabled")):
+        errors.append("web_apps requires enabled API, gateway and protocol resources")
+    for key, default, low, high in (("launch_ttl", 30, 5, 60), ("session_ttl_seconds", 3600, 30, 28800),
+                                  ("idle_timeout_seconds", 900, 10, 28800), ("max_sessions", 100, 1, 4096),
+                                  ("max_requests_per_session", 16, 1, 128)):
+        value = applications.get(key, default)
+        if type(value) is not int or not low <= value <= high:
+            errors.append("web_apps." + key + " is outside the supported range")
     features = gateway.get("ssh_features", {})
     if not isinstance(features, dict):
         errors.append("gateway.ssh_features must be an object")
@@ -210,7 +230,16 @@ def validate_runtime_config(config, check_paths=False):
                     address = str(ipaddress.ip_address(parsed.hostname))
                 except ValueError:
                     address = "192.0.2.1"
-                resolve_target(config, {"server_id": str(identifier), "project_name": target.get("project"), "server_ip": address}, target.get("protocol"))
-            except (ProtocolError, ValueError, TypeError):
+                resolved = resolve_target(config, {"server_id": str(identifier), "project_name": target.get("project"), "server_ip": address}, target.get("protocol"))
+                if check_paths and (target.get("database_proxy") or {}).get("enabled"):
+                    from isolate_database_proxy import validate_database_target
+                    validate_database_target(resolved, check_paths=True)
+                if check_paths and (target.get("kubernetes") or {}).get("enabled"):
+                    from isolate_credentials import _read_file
+                    _read_file(target.get("bearer_token_file"), secret=True, maximum=65536)
+                    for name in ("ca_file", "client_cert_file", "client_key_file"):
+                        if target.get(name):
+                            _read_file(target[name], secret=name == "client_key_file")
+            except (ProtocolError, ValueError, TypeError, OSError):
                 errors.append("protocol target {} is invalid".format(identifier))
     return {"errors": errors, "warnings": warnings}

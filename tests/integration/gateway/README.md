@@ -54,3 +54,11 @@ Group removal closes an active multiplexed SSH transport and its SFTP channel
 while stopping queued/running jobs. PTY resize is followed by another command,
 so the check verifies that the session remains usable. No production Unix
 account or SSH trust entry is created by this test.
+
+The real Keycloak token also previews and submits a runbook campaign against two
+inventory targets. The worker executes the canary and following stage through
+OpenSSH; signed terminal receipts gate promotion and PostgreSQL-backed timeline
+queries correlate their results without exposing tokens. Finally, a fresh real
+Keycloak browser login opens SSH before a separate fixture maintainer offboards
+the subject inside Isolate. The active connection closes and new tickets are
+denied while the same fresh IdP identity remains valid.

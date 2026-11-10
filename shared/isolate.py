@@ -553,7 +553,10 @@ def _require_platform_admin(config):
         else:
             raise ConnectionDenied("platform administration requires a Linux host")
         from isolate_identity import _load_token_cache
-        identity = bind_identity(_load_token_cache().get("id_token"), authorization_config, username)
+        from isolate_oidc import identity_provider_config
+        token_kind = identity_provider_config(authorization_config).get('token_kind', 'id_token')
+        identity = bind_identity(_load_token_cache().get(token_kind), authorization_config, username,
+                                 redis=redis_client(authorization_config))
     except (ConnectionDenied, OSError) as exc:
         raise AccessDenied(str(exc)) from exc
     groups = authorization_config.get("dashboard", {}).get("admin_groups") or authorization_config.get("access", {}).get("admin_groups") or []
@@ -1607,12 +1610,9 @@ def cmd_user_activity(args, config):
 
 
 def cmd_grant_explain(args, config):
+    from isolate_access_explain import policy_explanation, ExplanationError
     redis = redis_client(config)
     host = get_host(redis, args.host) if args.host else None
-    if args.host and host is None:
-        host = {"server_id": args.host, "server_name": args.host}
-    project = args.project or (host or {}).get("project_name")
-
     identity = {"username": args.user, "groups": args.group or [], "roles": args.role or []}
     if not args.group:
         try:
@@ -1623,53 +1623,32 @@ def cmd_grant_explain(args, config):
             pass
     if args.user:
         identity["username"] = args.user
-
+    # This command is an administrative policy simulation (main() enforces the
+    # platform-admin boundary). It never turns simulated groups into authority.
+    project = (host or {}).get("project_name") if host else args.project
+    action = getattr(args, 'action', 'ssh')
+    safe_host = {key: host[key] for key in ('server_id', 'server_name', 'project_name') if key in host} if host else None
+    output = {'allowed': False, 'user': identity.get('username'), 'groups': identity.get('groups') or [],
+        'project': args.project, 'host': None, 'action': action, 'snapshot_only': True, 'simulation': True}
     try:
-        decision = resolve_grant(
-            identity,
-            project=project,
-            host=host,
-            grants=load_grants(redis),
-            project_sets=load_project_sets(redis),
-            defaults={**config.get("policy", {}), **config.get("ssh", {})},
-        )
-        matched = decision.get("matched_rule") or {}
-        output = {
-            "allowed": True,
-            "user": identity.get("username"),
-            "groups": identity.get("groups") or [],
-            "project": project,
-            "host": host,
-            "remote_user": decision.get("remote_user"),
-            "sudo_mode": decision.get("sudo_mode"),
-            "allowed_actions": decision.get("allowed_actions"),
-            "matched_grant": {
-                "id": matched.get("id"),
-                "subject": matched.get("subject"),
-                "name": matched.get("name"),
-                "host": matched.get("host") or matched.get("host_id") or matched.get("server_id"),
-                "project": matched.get("project"),
-                "project_glob": matched.get("project_glob"),
-                "project_set": matched.get("project_set"),
-            },
-        }
-        print(json.dumps(output, indent=2, sort_keys=True))
-        return 0
-    except PolicyDenied as exc:
-        output = {
-            "allowed": False,
-            "user": identity.get("username"),
-            "groups": identity.get("groups") or [],
-            "project": project,
-            "host": host,
-            "reason": str(exc),
-            "suggested_request": "isolate access request --project {}{} --reason <reason>".format(
-                project or "<project>",
-                " --host {}".format(args.host) if args.host else "",
-            ),
-        }
-        print(json.dumps(output, indent=2, sort_keys=True))
-        return 2
+        if args.host and host is None or host and args.project and args.project != project:
+            raise ExplanationError(404, 'resource_not_found_or_not_visible')
+        policy = policy_explanation(config, identity, host or {'project_name': project}, load_grants(redis),
+            load_project_sets(redis), action=action, admin=True)
+        output.update(policy=policy, reason_code=policy['reason_code'])
+        if policy['allowed']:
+            output.update(allowed=True, project=project, host=safe_host, remote_user=policy['remote_user'],
+                sudo_mode=policy['sudo_mode'], allowed_actions=policy['selected_grant']['allowed_actions'],
+                matched_grant=policy['selected_grant'])
+        else:
+            output['reason'] = 'The selected active rule does not allow this action.' if policy['reason_code'] == 'action_not_allowed' else 'No active policy assignment permits this request.'
+    except ExplanationError as exc:
+        output.update(reason_code=exc.code, reason='The resource or requested action is unavailable.')
+    if not output['allowed']:
+        output['suggested_request'] = 'isolate access request --project {}{} --reason <reason>'.format(
+            args.project or '<project>', ' --host {}'.format(args.host) if args.host else '')
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return 0 if output['allowed'] else 2
 
 
 @_managed_cli()
@@ -2469,6 +2448,7 @@ def build_parser():
     grant_explain.add_argument("--role", action="append")
     grant_explain.add_argument("--project")
     grant_explain.add_argument("--host")
+    grant_explain.add_argument("--action", default="ssh", help="Explain an explicit protocol/operation action")
     grant_explain.set_defaults(func=cmd_grant_explain)
 
     package = sub.add_parser("package")

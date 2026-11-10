@@ -12,7 +12,9 @@ import datetime
 import ipaddress
 import json
 import os
+import secrets
 import ssl
+import struct
 import sys
 from urllib.parse import urlsplit
 
@@ -20,9 +22,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from isolate_identity import IdentityError, _load_token_cache
 
 
-def identity_token(path=None):
+def identity_token(path=None, config=None):
+    from isolate_config import load_config
+    from isolate_oidc import identity_provider_config
+    config = config if config is not None else load_config()
     cache = _load_token_cache(path)
-    token = cache.get("id_token")
+    token = cache.get(identity_provider_config(config).get("token_kind", "id_token"))
     if not isinstance(token, str) or not token:
         raise IdentityError("run isolate login before using a protocol proxy")
     return token, cache
@@ -49,12 +54,39 @@ async def database_tunnel(args):
     tls = ssl.create_default_context(cafile=args.ca_file)
     tls.minimum_version = ssl.TLSVersion.TLSv1_2
     active = set()
+    from isolate_config import load_config
+    config = load_config(getattr(args, "config", None))
+    brokered = bool(getattr(args, "database_proxy", False))
+    frontend_password = None
+    if brokered:
+        path = getattr(args, "frontend_password_file", None)
+        if not path or not os.path.isabs(path):
+            raise ValueError("brokered database mode requires an absolute private --frontend-password-file")
+        if getattr(args, "create_frontend_password", False):
+            with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600), "w", encoding="ascii") as output:
+                output.write(secrets.token_urlsafe(36) + "\n")
+        from isolate_oidc import read_client_secret
+        frontend_password = read_client_secret({"client_secret_file": path})
+        if len(frontend_password) < 32:
+            raise ValueError("local frontend credential must contain at least 32 characters")
 
     async def connection(reader, writer):
         current = asyncio.current_task()
         active.add(current)
         try:
-            token, _ = identity_token(args.identity_file)
+            token, _ = identity_token(args.identity_file, config)
+            initial = b""
+            cancellation = None
+            if brokered and args.protocol == "postgresql":
+                # Cancellation is a separate libpq TCP connection. Read only
+                # the fixed header here; all other protocol parsing stays on
+                # the gateway and never chooses a caller-supplied destination.
+                initial = await asyncio.wait_for(reader.readexactly(8), timeout=10)
+                length, code = struct.unpack("!II", initial)
+                if (length, code) == (16, 80877102):
+                    cancel_body = await asyncio.wait_for(reader.readexactly(8), timeout=10)
+                    process_id, secret_key = struct.unpack("!II", cancel_body)
+                    cancellation = {"process_id": process_id, "secret_key": secret_key}
             timeout = aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10)
             async with aiohttp.ClientSession(timeout=timeout, connector=aiohttp.TCPConnector(ssl=tls),
                     trust_env=False, cookie_jar=aiohttp.DummyCookieJar()) as client:
@@ -68,10 +100,23 @@ async def database_tunnel(args):
                 # to send a one-time credential to an unexpected origin.
                 async with client.ws_connect(gateway_url + "/protocols/database", max_msg_size=65536,
                         heartbeat=20) as websocket:
-                    await websocket.send_json({"ticket": issued["ticket"], "protocol": args.protocol})
+                    authentication = {"ticket": issued["ticket"], "protocol": args.protocol}
+                    if brokered:
+                        if cancellation is not None:
+                            authentication["cancel"] = cancellation
+                        else:
+                            authentication["frontend_password"] = frontend_password
+                    await websocket.send_json(authentication)
                     first = await websocket.receive_json(timeout=300)
-                    if first.get("type") != "ready" or first.get("audit_profile") != "connection":
+                    if cancellation is not None:
+                        if first.get("type") != "cancelled":
+                            raise RuntimeError("database cancellation was denied")
+                        return
+                    expected_profile = "sql-query" if brokered else "connection"
+                    if first.get("type") != "ready" or first.get("audit_profile") != expected_profile:
                         raise RuntimeError("database transport was denied")
+                    if initial:
+                        await websocket.send_bytes(initial)
 
                     async def upstream():
                         while True:
@@ -119,7 +164,8 @@ async def database_tunnel(args):
 
 
 def credential(args):
-    token, cache = identity_token(args.identity_file)
+    from isolate_config import load_config
+    token, cache = identity_token(args.identity_file, load_config(getattr(args, "config", None)))
     status = {"token": token}
     if cache.get("expires_at"):
         expiration = datetime.datetime.fromtimestamp(int(cache["expires_at"]), datetime.timezone.utc)
@@ -137,10 +183,15 @@ def main():
     db.add_argument("--protocol", choices=("postgresql", "mysql"), required=True)
     db.add_argument("--listen-port", type=int, default=0)
     db.add_argument("--identity-file")
+    db.add_argument("--config", help="Client configuration selecting the configured OIDC token kind")
+    db.add_argument("--database-proxy", action="store_true", help="Use policy-selected database credentials and SQL audit")
+    db.add_argument("--frontend-password-file", help="Private local client capability file; never a database target password")
+    db.add_argument("--create-frontend-password", action="store_true", help="Create a new private local capability file without overwriting")
     db.add_argument("--ca-file")
     db.add_argument("--allow-loopback-http", action="store_true", help="Only for a loopback development endpoint")
     kube = commands.add_parser("credential", help="Print an ExecCredential for kubectl's exec plugin")
     kube.add_argument("--identity-file")
+    kube.add_argument("--config", help="Client configuration selecting the configured OIDC token kind")
     args = parser.parse_args()
     try:
         if args.command == "credential":

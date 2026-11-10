@@ -145,7 +145,7 @@ class WorkspaceUITest(unittest.TestCase):
     def test_navigation_entry_permissions_do_not_expand_a_scoped_role(self):
         self.config["dashboard"]["role_bindings"] = [{"group": "Support", "role": "approver", "projects": ["prod"]}]
         urls = {row["url"] for row in administration_links(self.current, self.config, WORDS["en"])}
-        self.assertEqual(urls, {"/inventory", "/access", "/session-approvals"})
+        self.assertEqual(urls, {"/inventory", "/access", "/session-approvals", "/workspace/governance"})
 
 
 if __name__ == "__main__":

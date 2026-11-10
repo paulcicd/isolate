@@ -850,6 +850,15 @@ def _html(title, body, config=None, notice=None):
     portal_nav += '<a class="nav-link" href="/me/session-approvals">{}</a>'.format("Мои согласования" if locale == "ru" else "My approvals")
     if (config or {}).get("api", {}).get("enabled") and (config or {}).get("audit_index", {}).get("enabled"):
         portal_nav += '<a class="nav-link" href="/audit/search">{}</a>'.format("Поиск по аудиту" if locale == "ru" else "Audit search")
+        portal_nav += '<a class="nav-link" href="/investigations">{}</a>'.format('Расследование' if locale == 'ru' else 'Investigation')
+    if (config or {}).get('api', {}).get('enabled'):
+        if has_permission(identity, config or {}, 'access.read'):
+            admin_nav += '<a class="nav-link" href="/workspace/governance">{}</a>'.format('Жизненный цикл доступов' if locale == 'ru' else 'Access lifecycle')
+        if admin_view:
+            admin_nav += '<a class="nav-link" href="/policy/impact">{}</a>'.format('Влияние изменения прав' if locale == 'ru' else 'Policy impact')
+        from isolate_workspace_ui import campaign_navigation_allowed
+        if campaign_navigation_allowed(identity, config or {}):
+            portal_nav += '<a class="nav-link" href="/operations/campaigns">{}</a>'.format('Поэтапные операции' if locale == 'ru' else 'Staged operations')
     try:
         from flask import has_request_context, request
         if has_request_context() and (request.path == "/workspace" or request.path.startswith(("/me/terminal", "/replay/"))):
@@ -1254,6 +1263,12 @@ def create_app(config=None):
             except (IdentityError, ConnectionDenied):
                 session.clear()
                 return None
+        from isolate_governance import check_governance_access
+        try:
+            check_governance_access(redis_client(config), identity)
+        except IdentityError:
+            session.clear()
+            return None
         security = config.get("identity_security", {})
         if any(security.get(name, {}).get("enabled") for name in ("backchannel_logout", "introspection", "membership")):
             from isolate_identity_security import refresh_identity
@@ -1374,6 +1389,7 @@ def create_app(config=None):
     def audit_admin(action, admin, outcome, details=None):
         record = {
             "event": "dashboard_user_action" if (details or {}).get("self_service") else "dashboard_admin_action",
+            "ts": time.time(),
             "action": action,
             "username": admin.get("username"),
             "keycloak_sub": admin.get("keycloak_sub"),
@@ -1559,11 +1575,19 @@ def create_app(config=None):
                 ensure_provider_binding(config, redis_client(config))
             except IdentityError:
                 abort(401, description="Identity provider binding does not match this installation")
+        from isolate_governance import check_governance_access
+        try:
+            check_governance_access(redis_client(config), identity)
+        except IdentityError:
+            abort(403, description='Access lifecycle policy prevents sign-in')
         if not is_dashboard_admin(identity, config) and not is_self_service_user(identity, config) and not role_names(identity, config):
             abort(403)
         return_to = session.get("return_to")
         session.clear()
         session["identity"] = identity
+        from isolate_investigations import identity_session_reference
+        audit_admin('login', identity, 'success', {'event': 'identity_login',
+            'identity_session_sha256': identity_session_reference(identity)})
         # Flask cookies are signed, not encrypted. Keep bearer credentials only
         # in the private server-side store, keyed by an opaque session handle.
         if generic_oidc or config.get("api", {}).get("enabled") or any(config.get("identity_security", {}).get(name, {}).get("enabled") for name in ("introspection", "delegation")):
@@ -1582,6 +1606,11 @@ def create_app(config=None):
 
     @app.route("/logout")
     def logout():
+        identity = session.get('identity')
+        if isinstance(identity, dict):
+            from isolate_investigations import identity_session_reference
+            audit_admin('logout', identity, 'closed', {'event': 'identity_logout',
+                'identity_session_sha256': identity_session_reference(identity)})
         handle = session.get("runtime_session")
         if handle:
             redis_client(config).delete("isolate_browser_" + handle)
@@ -1814,6 +1843,11 @@ def create_app(config=None):
             body += """<form class="inline" method="post" action="/job/{}/cancel"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button class="button-danger">Cancel job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))
         if job.get("status") in ("failed", "timed_out"):
             body += """<form class="inline" method="post" action="/job/{}/retry"><input type="hidden" name="csrf_token" value="{}"><label><input type="checkbox" name="confirm" value="true" required> confirm</label><button>Retry job</button></form>""".format(html.escape(str(job_id)), html.escape(csrf_token()))
+        if config.get('api', {}).get('enabled'):
+            from isolate_explain_api import explanation_panel
+            body += explanation_panel(job.get('host_id'), 'ssh', action=job.get('policy_action') or 'command')
+            if config.get('audit_index', {}).get('enabled'):
+                body += '<p><a href="/investigations?kind=job&amp;id={}">Follow related evidence</a></p>'.format(html.escape(str(job_id), quote=True))
         body += "<h2>Output</h2><pre>{}</pre>".format(html.escape(output or "No output was captured."))
         body += "<h2>Authorization snapshot</h2><pre>{}</pre>".format(html.escape(json.dumps({
             "groups": job.get("groups") or [], "roles": job.get("roles") or [], "grant_id": job.get("grant_id"),

@@ -93,7 +93,7 @@ def _require_owner(record, identity):
         raise AccessDenied("access request is not owned by this user")
 
 
-def _mutate_request(redis, request_id, mutation):
+def _mutate_request(redis, request_id, mutation, config=None, actor=None, event=None):
     """Commit request status and its grant together, retrying competing decisions."""
     key = _request_key(request_id)
 
@@ -111,6 +111,11 @@ def _mutate_request(redis, request_id, mutation):
             else:
                 target.set(changed_key, json.dumps(value, sort_keys=True))
         target.set(key, json.dumps(record, sort_keys=True))
+        if event:
+            from isolate_workflow_audit import stage_event
+            stage_event(target, config, event, actor, record.get('project'), access_request_id=str(record['id']),
+                grant_id=record.get('grant_id'), requester_sub=record.get('requester_sub'), status=record.get('status'),
+                host_id=record.get('host'), expires_at=record.get('expires_at'))
         if writer is not None:
             writer.execute()
         return result
@@ -206,7 +211,18 @@ def create_access_request(redis, identity, project, host=None, remote_user=None,
     if renewal_of is not None:
         record["renewal_of"] = str(renewal_of)
         _append_comment(record, identity, "renew", "Renewal of request #{}".format(renewal_of))
-    redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
+    from isolate_workflow_audit import stage_event
+    if config is not None and callable(getattr(redis, 'pipeline', None)):
+        with redis.pipeline(transaction=True) as transaction:
+            transaction.multi()
+            transaction.set(_request_key(request_id), json.dumps(record, sort_keys=True))
+            stage_event(transaction, config, 'access_request_created', identity, project, access_request_id=str(request_id),
+                host_id=host, requester_sub=identity.get('keycloak_sub'))
+            transaction.execute()
+    else:
+        redis.set(_request_key(request_id), json.dumps(record, sort_keys=True))
+        stage_event(redis, config, 'access_request_created', identity, project, access_request_id=str(request_id),
+            host_id=host, requester_sub=identity.get('keycloak_sub'))
     return record
 
 
@@ -291,7 +307,7 @@ def approve_access_request(redis, request_id, approver, ttl_seconds, remote_user
         _append_comment(record, approver, "approve", comment)
         return (record, grant), [("set", "grant_{}".format(grant_id), grant)]
 
-    return _mutate_request(redis, request_id, approve) or (None, None)
+    return _mutate_request(redis, request_id, approve, config=config, actor=approver, event='access_request_approved') or (None, None)
 
 
 def deny_access_request(redis, request_id, approver, reason=None, comment=None, config=None):
@@ -303,7 +319,7 @@ def deny_access_request(redis, request_id, approver, reason=None, comment=None, 
                        "decided_at": now_ts(), "decision_reason": reason})
         _append_comment(record, approver, "deny", comment)
         return record, []
-    return _mutate_request(redis, request_id, deny)
+    return _mutate_request(redis, request_id, deny, config=config, actor=approver, event='access_request_denied')
 
 
 def comment_access_request(redis, request_id, identity, text, admin_groups=None):
@@ -376,7 +392,7 @@ def revoke_access_request(redis, request_id, identity, admin_groups=None, reason
                        "revoked_at": now_ts(), "revoke_reason": reason})
         _append_comment(record, identity, "revoke", reason or "Access revoked by administrator")
         return record, changes
-    return _mutate_request(redis, request_id, revoke)
+    return _mutate_request(redis, request_id, revoke, config=config, actor=identity, event='access_request_revoked')
 
 
 def renew_access_request(redis, request_id, identity, reason=None, ticket=None, starts_at=None, ends_at=None, config=None):

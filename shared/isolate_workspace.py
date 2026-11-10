@@ -100,6 +100,8 @@ def workspace_resources(runtime, identity, token, query=None, project=None, prot
                 continue
             decision = None
             try:
+                from isolate_governance import check_governance_access
+                check_governance_access(store, identity, host['project_name'])
                 assert_workload_action(config, identity, kind)
                 decision = resolve_grant(identity, project=host["project_name"], host=host, grants=grants,
                     project_sets=sets, defaults={**config.get("policy", {}), **config.get("ssh", {})}, action=kind)

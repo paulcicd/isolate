@@ -1,0 +1,61 @@
+name: isolate-database-integration
+x-runner: &runner
+  build:
+    context: ../../..
+    dockerfile: tests/integration/databases/Dockerfile
+  volumes:
+    - ../../..:/opt/auth:ro
+    - database-fixtures:/fixtures
+services:
+  fixtures:
+    <<: *runner
+    command: [python3, /opt/auth/tests/integration/databases/prepare.py]
+  postgres:
+    image: postgres:17-alpine
+    command: [postgres, -c, ssl=on, -c, ssl_cert_file=/fixtures/postgres.pem, -c, ssl_key_file=/fixtures/postgres.key, -c, hba_file=/fixtures/pg_hba.conf]
+    environment:
+      POSTGRES_USER: db_reader
+      POSTGRES_PASSWORD: isolated-postgres-upstream-password
+      POSTGRES_DB: app
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+    volumes:
+      - database-fixtures:/fixtures:ro
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, pg_isready -U db_reader -d app]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+  mysql:
+    image: mysql:8
+    command: [--ssl-ca=/fixtures/ca.pem, --ssl-cert=/fixtures/mysql.pem, --ssl-key=/fixtures/mysql.key, --require-secure-transport=ON]
+    environment:
+      MYSQL_USER: db_reader
+      MYSQL_PASSWORD: isolated-mysql-upstream-password
+      MYSQL_DATABASE: app
+      MYSQL_ROOT_PASSWORD: isolated-mysql-root-password
+    volumes:
+      - database-fixtures:/fixtures:ro
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+    healthcheck:
+      test: [CMD-SHELL, "MYSQL_PWD=$$MYSQL_PASSWORD mysql --protocol=tcp --host=127.0.0.1 --user=$$MYSQL_USER --database=$$MYSQL_DATABASE --ssl-mode=REQUIRED -N -e 'SELECT 1'"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+  runner:
+    <<: *runner
+    environment:
+      NO_PROXY: '*'
+    depends_on:
+      fixtures:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      mysql:
+        condition: service_healthy
+volumes:
+  database-fixtures:

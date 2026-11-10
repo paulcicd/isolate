@@ -167,6 +167,9 @@ async def main():
         config['command_execution'].update(enabled=True, allowed_groups=['Integration-Operators'],
             allowed_command_patterns=['whoami', 'hold'], default_timeout=30,
             jobs_path=str(work / 'jobs'), signing_key_file=str(job_key))
+        config['runbooks']['enabled'] = True
+        config['runbooks']['read_only']['allowed_groups'] = ['Integration-Operators']
+        config['campaigns'] = {'enabled': True, 'max_hosts': 10, 'max_batch_size': 2}
         config['logging']['sinks'] = [dict(config['audit_index'], type='sql')]
         index = AuditIndex(config['audit_index'])
         await asyncio.to_thread(index.initialize)
@@ -199,6 +202,8 @@ async def main():
                     command = words[2]
             if command == 'whoami':
                 process.stdout.write('observer\n')
+            elif command == '/usr/bin/uptime':
+                process.stdout.write('fixture uptime: healthy\n')
             elif command == 'hold':
                 process.stdout.write('ready\n')
                 await process.wait_closed()
@@ -239,7 +244,10 @@ async def main():
         store.set('server_10001', json.dumps(host))
         store.set('grant_1', json.dumps({'subject': 'group', 'name': 'Integration-Operators',
             'project': 'integration', 'host': '10001', 'remote_user': 'observer', 'sudo_mode': 'none',
-            'allowed_actions': ['ssh', 'command', 'sftp']}))
+            'allowed_actions': ['ssh', 'command', 'sftp', 'runbook']}))
+        store.set('server_10002', json.dumps(dict(host, server_id='10002', server_name='integration-canary-peer')))
+        store.set('grant_2', json.dumps({'subject': 'group', 'name': 'Integration-Operators',
+            'project': 'integration', 'host': '10002', 'remote_user': 'observer', 'sudo_mode': 'none', 'allowed_actions': ['runbook']}))
         runtime = Runtime(config, store)
         native = await create_native_listener(runtime)
         native_port = native.get_port()
@@ -409,6 +417,33 @@ async def main():
             check(result['status'] == 'completed', 'actual delegated OpenSSH command failed')
             progress('PASS: SQL-authoritative idempotent job API and encrypted delegated OpenSSH execution')
 
+            campaign_body = {'runbook_id': 'uptime', 'host_ids': ['10001', '10002'], 'canary_count': 1, 'batch_size': 1}
+            campaign_headers = {'Authorization': 'Bearer ' + token, 'Idempotency-Key': 'real-keycloak-canary-once'}
+            preview = await asyncio.to_thread(browser.post, DASHBOARD + '/api/v1/runbook-campaigns/preview',
+                headers=campaign_headers, json=campaign_body, timeout=20)
+            check(preview.status_code == 200, 'real OIDC campaign preview was not authorized')
+            campaign_body.update(confirm=True, preview_digest=preview.json()['preview_digest'])
+            created = await asyncio.to_thread(browser.post, DASHBOARD + '/api/v1/runbook-campaigns',
+                headers=campaign_headers, json=campaign_body, timeout=20)
+            check(created.status_code == 201, 'real OIDC campaign was not created')
+            campaign = created.json()['campaign']
+            from isolate_jobs import run_worker, get_job
+            from isolate_campaigns import get_campaign
+            await asyncio.to_thread(run_worker, config, store, True)
+            current = get_campaign(store, campaign['id'])
+            check(current['current_stage'] == 1, 'canary did not authorize exactly the next stage')
+            await asyncio.to_thread(run_worker, config, store, True)
+            current = get_campaign(store, campaign['id'])
+            check(current['status'] == 'completed', 'real delegated OpenSSH campaign did not complete')
+            check(all(get_job(store, row['id']).get('campaign_result', {}).get('signature') for row in current['jobs']),
+                'campaign terminal outcomes lack signed worker receipts')
+            trace = await asyncio.to_thread(browser.get, DASHBOARD + '/api/v1/investigations/timeline',
+                headers={'Authorization': 'Bearer ' + token}, params={'kind': 'campaign', 'id': campaign['id']}, timeout=15)
+            check(trace.status_code == 200 and any(row['stage'] == 'result' for row in trace.json()['events']),
+                'scoped PostgreSQL investigation lacks real campaign results')
+            check(token not in json.dumps(trace.json()), 'timeline exposed an OIDC bearer')
+            progress('PASS: real Keycloak token, SQL canary stages, signed worker results, OpenSSH runbooks and scoped timeline')
+
             control = browser_session()
             admin_token = await asyncio.to_thread(control.post, ISSUER + '/protocol/openid-connect/token',
                 data={'grant_type': 'client_credentials', 'client_id': 'isolate-fixture-admin',
@@ -498,6 +533,34 @@ async def main():
             check(await asyncio.to_thread(index.ingest, events['events'][0]) is False, 'audit replay was not idempotent')
             check(all(token not in json.dumps(event) for event in events['events']), 'bearer token leaked into audit')
             progress('PASS: shared PostgreSQL audit ingestion/search, event idempotency, token exclusion')
+
+            # A fresh real IdP session remains valid while Isolate ends project
+            # access independently. The trusted fixture maintainer is separate
+            # from the subject being offboarded.
+            await asyncio.sleep(1.1)
+            fresh_browser = await asyncio.to_thread(browser_login, browser_session())
+            fresh_session = flask_app.session_interface.get_signing_serializer(flask_app).loads(fresh_browser.cookies.get('session'))
+            fresh_token = json.loads(store.get('isolate_browser_' + fresh_session['runtime_session']))['token']
+            fresh_headers = {'Authorization': 'Bearer ' + fresh_token}
+            ready = await asyncio.to_thread(fresh_browser.post, DASHBOARD + '/api/v1/connections', headers=fresh_headers,
+                json={'host_id': '10001', 'protocol': 'ssh'}, timeout=15)
+            check(ready.status_code == 201, 'fresh real Keycloak sign-in failed after prior logout')
+            async with asyncssh.connect('127.0.0.1', port=native_port, username='10001', password=ready.json()['ticket'],
+                    known_hosts=str(gateway_known), client_keys=[], agent_path=None, config=[]) as connection:
+                process = await connection.create_process('hold')
+                check((await asyncio.wait_for(process.stdout.readline(), 5)).strip() == 'ready', 'offboarding hold session did not start')
+                config['dashboard']['role_bindings'] = [{'group': 'Fixture-Lifecycle-Owners', 'role': 'project-owner', 'projects': ['integration']}]
+                maintainer = {'keycloak_sub': 'fixture-independent-maintainer', 'username': 'maintainer', 'groups': ['Fixture-Lifecycle-Owners']}
+                from isolate_governance import offboard
+                await asyncio.to_thread(offboard, store, config, maintainer, identity['keycloak_sub'], 'integration', 'Fixture project assignment ended')
+                result = await asyncio.wait_for(process.wait(), 5)
+                check(result.exit_status != 0, 'offboarded real SSH connection continued')
+            denied = await asyncio.to_thread(fresh_browser.post, DASHBOARD + '/api/v1/connections', headers=fresh_headers,
+                json={'host_id': '10001', 'protocol': 'ssh'}, timeout=15)
+            check(denied.status_code == 403, 'project offboarding allowed a fresh connection')
+            still_verified = await asyncio.to_thread(fresh_browser.get, DASHBOARD + '/api/v1/me', headers=fresh_headers, timeout=15)
+            check(still_verified.status_code == 200, 'project decision incorrectly disabled the IdP identity')
+            progress('PASS: durable offboarding ends real SSH and denies reuse while fresh Keycloak identity remains valid')
             progress('ALL GATEWAY INTEGRATION CHECKS PASSED')
         finally:
             await asyncio.to_thread(server.shutdown)

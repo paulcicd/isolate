@@ -16,6 +16,12 @@ class AuditIndexError(ValueError):
     pass
 
 
+# Only these producer-defined scalar identifiers may participate in a timeline
+# join. Callers cannot inject SQL/JSON paths or search arbitrary payload fields.
+REFERENCE_FIELDS = frozenset({"job_id", "retry_of", "campaign_id", "connection_id", "session_id",
+    "parent_connection_id", "access_request_id", "session_approval_id", "grant_id", "identity_session_sha256"})
+
+
 def _redact(value):
     if isinstance(value, dict):
         return {k: ("[redacted]" if any(part in k.lower() for part in
@@ -72,6 +78,14 @@ class AuditIndex:
             for name, fields in (("time", "ts, event_id"), ("subject", "keycloak_sub, ts"),
                     ("project", "project, ts"), ("session", "connection_id, ts"), ("host", "host_id, ts")):
                 db.execute("CREATE INDEX IF NOT EXISTS isolate_audit_{} ON isolate_audit_events ({})".format(name, fields))
+            # Added only by the explicit init command, never by a search route.
+            # Partial indexes avoid indexing absent references on every event.
+            for field in ('job_id', 'campaign_id', 'access_request_id', 'session_approval_id',
+                          'identity_session_sha256', 'target_subject', 'requester_sub'):
+                expression = ("CAST(json_extract(payload, '$.{}') AS TEXT)".format(field) if self.driver == 'sqlite'
+                    else "(payload::jsonb->>'{}')".format(field))
+                db.execute("CREATE INDEX IF NOT EXISTS isolate_audit_ref_{} ON isolate_audit_events ({}, ts) WHERE {} IS NOT NULL".format(
+                    field, expression, expression))
             if self.driver == "sqlite":
                 db.execute("CREATE VIRTUAL TABLE IF NOT EXISTS isolate_audit_fts USING fts5(event_id UNINDEXED, search_text)")
                 db.execute("INSERT OR IGNORE INTO isolate_audit_schema(version) VALUES (1)")
@@ -103,7 +117,8 @@ class AuditIndex:
         return False
 
     def search(self, *, subject=None, projects=None, query=None, event=None, host_id=None,
-               connection_id=None, since=None, until=None, before=None, limit=100):
+               connection_id=None, since=None, until=None, before=None, limit=100,
+               actor_sub=None, project=None, references=None, include_index_time=False, person_sub=None):
         conditions, params = [], []
         p = self.marker
         # projects=None means unrestricted. [] explicitly grants no projects;
@@ -125,6 +140,36 @@ class AuditIndex:
             if value is not None:
                 conditions.append(name + "=" + p)
                 params.append(str(value))
+        for name, value in (("keycloak_sub", actor_sub), ("project", project)):
+            if value is not None:
+                conditions.append(name + "=" + p)
+                params.append(str(value))
+        if person_sub is not None:
+            expressions = ['keycloak_sub']
+            for field in ('requester_sub', 'target_subject'):
+                expressions.append("CAST(json_extract(payload, '$.{}') AS TEXT)".format(field)
+                    if self.driver == 'sqlite' else "(payload::jsonb->>'{}')".format(field))
+            conditions.append('(' + ' OR '.join(expression + '=' + p for expression in expressions) + ')')
+            params.extend([str(person_sub)] * len(expressions))
+        if references is not None:
+            if not isinstance(references, dict) or set(references) - REFERENCE_FIELDS:
+                raise AuditIndexError("invalid investigation references")
+            alternatives = []
+            for name, values in sorted(references.items()):
+                if (not isinstance(values, (list, tuple)) or len(values) > 64
+                        or any(not isinstance(value, str) or not value or len(value) > 128 for value in values)):
+                    raise AuditIndexError("invalid investigation reference values")
+                if not values:
+                    continue
+                if name == "connection_id":
+                    expression = "connection_id"
+                elif self.driver == "sqlite":
+                    expression = "CAST(json_extract(payload, '$.{}') AS TEXT)".format(name)
+                else:
+                    expression = "(payload::jsonb->>'{}')".format(name)
+                alternatives.append(expression + " IN ({})".format(",".join([p] * len(values))))
+                params.extend(values)
+            conditions.append("(" + " OR ".join(alternatives or ["1=0"]) + ")")
         for op, value in ((">=", since), ("<=", until)):
             if value is not None:
                 conditions.append("ts" + op + p)
@@ -154,7 +199,9 @@ class AuditIndex:
                 " ORDER BY ts DESC, event_id DESC LIMIT " + p, params).fetchall()
         more = len(rows) > maximum
         rows = rows[:maximum]
-        return {"events": [json.loads(row["payload"]) for row in rows],
+        events = [dict(json.loads(row['payload']), _index_timestamp=row['ts']) if include_index_time
+                  else json.loads(row['payload']) for row in rows]
+        return {"events": events,
                 "next": [rows[-1]["ts"], rows[-1]["event_id"]] if more and rows else None}
 
     def projects(self):

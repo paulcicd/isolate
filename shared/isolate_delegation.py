@@ -75,6 +75,8 @@ def _epoch(redis, config):
 
 def _grant(redis, config, identity, host, action):
     from isolate import load_grants, load_project_sets
+    from isolate_governance import check_governance_access
+    check_governance_access(redis, identity, host.get('project_name'))
     return resolve_grant(identity, project=host.get("project_name"), host=host,
         grants=load_grants(redis), project_sets=load_project_sets(redis),
         defaults={**config.get("policy", {}), **config.get("ssh", {})}, action=action)
@@ -161,7 +163,7 @@ def attach_delegation(redis, config, record, identity, token, host, decision):
     if deadline <= now:
         raise DelegationDenied("job delegation has expired")
     reference = secrets.token_hex(32)
-    record.update(schema_version=3, delegation_id=reference, delegation_expires_at=deadline,
+    record.update(schema_version=max(3, int(record.get('schema_version') or 1)), delegation_id=reference, delegation_expires_at=deadline,
                   principal_type=identity.get("principal_type", "human"), service_client_id=identity.get("service_client_id"),
                   delegation_epoch=_epoch(redis, config))
     _, _, audience = verified_token(config, token)

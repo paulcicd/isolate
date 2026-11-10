@@ -1,8 +1,8 @@
 """Policy-bound HTTP/Kubernetes proxies and encrypted database transport.
 
-Database transport deliberately leaves database authentication and SQL RBAC to
-the database. It is a network access gate, not a SQL parser or credential broker.
-Only connection metadata is audited; native TLS must be negotiated end to end.
+Legacy database transport preserves end-to-end native authentication/TLS.
+Explicit database_proxy, web-application and Kubernetes streaming modes extend
+this boundary with credential mediation and channel-aware runtime checks.
 """
 
 import asyncio
@@ -75,6 +75,10 @@ def resolve_target(config, host, protocol):
     target = dict((options.get("targets") or {}).get(str((host or {}).get("server_id"))) or {})
     if target.get("protocol") != protocol:
         raise ProtocolError("resource is not configured for this protocol")
+    for feature in ("database_proxy", "kubernetes"):
+        value = target.get(feature, {})
+        if not isinstance(value, dict) or "enabled" in value and not isinstance(value["enabled"], bool):
+            raise ProtocolError(feature + " must be an object with a boolean enabled flag")
     if not host.get("project_name") or target.get("project") != host["project_name"]:
         raise ProtocolError("target project differs from inventory")
     try:
@@ -115,15 +119,29 @@ def resolve_target(config, host, protocol):
     else:
         if parsed.scheme != protocol or parsed.path not in ("", "/"):
             raise ProtocolError("database upstream must use its protocol scheme and contain no path")
-        if target.get("database_native_auth") is not True:
+        brokered = target.get("database_proxy") or {}
+        if not isinstance(brokered, dict):
+            raise ProtocolError("database_proxy must be an object")
+        if "enabled" in brokered and not isinstance(brokered["enabled"], bool):
+            raise ProtocolError("database_proxy.enabled must be a boolean")
+        if not brokered.get("enabled") and target.get("database_native_auth") is not True:
             raise ProtocolError("database transport requires explicit database_native_auth acknowledgement")
         if target.get("require_native_tls", True) is not True:
             raise ProtocolError("database transport requires native database TLS")
         port = _port(port or (5432 if protocol == "postgresql" else 3306))
         base_path = ""
-        profile = "connection"
+        profile = "sql-query" if brokered.get("enabled") else "connection"
     target.update(protocol=protocol, address=address, hostname=parsed.hostname, port=port,
                   base_path=base_path, scheme=parsed.scheme, audit_profile=profile)
+    if protocol == "http" and target.get("mode") == "web-application":
+        from isolate_web_apps import validate_web_app_target
+        validate_web_app_target(config, target)
+    if protocol in DATABASE_PROTOCOLS and (target.get("database_proxy") or {}).get("enabled"):
+        from isolate_database_proxy import validate_database_target
+        validate_database_target(target)
+    if protocol == "kubernetes" and (target.get("kubernetes") or {}).get("enabled"):
+        from isolate_kubernetes import validate_kubernetes_target
+        validate_kubernetes_target(target)
     return target
 
 
@@ -303,6 +321,8 @@ async def proxy_http_request(request, runtime, protocol):
         host_id = request.match_info["host_id"]
         context = await _call(runtime, "authorize", authorization[7:], host_id, protocol=protocol, source_ip=request.remote)
         target = resolve_target(runtime.config, context["host"], protocol)
+        if target.get("mode") == "web-application":
+            raise ProtocolError("use the isolated application origin from the workspace")
         method, path = validate_http_request(target, request.method, "/" + request.match_info.get("path", ""), request.query)
         context["audit_profile"] = "http-request"
         context["protocol_request"] = {"method": method, "path": path}
@@ -458,11 +478,39 @@ async def database_websocket(request, runtime, registry=None):
         auth = json.loads(message.data)
         if not isinstance(auth, dict) or auth.get("protocol") not in DATABASE_PROTOCOLS:
             raise ProtocolError("unsupported database protocol")
+        if set(auth) - {"ticket", "protocol", "frontend_password", "cancel"}:
+            raise ProtocolError("unsupported database authentication fields")
         ticket = auth.get("ticket")
         if not isinstance(ticket, str) or len(ticket) > 2048:
             raise ProtocolError("a one-time ticket is required")
         context = await _call(runtime, "consume_ticket", ticket, protocol=auth["protocol"], source_ip=request.remote)
         target = resolve_target(runtime.config, context["host"], auth["protocol"])
+        if (target.get("database_proxy") or {}).get("enabled"):
+            from isolate_database_proxy import proxy_database_session, cancel_database_query
+            if auth.get("cancel") is not None:
+                if auth["protocol"] != "postgresql":
+                    raise ProtocolError("only PostgreSQL has a separate cancellation channel")
+                await cancel_database_query(runtime, context, target, auth["cancel"])
+                await websocket.send_json({"type": "cancelled"})
+                exit_code = 0
+                return websocket
+            password = auth.get("frontend_password")
+            if (not isinstance(password, str) or not 32 <= len(password) <= 512
+                    or any(ord(char) < 33 or ord(char) > 126 for char in password)):
+                raise ProtocolError("private local frontend credential is required")
+            context["audit_profile"] = "sql-query"
+            context["protocol_stats"] = {"received_bytes": 0, "sent_bytes": 0}
+            await _prepare(runtime, context, _database_disconnected(websocket))
+            await _call(runtime, "start", context)
+            await _call(runtime, "recheck", context)
+            await websocket.send_json({"type": "ready", "protocol": target["protocol"], "audit_profile": "sql-query",
+                "database_native_auth": False, "require_native_tls": True})
+            await _guarded(runtime, context, proxy_database_session(runtime, context, target,
+                _WebSocketReader(websocket), websocket, frontend_password=password))
+            exit_code = 0
+            return websocket
+        if auth.get("cancel") is not None or auth.get("frontend_password") is not None:
+            raise ProtocolError("credential brokering is not enabled for this target")
         context["audit_profile"] = "connection"
         context["protocol_stats"] = {"received_bytes": 0, "sent_bytes": 0}
         await _prepare(runtime, context, _database_disconnected(websocket))
@@ -557,6 +605,10 @@ def register_protocol_routes(app, runtime):
         return await proxy_http_request(request, runtime, "http")
 
     async def kubernetes(request):
+        target = (runtime.config.get("protocols", {}).get("targets", {}).get(request.match_info["host_id"]) or {})
+        if (target.get("kubernetes") or {}).get("enabled"):
+            from isolate_kubernetes import proxy_kubernetes_request
+            return await proxy_kubernetes_request(request, runtime, sockets)
         return await proxy_http_request(request, runtime, "kubernetes")
 
     async def database(request):

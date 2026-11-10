@@ -128,6 +128,9 @@ def assert_identity_active(redis, config, identity, token=None, host=None, decis
     accepted because another node cached a previous active response.
     """
     now = int(time.time() if now is None else now)
+    if redis is not None:
+        from isolate_governance import check_governance_access
+        check_governance_access(redis, identity, (host or {}).get('project_name'))
     options = _options(config)
     logout = options.get("backchannel_logout") or {}
     introspection = options.get("introspection") or {}

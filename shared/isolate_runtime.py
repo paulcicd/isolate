@@ -83,6 +83,8 @@ class Runtime:
         host = get_host(self.redis, host_id)
         if not host:
             raise RuntimeDenied("target not found")
+        from isolate_governance import check_governance_access
+        check_governance_access(self.redis, identity, host.get('project_name'))
         ipaddress.ip_address(host["server_ip"])
         if protocol in ("ssh", "webssh"):
             if not self.config.get("gateway", {}).get("enabled", False):
@@ -138,7 +140,7 @@ class Runtime:
             try:
                 # Listing SSH resources continues to work with gateway disabled.
                 decision = policy_for_host(self.redis, self.config, identity, host)
-            except (ConnectionDenied, PolicyDenied):
+            except (ConnectionDenied, PolicyDenied, IdentityError):
                 continue
             fields = ("server_id", "server_name", "server_ip", "server_port", "project_name", "server_services",
                 "server_services_display", "server_note", "server_vip", "server_vip_marker", "maintenance_enabled",
@@ -274,8 +276,10 @@ class Runtime:
             "protocol": context["protocol"], "source_ip": context.get("source_ip"), "owner_node": self.node_id,
             "server_name": host.get("server_name"),
             "proxy_host_ids": [str(hop["host"]["server_id"]) for hop in context.get("proxy_chain", [])],
-            "audit_profile": "terminal-recording" if context["protocol"] in ("ssh", "webssh") else "connection",
+            "audit_profile": context.get("audit_profile") or ("terminal-recording" if context["protocol"] in ("ssh", "webssh") else "connection"),
             "session_approval_id": context.get("session_approval_id"), "expires_at": context["deadline"]}
+        metadata.update(grant_id=(decision.get('matched_rule') or {}).get('id'),
+                        access_request_id=(decision.get('matched_rule') or {}).get('request_id'))
         context["_raw_log_path"] = os.path.join(logger.session_dir, "terminal.log")
         logger.event_durable("ssh_start" if context["protocol"] in ("ssh", "webssh") else "protocol_start",
                              connection_id=context["connection_id"], raw_log_path=context["_raw_log_path"], **metadata)

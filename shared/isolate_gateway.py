@@ -833,7 +833,7 @@ async def websocket_ssh(request):
 def create_web_app(runtime):
     from aiohttp import web
 
-    app = web.Application(client_max_size=MAX_MESSAGE)
+    app = web.Application(client_max_size=MAX_MESSAGE, handler_args={"auto_decompress": False})
     app[RUNTIME_KEY] = runtime
     app[WEB_CONNECTIONS_KEY] = set()
     app.router.add_get("/ssh", websocket_ssh)
@@ -860,6 +860,9 @@ def create_web_app(runtime):
     if runtime.config.get("protocols", {}).get("enabled"):
         from isolate_protocols import register_protocol_routes
         register_protocol_routes(app, runtime)
+    if runtime.config.get("web_apps", {}).get("enabled"):
+        from isolate_web_apps import register_web_app_routes
+        register_web_app_routes(app, runtime, app[WEB_CONNECTIONS_KEY])
     return app
 
 

@@ -53,7 +53,9 @@ class TerminalWorkspaceTest(unittest.TestCase):
         attack = '</script><img src=x onerror="alert(1)"><script>'
         page = render_terminal_workspace({"id": "1", "name": attack, "project": attack}, csrf_token=attack)
         parser = PageParser(page)
-        self.assertEqual(len(parser.scripts), 2)
+        self.assertEqual(len(parser.scripts), 3)
+        self.assertEqual({script.get('src') for script in parser.scripts if script.get('src')},
+            {'/static/access-explain.js', '/static/terminal-workspace.js'})
         self.assertFalse(any(tag == "img" for tag, _ in parser.elements))
         config = parser.configuration("terminal-workspace-config")
         self.assertEqual(config["initialResource"]["name"], attack)

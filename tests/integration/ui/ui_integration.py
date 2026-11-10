@@ -125,11 +125,53 @@ def browser_checks(base, cookie, output, commands, connection_ids):
         page.locator("#tr-play").click()
         page.locator("#tr-pause").click()
         page.screenshot(path=str(output / "replay-bookmarks.png"), full_page=True)
+        page.goto(base + '/workspace/access/1?protocol=ssh&lang=ru')
+        expect(page.locator('h1')).to_contain_text('Объяснение доступа')
+        expect(page.locator('body')).to_contain_text('first')
+        page.screenshot(path=str(output / 'access-explanation.png'), full_page=True)
+        page.goto(base + '/policy/impact?grant_id=1')
+        page.locator('[name="grant"]').fill(json.dumps({'allowed_actions': ['ssh', 'runbook']}))
+        page.get_by_role('button', name='Preview impact').click()
+        expect(page.get_by_role('heading', name='Preview result')).to_be_visible()
+        page.screenshot(path=str(output / 'policy-impact.png'), full_page=True)
+        page.goto(base + '/workspace/governance')
+        review = page.locator('form').filter(has=page.locator('[name="operation"][value="create_review"]'))
+        review.locator('[name="project"]').select_option('payments')
+        review.locator('[name="reason"]').fill('Scheduled browser owner review')
+        review.locator('[name="confirm"]').check()
+        review.get_by_role('button', name='Start review').click()
+        expect(page.get_by_role('heading', name='Owner reviews')).to_be_visible()
+        decision = page.locator('form').filter(has=page.locator('[name="operation"][value="review"]')).first
+        decision.locator('[name="reason"]').fill('Owner verified current rule without extending expiry')
+        decision.locator('[name="confirm"]').check()
+        decision.get_by_role('button', name='Record decision').click()
+        expect(page.locator('body')).to_contain_text('completed')
+        page.screenshot(path=str(output / 'access-lifecycle.png'), full_page=True)
+        page.set_viewport_size({'width': 390, 'height': 844})
+        page.screenshot(path=str(output / 'access-lifecycle-mobile.png'), full_page=True)
+        assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth'), 'lifecycle page overflows mobile'
+        page.set_viewport_size({'width': 1440, 'height': 1000})
+        page.goto(base + '/operations/campaigns')
+        page.locator('[name="runbook_id"]').select_option('uptime')
+        page.locator('[name="host_ids"]').fill('1,2')
+        page.get_by_role('button', name='Review plan').click()
+        expect(page.get_by_role('heading', name='Review campaign')).to_be_visible()
+        page.screenshot(path=str(output / 'canary-review.png'), full_page=True)
+        page.locator('[name="confirm"]').check()
+        page.get_by_role('button', name='Start canary').click()
+        expect(page.get_by_role('heading', name='Campaign uptime')).to_be_visible()
+        page.locator('[name="confirm"]').check()
+        page.get_by_role('button', name='Stop campaign').click()
+        expect(page.locator('body')).to_contain_text('cancelled')
+        page.get_by_role('link', name='Investigate campaign').click()
+        expect(page.locator('.investigation-event')).not_to_have_count(0)
+        page.screenshot(path=str(output / 'investigation.png'), full_page=True)
         assert not errors, errors
         context.close()
         browser.close()
     assert "whoami" in commands and "first-command" in commands and "second-command" in commands, commands
     print("PASS: catalogue filters/favorites/recent, responsive layout, real Web SSH, tabs/split/search/settings, paste guard, persisted replay bookmarks")
+    print('PASS: browser access explanation, policy impact, owner review, canary confirmation/cancellation and correlated investigation')
 
 
 async def main(output):
@@ -137,12 +179,26 @@ async def main(output):
     fixture = fixtures.RuntimeTest()
     fixture.setUp()
     config = fixture.config
+    fixture.claims['scope'] = 'isolate.runbook isolate.execute'
+    fixture.token = fixture.sign(fixture.claims)
     work = Path(fixture.directory.name)
     options = {"backend": "sqlite", "sqlite_path": str(work / "state.db")}
     SQLState(options).initialize()
     store = StateClient(fixture.redis, options)
     config["state"] = options
     config["dashboard"].update(admin_groups=["Support"], locale="ru", refresh_seconds=0)
+    from isolate_audit_index import AuditIndex
+    config['audit_index'].update(enabled=True, driver='sqlite', path=str(work / 'audit.sqlite'))
+    AuditIndex(config['audit_index']).initialize()
+    config['logging']['sinks'] = [dict(config['audit_index'], type='sql')]
+    campaign_key = work / 'campaign-key'
+    campaign_key.write_bytes(b'isolated-ui-campaign-key-with-at-least-32-bytes')
+    campaign_key.chmod(0o600)
+    config['identity_security']['delegation']['enabled'] = True
+    config['command_execution'].update(enabled=True, allowed_groups=['Support'], signing_key_file=str(campaign_key), jobs_path=str(work / 'jobs'))
+    config['runbooks']['enabled'] = True
+    config['runbooks']['read_only']['allowed_groups'] = ['Support']
+    config['campaigns']['enabled'] = True
     host_key, client_key = asyncssh.generate_private_key("ssh-ed25519"), asyncssh.generate_private_key("ssh-ed25519")
     client_path = work / "client-key"
     client_key.write_private_key(str(client_path))
@@ -182,7 +238,8 @@ async def main(output):
         store.set("server_" + str(i), json.dumps({"server_id": str(i), "project_name": project, "server_name": name,
             "server_ip": "127.0.0.1", "server_port": target.get_port(), "resource_owner": "Platform Engineering",
             "environment": "Staging", "tags": {"team": project, "region": "eu-west"}}))
-    store.set("grant_1", json.dumps({"subject": "group", "name": "Support", "project": "*", "remote_user": "support", "sudo_mode": "none", "allowed_actions": ["ssh", "http", "kubernetes", "postgresql", "mysql"]}))
+    store.set("grant_1", json.dumps({"subject": "group", "name": "Support", "project": "*", "remote_user": "support", "sudo_mode": "none", "allowed_actions": ["ssh", "http", "kubernetes", "postgresql", "mysql", "runbook"]}))
+    store.set('offset_grant_id', 1)
     service_token = work / "kubernetes-token"
     service_token.write_text("synthetic-unused-fixture-token")
     service_token.chmod(0o600)

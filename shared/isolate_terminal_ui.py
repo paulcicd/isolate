@@ -114,6 +114,9 @@ def render_terminal_workspace(initial_resource=None, csrf_token="", language="ru
   <dialog id="tw-shortcuts-dialog" class="tw-dialog"><form method="dialog"><header><h2>{shortcuts}</h2><button value="close" aria-label="{close}">×</button></header><p>{shortcut_help}</p></form></dialog>
 </section>
 """.format(**w)
+    if resource:
+        from isolate_explain_api import explanation_panel
+        body += explanation_panel(resource['id'], 'ssh', russian=language == 'ru')
     return _asset_header() + body + '<script id="terminal-workspace-config" type="application/json">' + _json(config) + '</script><script type="module" src="/static/terminal-workspace.js"></script>'
 
 

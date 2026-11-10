@@ -29,6 +29,14 @@ enabled. `/ssh/authorize` remains an API/browser page. Configure upstream TLS
 verification and WebSocket support in the actual ingress controller; the default
 NGINX backend-protocol annotation selects HTTPS but does not configure your CA.
 
+Browser applications use separate exact-host Ingress resources when
+`webApplications.enabled=true`, with `gateway.enabled=true` and matching runtime
+`web_apps` configuration. Set `webApplications.hosts` entries with `host` and
+`tlsSecret`; no wildcard or automatic public DNS is provisioned. Default NGINX
+annotations select HTTPS backend and cookie affinity. Configure controller TLS
+verification/SNI, WebSocket timeouts and sticky routing for the app session owner.
+See [WEB-APPLICATIONS.md](../../WEB-APPLICATIONS.md) for DNS isolation and lifecycle.
+
 App containers run as UID/GID 2000, drop all capabilities, disable privilege
 escalation and service-account token mounts, and use read-only root filesystems.
 Private credentials must be owner-only: native projected Secrets otherwise have

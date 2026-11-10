@@ -127,13 +127,42 @@ def mutate_job(redis, job_id, change):
 
 
 def update_owned_job(redis, job_id, owner, updates):
-    """Merge worker status while preserving a concurrent cancellation request."""
-    def change(current):
-        if current is None or current.get("execution_owner") != owner:
+    """Merge only while this worker still holds the live lease and claim.
+
+    A delayed owner cannot overwrite quarantine/terminal state after a successor
+    has acquired the execution lock, even though execution_owner remains useful
+    historical evidence of the original process.
+    """
+    key, lock_key = 'job_' + str(job_id), 'job_lock_' + str(job_id)
+
+    def change(client):
+        raw = client.get(key)
+        current = json.loads(_decode(raw)) if raw is not None else None
+        claim_raw = client.get(claim_key(job_id))
+        claim = json.loads(_decode(claim_raw)) if claim_raw is not None else None
+        if (current is None or current.get("execution_owner") != owner
+                or _decode(client.get(lock_key)) != owner or not claim or claim.get('owner') != owner
+                or current.get('status') not in ('claimed', 'running')):
             raise JobOwnershipError("job execution ownership changed")
         current.update(updates)
         return current
-    return mutate_job(redis, job_id, change)
+    if not hasattr(redis, 'pipeline'):
+        current = change(redis)
+        redis.set(key, json.dumps(current, sort_keys=True))
+        return current
+    from redis.exceptions import WatchError
+    for _ in range(16):
+        with redis.pipeline() as pipe:
+            try:
+                pipe.watch(key, lock_key, claim_key(job_id))
+                current = change(pipe)
+                pipe.multi()
+                pipe.set(key, json.dumps(current, sort_keys=True))
+                pipe.execute()
+                return current
+            except WatchError:
+                continue
+    raise JobOwnershipError('job ownership changed too frequently')
 
 
 def mark_recovery_required(redis, job_id, owner):

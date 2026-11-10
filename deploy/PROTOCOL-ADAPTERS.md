@@ -8,6 +8,12 @@ reverse proxy externally. Each resource must exist in inventory and have an
 explicit grant for its protocol action; an `ssh` grant does not grant database,
 HTTP or Kubernetes access. Keep `protocols.enabled: false` until configured.
 
+The original modes described below remain compatible. Extended opt-in modes add
+[database mediation/SQL audit](DATABASE-PROXY.md),
+[isolated browser applications](WEB-APPLICATIONS.md), and
+[interactive Kubernetes streams](KUBERNETES.md). Their guides cover additional
+TLS, DNS, credentials and per-operation settings.
+
 An example trusted server configuration:
 
 ```yaml
@@ -68,14 +74,14 @@ and is unavailable for Kubernetes.
 
 ## HTTP APIs
 
-`/protocols/http/<host-id>/<upstream-path>` accepts the caller's Keycloak bearer
+`/protocols/http/<host-id>/<upstream-path>` accepts the caller's configured OIDC bearer
 token in the Authorization header. The proxy validates policy and session
 requirements for every request, then forwards only allowlisted request headers.
 Caller cookies, credentials, forwarded identity and impersonation headers are
 discarded. An optional trusted token file supplies upstream authentication.
-Responses discard cookies and redirects; HTML is sandboxed. This is an API
-proxy, not transparent hosting of arbitrary browser applications. Cookies,
-interactive login redirects and WebSocket upgrades are unsupported.
+Responses discard cookies and redirects; HTML is sandboxed. Browser cookies,
+login redirects and WebSocket upgrades require the separate
+`mode: web-application` origin in [WEB-APPLICATIONS.md](WEB-APPLICATIONS.md).
 
 Default methods are GET/HEAD. Configure mutations and allowed paths explicitly.
 Bodies, timeouts and concurrent requests are bounded. Long responses are streamed
@@ -88,7 +94,7 @@ Authorization headers or cookies.
 
 `/protocols/kubernetes/<host-id>/...` uses the same bearer-token boundary. The
 proxy authenticates upstream with a dedicated service-account token and always
-impersonates the verified Keycloak subject (`isolate:<sub>`) and its signed
+impersonates the verified OIDC subject (`isolate:<sub>`) and its signed
 groups (`isolate:<group>`). Callers cannot set impersonation headers. Configure
 Kubernetes RBAC for these prefixed users/groups. Grant the proxy service account
 only the required `impersonate` privileges; Kubernetes RBAC remains authoritative
@@ -114,18 +120,21 @@ users:
 
 The helper does not automatically refresh an expired login; run `isolate login`
 again. Allow API discovery paths required by your kubectl version, as well as
-the intended resources. `exec`, `attach`, `portforward` and API `proxy`
-subresources require different stream semantics and are denied. `watch` is
-opt-in and remains bounded by request time/response byte/session limits.
+the intended resources. The original API mode denies `exec`, `attach` and
+`portforward`. Enable the channel-aware adapter in [KUBERNETES.md](KUBERNETES.md)
+for these operations, logs and watch with separate grant actions. API `proxy`
+subresources remain denied in both modes.
 
 ## PostgreSQL and MySQL
 
-These adapters are an authenticated network gate. They **do not replace database
+The original transport mode is an authenticated network gate. It **does not replace database
 authentication**, inject credentials, enforce a database username from an SSH
 grant, parse SQL, or provide SQL query audit. Configure database accounts, grants
 and database-native auditing separately. `database_native_auth: true` explicitly
 acknowledges that boundary. The audit profile is `connection`: subject, resource,
-session lifecycle and transfer sizes, never database payloads/passwords.
+session lifecycle and transfer sizes, never database payloads/passwords. To have
+Isolate supply policy-selected credentials and record SQL lifecycle evidence,
+enable `database_proxy.enabled` as described in [DATABASE-PROXY.md](DATABASE-PROXY.md).
 
 The gateway accepts `/protocols/database` WebSockets. A first JSON frame carries
 an opaque, one-time ticket and protocol. The ticket must have been issued for

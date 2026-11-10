@@ -86,6 +86,7 @@ class SessionLogger(object):
         return self._event(event_type, fields, durable=True)
 
     def _event(self, event_type, fields, durable=False):
+        from isolate_investigations import identity_session_reference
         record = {
             "ts": time.time(),
             "event": event_type,
@@ -93,6 +94,7 @@ class SessionLogger(object):
             "keycloak_sub": self.identity.get("keycloak_sub"),
             "username": self.identity.get("username"),
             "groups": self.identity.get("groups", []),
+            "identity_session_sha256": identity_session_reference(self.identity),
         }
         record.update(fields)
         logging_config = dict(self.logging_config)

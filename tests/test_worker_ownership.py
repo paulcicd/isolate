@@ -61,6 +61,21 @@ class WorkerOwnershipTests(unittest.TestCase):
         self.redis.set("job_1", json.dumps({"id": "1", "status": "queued", "timeout": 30}))
         self.redis.set("job_lock_1", "owner-1", ex=60)
 
+    def test_delayed_worker_cannot_finish_after_lease_loss_or_quarantine(self):
+        self.queued()
+        ownership.claim_job(self.redis, '1', 'owner-1')
+        self.other.delete('job_lock_1')
+        with self.assertRaises(ownership.JobOwnershipError):
+            ownership.update_owned_job(self.redis, '1', 'owner-1', {'status': 'completed', 'exit_code': 0})
+        self.other.set('job_lock_1', 'recovery-operator', ex=60)
+        quarantined = ownership.mark_recovery_required(self.other, '1', 'recovery-operator')
+        self.assertEqual(quarantined['status'], 'recovery_required')
+        # Even reacquiring a lock with the old token cannot undo quarantine.
+        self.other.set('job_lock_1', 'owner-1', ex=60)
+        with self.assertRaises(ownership.JobOwnershipError):
+            ownership.update_owned_job(self.redis, '1', 'owner-1', {'status': 'completed', 'exit_code': 0})
+        self.assertEqual(jobs.get_job(self.other, '1')['status'], 'recovery_required')
+
     def test_durable_claim_allows_only_one_racing_executor(self):
         self.queued()
         barrier = threading.Barrier(2)

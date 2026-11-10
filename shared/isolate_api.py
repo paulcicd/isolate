@@ -79,8 +79,18 @@ def register_api_routes(app, config, redis_factory, current_identity, csrf_token
 
     from isolate_workspace_api import register_workspace_api
     register_workspace_api(app, config, runtime, bearer, bounded_json, failure, errors)
+    from isolate_application_api import register_application_api
+    register_application_api(app, config, runtime, bearer, bounded_json, failure, errors, csrf_token)
     from isolate_admin_api import register_admin_api
     register_admin_api(app, config, runtime, bearer, bounded_json, failure, errors)
+    from isolate_investigation_api import register_investigation_api
+    register_investigation_api(app, config, runtime, bearer, failure, errors)
+    from isolate_explain_api import register_explain_api
+    register_explain_api(app, config, runtime, bearer, bounded_json, failure, errors)
+    from isolate_governance_api import register_governance_api
+    register_governance_api(app, config, runtime, bearer, bounded_json, failure, errors, csrf_token)
+    from isolate_campaign_api import register_campaign_api
+    register_campaign_api(app, config, runtime, bearer, bounded_json, failure, errors, csrf_token)
     from isolate_openapi import register_openapi_routes
     register_openapi_routes(app, config)
 

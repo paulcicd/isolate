@@ -137,7 +137,7 @@ def list_session_approvals(redis, status=None, project=None):
     return sorted(rows, key=lambda row: row.get("requested_at") or 0, reverse=True)
 
 
-def _mutate(redis, request_id, change, config=None):
+def _mutate(redis, request_id, change, config=None, actor=None, event=None):
     key = _key(request_id)
 
     def apply(reader, transaction=None):
@@ -160,6 +160,11 @@ def _mutate(redis, request_id, change, config=None):
         if transaction is not None:
             transaction.multi()
         target.set(key, json.dumps(record, sort_keys=True))
+        if event and failure is None:
+            from isolate_workflow_audit import stage_event
+            stage_event(target, config, event, actor, record.get('project'), session_approval_id=record['id'],
+                connection_id=record.get('connection_id'), grant_id=record.get('grant_id'),
+                requester_sub=record.get('requester_sub'), status=record.get('status'))
         if transaction is not None:
             transaction.execute()
         if failure is not None:
@@ -195,7 +200,18 @@ def request_session_approval(redis, config, identity, host, decision, connection
                   required_approvals=_quorum(config, decision), requested_at=now,
                   request_expires_at=expiry, requester_expires_at=identity_expiry,
                   grant_id=(decision.get("matched_rule") or {}).get("id"))
-    redis.set(_key(request_id), json.dumps(record, sort_keys=True))
+    from isolate_workflow_audit import stage_event
+    if callable(getattr(redis, 'pipeline', None)):
+        with redis.pipeline(transaction=True) as transaction:
+            transaction.multi()
+            transaction.set(_key(request_id), json.dumps(record, sort_keys=True))
+            stage_event(transaction, config, 'session_approval_requested', identity, host.get('project_name'),
+                session_approval_id=request_id, connection_id=connection_id, grant_id=record.get('grant_id'))
+            transaction.execute()
+    else:
+        redis.set(_key(request_id), json.dumps(record, sort_keys=True))
+        stage_event(redis, config, 'session_approval_requested', identity, host.get('project_name'),
+            session_approval_id=request_id, connection_id=connection_id, grant_id=record.get('grant_id'))
     return record
 
 
@@ -245,7 +261,7 @@ def decide_session_approval(redis, config, request_id, actor, approve=True, reas
             now = _now()
             record.update(status="approved", approved_at=now,
                           approval_expires_at=min(now + _settings(config)["approval_ttl_seconds"], record["requester_expires_at"]))
-    return _mutate(redis, request_id, decide, config=config)
+    return _mutate(redis, request_id, decide, config=config, actor=actor, event='session_approval_decided')
 
 
 def revoke_session_approval(redis, config, request_id, actor, reason=None):
@@ -254,7 +270,7 @@ def revoke_session_approval(redis, config, request_id, actor, reason=None):
         if record["status"] not in ("pending", "approved", "active"):
             raise SessionApprovalDenied("session approval is already {}".format(record["status"]))
         record.update(status="revoked", revoked_at=_now(), revoked_by=actor["keycloak_sub"], reason=str(reason or "")[:2048])
-    return _mutate(redis, request_id, revoke, config=config)
+    return _mutate(redis, request_id, revoke, config=config, actor=actor, event='session_approval_revoked')
 
 
 def cancel_session_approval(redis, config, request_id, identity):
@@ -264,7 +280,7 @@ def cancel_session_approval(redis, config, request_id, identity):
         if record["status"] not in ("pending", "approved"):
             raise SessionApprovalDenied("only an unconsumed session request can be cancelled")
         record.update(status="cancelled", cancelled_at=_now(), cancelled_by=identity["keycloak_sub"])
-    return _mutate(redis, request_id, cancel, config=config)
+    return _mutate(redis, request_id, cancel, config=config, actor=identity, event='session_approval_cancelled')
 
 
 def _check_binding(record, config, identity, host, decision, connection_id, source_ip):
@@ -288,7 +304,7 @@ def consume_session_approval(redis, config, request_id, identity, host, decision
         if expiry <= now:
             raise SessionApprovalDenied("session authorization expired")
         record.update(status="active", consumed_at=now, session_expires_at=expiry)
-    return _mutate(redis, request_id, consume, config=config)
+    return _mutate(redis, request_id, consume, config=config, actor=identity, event='session_approval_consumed')
 
 
 def validate_session_approval(redis, config, request_id, identity, host, decision, connection_id, source_ip=None):

@@ -203,6 +203,24 @@ class ReleaseTest(unittest.TestCase):
 
 class HelmTest(unittest.TestCase):
     @unittest.skipUnless(shutil.which("helm"), "Helm binary is required for chart integration")
+    def test_browser_applications_require_explicit_tls_hosts_and_enabled_gateway(self):
+        import yaml
+        chart = Path(__file__).resolve().parents[1] / "deploy/helm/isolate"
+        arguments = ["helm", "template", "test", str(chart), "--set", "webApplications.enabled=true"]
+        self.assertNotEqual(subprocess.run(arguments, capture_output=True).returncode, 0)
+        self.assertNotEqual(subprocess.run(arguments + ["--set", "gateway.enabled=true"], capture_output=True).returncode, 0)
+        rendered = subprocess.run(arguments + ["--set", "gateway.enabled=true,webApplications.hosts[0].host=wiki.apps.test,webApplications.hosts[0].tlsSecret=wiki-tls"],
+            capture_output=True, text=True)
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        ingress = next(item for item in yaml.safe_load_all(rendered.stdout) if item and item["kind"] == "Ingress")
+        self.assertEqual(ingress['spec']['tls'], [{'hosts': ['wiki.apps.test'], 'secretName': 'wiki-tls'}])
+        rule = ingress['spec']['rules'][0]
+        self.assertEqual(rule['host'], 'wiki.apps.test')
+        self.assertEqual(rule['http']['paths'][0]['path'], '/')
+        self.assertEqual(rule['http']['paths'][0]['backend']['service']['port']['name'], 'web')
+        self.assertEqual(ingress['metadata']['annotations']['nginx.ingress.kubernetes.io/affinity'], 'cookie')
+
+    @unittest.skipUnless(shutil.which("helm"), "Helm binary is required for chart integration")
     def test_chart_lint_render_security_and_external_dependencies(self):
         chart = Path(__file__).resolve().parents[1] / "deploy/helm/isolate"
         lint = subprocess.run(["helm", "lint", str(chart), "--strict"], capture_output=True, text=True)

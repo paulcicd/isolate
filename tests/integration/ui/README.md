@@ -10,6 +10,7 @@ Compose suite. No production service or account is contacted.
 python -m pip install -r tests/integration/ui/requirements.txt
 python -m playwright install --with-deps chromium
 python tests/integration/ui/ui_integration.py --output /tmp/isolate-ui-verification
+python tests/integration/ui/web_apps_integration.py --output /tmp/isolate-ui-verification
 ```
 
 On Windows the test uses installed Microsoft Edge in headless mode, so installing
@@ -22,3 +23,18 @@ tabs, split panes, search, saved font settings, paste review before bytes reach
 SSH, and persisted owner-scoped replay bookmarks. It records screenshots and
 fails on uncaught page errors. The local HTTP/WS transport is a test-only
 loopback fixture; deployed browser sessions must use HTTPS/WSS.
+
+The workspace test also exercises access explanations, read-only policy impact,
+an owner review and a keep decision that preserves expiry, mobile review layout,
+canary preview/confirmation/cancellation, and the correlated investigation page.
+The browser campaign is cancelled before execution. Actual staged execution and
+signed worker results are covered separately by the real Keycloak/OpenSSH
+gateway integration suite.
+
+The application test additionally uses local HTTPS control/app origins and
+browser-only DNS overrides. It exercises the real resource launch button,
+cross-site auto-POST/Origin validation, host-only Secure cookies, upstream
+redirect/cookie rewriting, WebSocket and logout. Certificate verification is
+relaxed only inside this browser context for its synthetic one-day certificates;
+the gateway still verifies the HTTPS upstream. Network unit tests separately
+assert rejection of an untrusted upstream certificate.

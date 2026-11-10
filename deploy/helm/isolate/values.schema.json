@@ -301,6 +301,51 @@
     },
     "affinity": {
       "type": "object"
+    },
+    "webApplications": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "enabled",
+        "hosts",
+        "className",
+        "annotations"
+      ],
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "className": {
+          "type": "string"
+        },
+        "annotations": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "hosts": {
+          "type": "array",
+          "maxItems": 100,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "host",
+              "tlsSecret"
+            ],
+            "properties": {
+              "host": {
+                "$ref": "#/definitions/name"
+              },
+              "tlsSecret": {
+                "$ref": "#/definitions/name"
+              }
+            }
+          }
+        }
+      }
     }
   }
 }

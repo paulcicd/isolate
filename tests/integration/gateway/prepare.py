@@ -68,7 +68,7 @@ def main():
     realm['clients'][0]['protocolMappers'].append({
         'name': 'integration-job-scope', 'protocol': 'openid-connect',
         'protocolMapper': 'oidc-hardcoded-claim-mapper', 'consentRequired': False,
-        'config': {'claim.name': 'scp', 'claim.value': 'isolate.execute',
+        'config': {'claim.name': 'scp', 'claim.value': 'isolate.execute isolate.runbook',
                    'jsonType.label': 'String', 'id.token.claim': 'true', 'access.token.claim': 'true'}})
     for name, roles in (
             ('membership-reader', ['view-users', 'query-users', 'view-realm']),

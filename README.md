@@ -15,7 +15,18 @@ Optional native SSH, Web SSH and API console migration:
 [protocol adapters](deploy/PROTOCOL-ADAPTERS.md),
 [cluster operations](deploy/CLUSTER.md).
 
-> Для быстрого локального запуска bastion, Keycloak, Redis, dashboard и пяти SSH targets используйте [Docker demo](demo/README.md).
+Extended protocol access is opt-in: [PostgreSQL/MySQL credential mediation and
+SQL audit](deploy/DATABASE-PROXY.md), [isolated browser applications with cookies
+and WebSockets](deploy/WEB-APPLICATIONS.md), and [Kubernetes interactive streams
+and port-forward](deploy/KUBERNETES.md). These use the existing signed OIDC
+identity, grants, session approvals and revocation lifecycle.
+
+Access management and operations: [access explanations and policy impact](deploy/ACCESS-EXPLAIN.md),
+[owner reviews, temporary assignments and offboarding](deploy/ACCESS-GOVERNANCE.md),
+[correlated investigation](deploy/INVESTIGATIONS.md), and
+[canary-first runbook campaigns](deploy/SAFE-OPERATIONS.md).
+
+> To quickly launch bastion, Keycloak, Redis, dashboard, and five SSH targets locally, [Docker demo](demo/README.md).
 
 Isolate Bastion Platform v2 is an SSH bastion access layer for large Linux fleets. It keeps the familiar `s` and `g` workflow while adding modern identity, policy, audit, temporary access, and dashboard capabilities.
 

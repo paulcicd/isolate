@@ -61,6 +61,14 @@ migration:
   enabled: false
   acknowledgement: ""
   command: []
+webApplications:
+  enabled: false
+  className: ""
+  # One exact host per configured application origin, with its own TLS Secret.
+  hosts: []
+  annotations:
+    nginx.ingress.kubernetes.io/backend-protocol: HTTPS
+    nginx.ingress.kubernetes.io/affinity: cookie
 nodeSelector: {}
 tolerations: []
 affinity: {}

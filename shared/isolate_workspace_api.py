@@ -84,16 +84,39 @@ def register_workspace_api(app, config, runtime_factory, bearer, bounded_json, f
             endpoint = gateway.replace("wss://", "https://", 1).replace("ws://", "http://", 1)
             title = context["host"]["server_name"]
             body = '<h1>{}</h1><p>{} · {}</p>'.format(html.escape(title), html.escape(context["host"]["project_name"]), html.escape(protocol.upper()))
+            from isolate_explain_api import explanation_panel
+            body += explanation_panel(host_id, protocol)
             if protocol in ("postgresql", "mysql"):
+                target = config.get("protocols", {}).get("targets", {}).get(str(host_id), {})
+                brokered = (target.get("database_proxy") or {}).get("enabled")
                 command = shlex.join(['python3', '/opt/auth/scripts/isolate-protocol-proxy.py', 'database',
-                    '--api-url', public, '--gateway-url', gateway + '/protocols/database',
-                    '--host-id', str(host_id), '--protocol', protocol, '--listen-port', '15432'])
-                body += '<p>Start the local Isolate tunnel, then connect your database client to 127.0.0.1:15432 with native TLS and your database identity.</p><pre>{}</pre>'.format(html.escape(command))
+                    '--api-url', public, '--gateway-url', gateway,
+                    '--host-id', str(host_id), '--protocol', protocol, '--listen-port', '15432'] +
+                    (['--database-proxy', '--frontend-password-file', '/absolute/private/isolate-db-client', '--create-frontend-password'] if brokered else []))
+                explanation = ('Isolate supplies the database credential. Use the private local capability file as your client password and verify the gateway database certificate with native TLS. Your database identity is selected by policy.' if brokered else
+                               'Connect your database client to 127.0.0.1:15432 with native TLS and your database identity.')
+                body += '<p>Start the local Isolate proxy. {}</p><pre>{}</pre>'.format(explanation, html.escape(command))
+                body += '<p>Database identity: <strong>{}</strong></p>'.format(html.escape(str(context["decision"].get("remote_user") or "")))
+            elif protocol == "http" and config.get("protocols", {}).get("targets", {}).get(str(host_id), {}).get("mode") == "web-application":
+                from isolate_application_api import launch_form
+                # The existing workspace bootstrap already supplies a session
+                # CSRF value; retrieve it from the signed browser session here.
+                from flask import session
+                csrf = session.get("csrf_token")
+                if not csrf:
+                    csrf = secrets.token_urlsafe(32)
+                    session["csrf_token"] = csrf
+                body += '<p>Open this internal application on its isolated application domain. Current access is checked throughout the session.</p>'
+                body += launch_form(host_id, csrf)
             else:
                 endpoint += '/protocols/' + protocol + '/' + str(host_id) + '/'
                 body += '<p>Use this authenticated API endpoint from your client. Sign in with <code>isolate login</code>; bearer credentials remain in your private client cache.</p><pre>{}</pre>'.format(html.escape(endpoint))
                 if protocol == "kubernetes":
                     body += '<p>Configure kubectl with the Isolate ExecCredential helper and the trusted gateway CA. Your verified identity is impersonated upstream.</p>'
+                    options = config.get("protocols", {}).get("targets", {}).get(str(host_id), {}).get("kubernetes", {})
+                    if options.get("enabled"):
+                        operations = ', '.join(options.get("allowed_operations", []))
+                        body += '<p>Configured operations: {}. Each operation also requires its own grant action. Use a kubectl client with WebSocket streaming enabled.</p>'.format(html.escape(operations))
             body += '<p><a href="/workspace">Back to resources</a></p>'
             from isolate_web import _html
             return _html(title, body, config=config)

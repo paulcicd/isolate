@@ -195,9 +195,10 @@ class SessionApprovalsTest(unittest.TestCase):
                 return FalsyPipeline(self)
         self.redis = Redis()
         request = self.request()
+        created_transactions = self.redis.executions
         self.approve(request)
         self.consume(request)
-        self.assertEqual(self.redis.executions, 2)
+        self.assertEqual(self.redis.executions, created_transactions + 2)
         self.assertEqual(approvals.get_session_approval(self.redis, request["id"])["status"], "active")
 
     def test_missing_object_project_fails_closed_even_for_global_admin(self):

@@ -281,6 +281,9 @@ button.addEventListener('click', function() { if (navigator.clipboard) navigator
         prefill = urllib.parse.urlencode({"project": host["project_name"], "host": host["server_id"]})
         body += '<p><a href="/me/access?{}">{}</a></p></div>'.format(html.escape(prefill, quote=True), html.escape(labels["request_for_resource"]))
         body += copy_script()
+        if config.get('api', {}).get('enabled'):
+            from isolate_explain_api import explanation_panel
+            body += explanation_panel(server_id, 'ssh', russian=web._dashboard_locale(config) == 'ru')
         return page(host["server_name"], body)
 
     @app.route("/me/sessions")

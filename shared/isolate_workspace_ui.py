@@ -28,6 +28,7 @@ WORDS = {
         "reason_step_up": "Fresh authentication is required.", "reason_maintenance": "This resource is in maintenance.",
         "reason_denied": "A separate connection grant is required.", "reason_unavailable": "The connection service is not enabled for this resource.",
         "connect": "Connect", "details": "Details", "request_access": "Request access", "request_approval": "Request approval",
+        "explain_access": "Why this access?",
         "step_up": "Verify identity", "view": "View resource", "add_favorite": "Add to favorites", "remove_favorite": "Remove from favorites",
         "error": "Resources could not be loaded. Your previous results have been cleared.",
         "preferences_error": "Your favorites could not be saved. Try again.", "preferences_load_error": "Favorites could not be loaded. Refresh before making changes.",
@@ -64,6 +65,7 @@ WORDS = {
         "reason_step_up": "Нужно повторно подтвердить личность.", "reason_maintenance": "На ресурсе идут технические работы.",
         "reason_denied": "Для подключения требуется отдельное разрешение.", "reason_unavailable": "Сервис подключения к этому ресурсу пока не включён.",
         "connect": "Подключиться", "details": "Подробнее", "request_access": "Запросить доступ", "request_approval": "Запросить согласование",
+        "explain_access": "Почему такой доступ?",
         "step_up": "Подтвердить личность", "view": "Открыть ресурс", "add_favorite": "Добавить в избранное", "remove_favorite": "Убрать из избранного",
         "error": "Не удалось загрузить ресурсы. Предыдущие результаты скрыты.",
         "preferences_error": "Не удалось сохранить избранное. Повторите попытку.", "preferences_load_error": "Не удалось загрузить избранное. Обновите страницу перед изменениями.",
@@ -111,7 +113,30 @@ def administration_links(identity, config, labels):
                           ("/policy/gitops", "gitops"), ("/users", "users"), ("/jobs", "jobs"),
                           ("/alerts", "alerts"), ("/docs", "docs")):
             links.append({"url": path, "label": labels[key], "description": labels[key + "_help"]})
+    if config.get('api', {}).get('enabled'):
+        russian = labels.get('administration') == 'Управление'
+        if has_permission(identity, config, 'access.read'):
+            links.append({'url': '/workspace/governance', 'label': 'Жизненный цикл доступов' if russian else 'Access lifecycle',
+                'description': 'Пересмотры, подрядчики, сроки и завершение доступа.' if russian else 'Owner reviews, contractors, expiry and offboarding.'})
+        if is_platform_admin(identity, config):
+            links.append({'url': '/policy/impact', 'label': 'Влияние изменения прав' if russian else 'Policy impact preview',
+                'description': 'Проверьте изменение перед применением.' if russian else 'Review the effect of a policy change before applying it.'})
+        if config.get('audit_index', {}).get('enabled') and has_permission(identity, config, 'audit.read'):
+            links.append({'url': '/investigations', 'label': 'Расследование' if russian else 'Investigation',
+                'description': 'Связанные события от входа до результата.' if russian else 'Related evidence from sign-in to result.'})
+        if campaign_navigation_allowed(identity, config):
+            links.append({'url': '/operations/campaigns', 'label': 'Поэтапные операции' if russian else 'Staged operations',
+                'description': 'Canary, ограниченные партии и автоматическая остановка.' if russian else 'Canary, bounded batches and automatic stop conditions.'})
     return links
+
+
+def campaign_navigation_allowed(identity, config):
+    if not (config.get('api', {}).get('enabled') and config.get('campaigns', {}).get('enabled')):
+        return False
+    from isolate_mcp import IsolateMCPService, token_scopes
+    service = IsolateMCPService(config, None)
+    scopes = token_scopes(identity.get('raw_claims') or {})
+    return any(service._runbook_access_error(identity, scopes, kind) is None for kind in ('read_only', 'operational'))
 
 
 def _switcher(labels, can_manage, administration=False):

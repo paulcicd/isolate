@@ -137,6 +137,8 @@ def bind_identity(token, config, username, redis=None):
 def policy_for_host(redis, config, identity, host):
     # Import lazily: the CLI also imports inventory and connection helpers.
     from isolate import load_grants, load_project_sets
+    from isolate_governance import check_governance_access
+    check_governance_access(redis, identity, host.get('project_name'))
     if is_host_in_maintenance(host) and not set(identity.get("groups") or []).intersection(config.get("maintenance", {}).get("bypass_groups") or []):
         raise ConnectionDenied("target is in maintenance")
     return resolve_grant(identity, project=host["project_name"], host=host,

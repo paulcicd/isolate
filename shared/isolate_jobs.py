@@ -43,6 +43,7 @@ SIGNED_RUNBOOK_FIELDS = (
 )
 
 SIGNED_DELEGATION_FIELDS = ("delegation_id", "delegation_expires_at", "delegation_epoch", "principal_type", "service_client_id", "proxy_id")
+SIGNED_CAMPAIGN_FIELDS = ("campaign_id", "campaign_stage", "campaign_slot")
 
 def decode(value):
     return value.decode("utf-8") if isinstance(value, bytes) else value
@@ -81,6 +82,8 @@ def _signature_payload(record):
         fields += SIGNED_RUNBOOK_FIELDS
     if int(record.get("schema_version") or 1) >= 3:
         fields += SIGNED_DELEGATION_FIELDS
+    if int(record.get("schema_version") or 1) >= 4:
+        fields += SIGNED_CAMPAIGN_FIELDS
     return json.dumps(
         {name: record.get(name) for name in fields},
         sort_keys=True,
@@ -167,8 +170,11 @@ def _reject_gated_job(redis, config, host, decision, delegated=False):
 def _job_identity(redis, config, identity, token, host, decision, action):
     from isolate_delegation import submission_identity
     try:
-        return submission_identity(redis, config, identity, token, host, decision, action)
-    except (IdentityError, PolicyDenied) as exc:
+        effective, selected = submission_identity(redis, config, identity, token, host, decision, action)
+        from isolate_governance import check_governance_access
+        check_governance_access(redis, effective, host.get('project_name'))
+        return effective, selected
+    except (IdentityError, PolicyDenied, ValueError) as exc:
         raise JobError("delegated Keycloak identity or current policy could not be authorized") from exc
 
 
@@ -226,12 +232,15 @@ def create_command_job(redis, config, identity, host, decision, command, timeout
         "output_truncated": False,
     }
     record["proxy_id"] = host.get("proxy_id")
+    record['access_request_id'] = matched.get('request_id') or matched.get('access_request_id')
+    from isolate_investigations import identity_session_reference
+    record['identity_session_sha256'] = identity_session_reference(identity)
     _attach_job_delegation(redis, config, record, identity, token, host, decision)
     sign_job(record, config)
     return _save(redis, record)
 
 
-def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None, token=None):
+def create_runbook_job(redis, config, identity, host, decision, rendered, timeout=None, token=None, *, publish=True, campaign=None):
     from isolate_delegation import attach_delegation, options, submission_identity
     _reject_gated_job(redis, config, host, decision, delegated=bool(token and options(config).get("enabled")))
     identity, decision = _job_identity(redis, config, identity, token, host, decision, rendered["policy_action"])
@@ -290,9 +299,19 @@ def create_runbook_job(redis, config, identity, host, decision, rendered, timeou
         "output_truncated": False,
     }
     record["proxy_id"] = host.get("proxy_id")
+    record['access_request_id'] = matched.get('request_id') or matched.get('access_request_id')
+    from isolate_investigations import identity_session_reference
+    record['identity_session_sha256'] = identity_session_reference(identity)
+    if campaign is not None:
+        if (not isinstance(campaign, dict) or set(campaign) != set(SIGNED_CAMPAIGN_FIELDS)
+                or re.fullmatch(r'[a-f0-9]{32}', str(campaign.get('campaign_id', ''))) is None
+                or type(campaign.get('campaign_stage')) is not int or campaign['campaign_stage'] < 0
+                or type(campaign.get('campaign_slot')) is not int or campaign['campaign_slot'] < 0):
+            raise JobError('invalid campaign binding')
+        record.update(campaign, schema_version=4, status='held')
     _attach_job_delegation(redis, config, record, identity, token, host, decision)
     sign_job(record, config)
-    return _save(redis, record)
+    return _save(redis, record) if publish else record
 
 
 def _runbook_submission_plan(redis, config, identity, runbook_id, host_ids, parameters=None, timeout=None, token=None):
@@ -391,6 +410,8 @@ def retry_job(redis, config, original_job_id, actor, current_identity=None, toke
     original = get_job(redis, original_job_id)
     if original is None:
         raise JobError("job was not found")
+    if original.get('campaign_id') or int(original.get('schema_version') or 1) >= 4:
+        raise JobError('campaign children cannot be retried independently; review the outcome and create a fresh campaign')
     if original.get("status") not in FAILED_JOB_STATUSES:
         raise JobError("only failed or timed-out jobs can be retried")
     if not verify_job_signature(original, config):
@@ -511,6 +532,11 @@ def _audit(config, event, record, extra=None):
         "command_sha256": record.get("command_sha256"),
         "runbook_id": record.get("runbook_id"),
         "runbook_class": record.get("runbook_class"),
+        "campaign_id": record.get("campaign_id"),
+        "grant_id": record.get("grant_id"),
+        "access_request_id": record.get("access_request_id"),
+        "delegation_id": record.get("delegation_id"),
+        "identity_session_sha256": record.get("identity_session_sha256"),
         "source": "isolate-job-worker",
     }
     payload.update(extra or {})
@@ -598,7 +624,9 @@ def _execute_job_locked(redis, config, record, owner):
     try:
         if not verify_job_signature(current, config):
             return _fail_job(redis, config, current, "job authorization signature is invalid")
-    except JobError as exc:
+        from isolate_campaigns import check_campaign_job
+        check_campaign_job(redis, config, current)
+    except (JobError, ValueError) as exc:
         return _fail_job(redis, config, current, exc)
 
     host = get_host(redis, current["host_id"])
@@ -619,6 +647,8 @@ def _execute_job_locked(redis, config, record, owner):
         if current.get("delegation_id"):
             from isolate_delegation import recheck_delegation
             effective_identity, _ = recheck_delegation(redis, config, current, host)
+        from isolate_governance import check_governance_access
+        check_governance_access(redis, effective_identity, host.get('project_name'))
         if job_type == "remote-command":
             if not execution.get("enabled", False):
                 raise JobError("command execution was disabled after the job was queued")
@@ -655,7 +685,7 @@ def _execute_job_locked(redis, config, record, owner):
             defaults={**config.get("policy", {}), **config.get("ssh", {})},
             action=policy_action,
         )
-    except (JobError, PolicyDenied, RunbookError, IdentityError) as exc:
+    except (JobError, PolicyDenied, RunbookError, IdentityError, ValueError) as exc:
         return _fail_job(redis, config, current, "job authorization changed: {}".format(exc))
     if decision.get("remote_user") != current.get("remote_user") or decision.get("sudo_mode") != current.get("sudo_mode"):
         return _fail_job(redis, config, current, "command remote identity changed after the job was queued")
@@ -726,6 +756,11 @@ def _execute_job_locked(redis, config, record, owner):
             recheck_delegation(redis, config, current, live_host or {})
         except Exception:
             return _fail_job(redis, config, current, "delegated authorization failed before execution")
+    try:
+        from isolate_campaigns import check_campaign_job
+        check_campaign_job(redis, config, current)
+    except ValueError:
+        return _fail_job(redis, config, current, 'campaign authorization failed before execution')
     _audit(config, "job_start", current)
 
     max_output = int(execution.get("max_output_bytes", 1048576))
@@ -765,10 +800,34 @@ def _execute_job_locked(redis, config, record, owner):
                     error = "command output exceeded configured maximum"
                     break
             latest = get_job(redis, current["id"]) or current
+            live_owner = redis.get('job_lock_' + current['id'])
+            live_owner = live_owner.decode() if isinstance(live_owner, bytes) else live_owner
+            if (live_owner != owner or latest.get('execution_owner') != owner
+                    or latest.get('status') == 'recovery_required'):
+                _terminate_process(proc)
+                proc.stdout.close()
+                return latest
+            try:
+                from isolate_governance import check_governance_access
+                check_governance_access(redis, effective_identity, current.get('project'))
+            except Exception:
+                _terminate_process(proc)
+                status = 'cancelled'
+                error = 'job access was revoked or the control store became unavailable'
+                break
             if latest.get("cancel_requested"):
                 _terminate_process(proc)
                 status = "cancelled"
                 break
+            if current.get('campaign_id'):
+                try:
+                    from isolate_campaigns import check_campaign_job
+                    check_campaign_job(redis, config, current)
+                except Exception:
+                    _terminate_process(proc)
+                    status = 'cancelled'
+                    error = 'campaign was stopped, expired or became unavailable'
+                    break
             if current.get("delegation_id") and time.monotonic() >= next_identity_check:
                 try:
                     from isolate_delegation import recheck_delegation
@@ -795,8 +854,7 @@ def _execute_job_locked(redis, config, record, owner):
         proc.stdout.close()
 
     size = os.path.getsize(output_path)
-    current = update_owned_job(redis, current["id"], owner,
-        {
+    updates = {
             "status": status,
             "finished_at": now_ts(),
             "exit_code": proc.returncode,
@@ -804,8 +862,14 @@ def _execute_job_locked(redis, config, record, owner):
             "output_path": output_path,
             "output_bytes": size,
             "output_truncated": error == "command output exceeded configured maximum",
-        },
-    )
+        }
+    if current.get('campaign_id'):
+        from isolate_campaigns import terminal_result_receipt
+        updates['campaign_result'] = terminal_result_receipt(redis, config, current, updates, owner)
+    try:
+        current = update_owned_job(redis, current["id"], owner, updates)
+    except JobOwnershipError:
+        return get_job(redis, current['id'])
     _audit(config, "job_end", current, {"status": status, "exit_code": proc.returncode, "output_bytes": size})
     return current
 
@@ -814,6 +878,8 @@ def run_worker(config, redis, once=False):
     execution = config.get("command_execution", {}) or {}
     poll = max(float(execution.get("poll_interval", 1)), 0.1)
     while True:
+        from isolate_campaigns import reconcile_campaigns
+        reconcile_campaigns(redis, config)
         # A crashed owner's job is no longer queued. Surface its ambiguous
         # result without automatically repeating a possibly completed command.
         for status in ("claimed", "running"):
@@ -823,6 +889,7 @@ def run_worker(config, redis, once=False):
         queued = list_jobs(redis, status="queued", limit=100)
         for record in reversed(queued):
             execute_job(redis, config, record)
+            reconcile_campaigns(redis, config)
         if once:
             return
         time.sleep(poll)

@@ -29,6 +29,8 @@ DEFAULT_CONFIG = {
         "chunk_bytes": 262144, "upload_interval_seconds": 2, "max_outbox_age_seconds": 300,
     },
     "admission": {"enabled": False, "per_subject_per_minute": 60, "global_per_minute": 1000},
+    "governance": {"review_interval_days": 90},
+    "campaigns": {"enabled": False, "max_hosts": 100, "max_batch_size": 50},
     "api": {"enabled": False, "client_url": None, "ticket_ttl": 60, "bind_ticket_ip": False},
     "gateway": {
         "enabled": False, "listen_host": "127.0.0.1", "ssh_port": 2222,
@@ -54,6 +56,8 @@ DEFAULT_CONFIG = {
     },
     "credentials": {"default": "legacy", "targets": {}, "providers": {}, "known_hosts": None},
     "protocols": {"enabled": False, "targets": {}},
+    "web_apps": {"enabled": False, "session_ttl_seconds": 3600, "launch_ttl": 30,
+                 "idle_timeout_seconds": 900, "max_sessions": 100, "max_requests_per_session": 16},
     "audit_index": {"enabled": False, "driver": "sqlite", "path": "/opt/auth/spool/audit.sqlite3"},
     "cluster": {"node_id": None, "draining": False, "lease_ttl": 30, "node_ttl": 30},
     "connection_authorization": {
@@ -327,6 +331,10 @@ DEFAULT_CONFIG = {
             "access_request_*",
             "session_approval_*",
             "identity_revocation_*",
+            "governance_*",
+            "workflow_event_*",
+            "workflow_pending_*",
+            "runbook_campaign_*",
             "active_session_*",
             "job_*",
             "dashboard_alert_state_*",

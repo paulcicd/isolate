@@ -174,6 +174,11 @@
       if (!primaryURL) details.dataset.workspacePrimary = "true";
       actions.append(details);
     }
+    if (/^[0-9]{1,32}$/.test(String(resource.host_id || ""))) {
+      const explain = node("a", "access-explanation-link", words.explain_access || "Why this access?");
+      explain.href = "/workspace/access/" + encodeURIComponent(resource.host_id) + "?protocol=" + encodeURIComponent(resource.protocol);
+      actions.append(explain);
+    }
     article.append(actions);
     return article;
   }

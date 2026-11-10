@@ -482,53 +482,48 @@ class IsolateMCPService(object):
             self._audit("policy_preview", identity, "denied", started, {"host_id": host_id, "project": project, "action": action})
             return {"allowed": False, "identity": simulated, "project": project, "host_id": host_id, "action": action, "reason": str(exc)}
 
-    def grant_explain(self, identity, project=None, host_id=None):
+    def grant_explain(self, identity, project=None, host_id=None, action="ssh"):
+        from isolate_access_explain import policy_explanation, _can_see
+        from isolate_governance import check_governance_access
         started = time.monotonic()
         project = _optional_text(project, "project", 128)
+        requested_project = project
         host_id = _optional_text(host_id, "host_id", 64)
+        action = _required_text(action, "action", 32)
         if not project and not host_id:
             raise ValueError("project or host_id is required")
         host = get_host(self.redis, host_id) if host_id else None
-        if host_id and host is None:
-            raise MCPAccessDenied("host was not found or is not allowed")
+        grants, project_sets = self._policy_state()
+        if host_id and (host is None or not _can_see(identity, self.config, host, grants, project_sets)
+                or requested_project and requested_project != host.get('project_name')):
+            # Keep unknown and forbidden IDs indistinguishable, including audit
+            # details; deriving the real project here would leak hidden inventory.
+            self._audit('grant_explain', identity, 'denied', started, {'host_id': host_id, 'project': requested_project})
+            return {'allowed': False, 'host_id': host_id, 'project': requested_project, 'action': action,
+                'reason': 'host was not found or is not allowed', 'reason_code': 'resource_not_found_or_not_visible',
+                'snapshot_only': True}
         project = project or (host or {}).get("project_name")
         try:
-            decision = resolve_grant(
-                identity,
-                project=project,
-                host=host,
-                grants=load_grants(self.redis),
-                project_sets=load_project_sets(self.redis),
-                defaults=self._policy_defaults(),
-            )
-            matched = decision.get("matched_rule") or {}
-            result = {
-                "allowed": True,
-                "project": project,
-                "host": host,
-                "remote_user": decision.get("remote_user"),
-                "sudo_mode": decision.get("sudo_mode"),
-                "allowed_actions": decision.get("allowed_actions"),
-                "matched_grant": {
-                    "id": matched.get("id"),
-                    "subject": matched.get("subject"),
-                    "name": matched.get("name"),
-                    "host": matched.get("host") or matched.get("host_id") or matched.get("server_id"),
-                    "project": matched.get("project"),
-                    "project_glob": matched.get("project_glob"),
-                    "project_set": matched.get("project_set"),
-                    "temporary": bool(matched.get("temporary")),
-                    "expires_at": matched.get("expires_at"),
-                },
-            }
-            self._audit("grant_explain", identity, "allowed", started, {"host_id": host_id, "project": project})
+            check_governance_access(self.redis, identity, project)
+            policy = policy_explanation(self.config, identity, host or {'project_name': project}, grants,
+                project_sets, action=action, admin=True)
+            if not policy['allowed']:
+                raise PolicyDenied('No active policy assignment permits this action.')
+            safe_host = {key: host[key] for key in ('server_id', 'server_name', 'project_name') if key in host} if host else None
+            result = {'allowed': True, 'project': project, 'host': safe_host, 'action': action,
+                'remote_user': policy['remote_user'], 'sudo_mode': policy['sudo_mode'],
+                'allowed_actions': policy['selected_grant']['allowed_actions'], 'matched_grant': policy['selected_grant'],
+                'policy': policy, 'snapshot_only': True, 'evaluation_scope': 'policy-only; runtime checks still apply'}
+            self._audit('grant_explain', identity, 'allowed', started, {'host_id': host_id, 'project': project, 'action': action})
             return result
-        except PolicyDenied as exc:
+        except (PolicyDenied, IdentityError):
             result = {
                 "allowed": False,
                 "project": project,
                 "host_id": host_id,
-                "reason": str(exc),
+                "action": action,
+                "reason": 'No active policy and lifecycle decision permits this action.',
+                "snapshot_only": True,
                 "suggested_request": "isolate access request --project {}{} --reason <reason>".format(
                     project or "<project>",
                     " --host {}".format(host_id) if host_id else "",
@@ -1156,9 +1151,9 @@ def create_mcp_server(config=None, redis=None):
         )
 
     @server.tool(structured_output=True)
-    def grant_explain(project: str | None = None, host_id: str | None = None) -> dict[str, Any]:
+    def grant_explain(project: str | None = None, host_id: str | None = None, action: str = "ssh") -> dict[str, Any]:
         """Explain the current user's effective grant for a project or host."""
-        return service.grant_explain(_request_identity(), project=project, host_id=host_id)
+        return service.grant_explain(_request_identity(), project=project, host_id=host_id, action=action)
 
     @server.tool(structured_output=True)
     def grant_list(
